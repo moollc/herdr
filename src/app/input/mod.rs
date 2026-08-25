@@ -47,7 +47,8 @@ pub(crate) use self::commander::{
     refresh_reading as refresh_commander_reading, submit_commander, CommanderKeyOutcome,
 };
 pub(crate) use self::composer::{
-    enter_composer_mode, handle_composer_key, leave_composer_mode, ComposerKeyOutcome,
+    enter_composer_mode, handle_composer_key, handle_player_link_key, leave_composer_mode,
+    ComposerKeyOutcome,
 };
 pub(crate) use self::describe_dialog::{
     handle_describe_dialog_key, open_space_purpose_editor, open_tab_goal_editor,
@@ -79,7 +80,20 @@ impl App {
             return;
         }
         match self.state.mode {
-            Mode::Terminal => self.handle_terminal_key(key).await,
+            Mode::Terminal => {
+                if handle_player_link_key(&mut self.state, key) {
+                    return;
+                }
+                self.handle_terminal_key(key).await
+            }
+            Mode::PlayerInput => {
+                if handle_player_link_key(&mut self.state, key) {
+                    return;
+                }
+                if self.state.mode == Mode::Terminal {
+                    self.handle_terminal_key(key).await
+                }
+            }
             Mode::Prefix => self.handle_prefix_key(key),
             Mode::Navigate => self.handle_navigate_key(key),
             Mode::Copy => self.handle_copy_mode_key(key),
@@ -102,7 +116,8 @@ impl App {
                     | Mode::Navigate
                     | Mode::Copy
                     | Mode::Composer
-                    | Mode::Commander => unreachable!(),
+                    | Mode::Commander
+                    | Mode::PlayerInput => unreachable!(),
                     Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
                         handle_rename_key(&mut self.state, key_event)
                     }
@@ -146,6 +161,12 @@ impl App {
             self.settings_paste(&text);
             return;
         }
+        if self.state.mode == Mode::PlayerInput || self.state.player_input_focused {
+            let first = text.lines().next().unwrap_or_default();
+            self.state.player_link.insert_str(first);
+            return;
+        }
+
         if self.state.mode == Mode::Composer {
             match self.state.composer.focus {
                 // A pasted task keeps its lines: the field holds as many as it

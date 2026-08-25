@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::{
     Keybinds, NewTerminalCwdConfig, PaneHeaderConfig, SoundConfig, ToastConfig, ToastDelivery,
@@ -1001,6 +1001,8 @@ pub struct ViewState {
     pub tab_scroll_right_hit_area: Rect,
     pub new_tab_hit_area: Rect,
     pub terminal_area: Rect,
+    /// Herdplay box pinned to the bottom of the desktop sidebar.
+    pub player_rect: Rect,
     pub mobile_header_rect: Rect,
     pub mobile_menu_hit_area: Rect,
     pub toast_hit_area: Rect,
@@ -1030,6 +1032,7 @@ impl Default for ViewState {
             tab_scroll_right_hit_area: Rect::default(),
             new_tab_hit_area: Rect::default(),
             terminal_area: Rect::default(),
+            player_rect: Rect::default(),
             mobile_header_rect: Rect::default(),
             mobile_menu_hit_area: Rect::default(),
             toast_hit_area: Rect::default(),
@@ -1052,6 +1055,9 @@ pub enum Mode {
     Terminal,
     Composer,
     Commander,
+    /// Paste-link field in the player. Same claim as Composer: keys must not
+    /// be forwarded into a pane PTY while this mode is active.
+    PlayerInput,
     RenameWorkspace,
     RenameTab,
     RenamePane,
@@ -1897,6 +1903,14 @@ pub struct AppState {
     /// full table, freeing height for tabs and panes.
     pub agent_table_collapsed: bool,
     pub spaces_collapsed: bool,
+    /// Herdplay box in the sidebar: false is the 3-row bar, true is the taller
+    /// paste/Load chrome. Not persisted; it is session chrome, not layout.
+    pub player_expanded: bool,
+    /// Paste field for an ElevenMusic URL. Same `TextField` as the task prompt.
+    pub player_link: crate::composer::TextField,
+    pub player_input_focused: bool,
+    pub player_playlist_scroll: usize,
+    pub(crate) player_bg_click: Option<(u16, u16, Instant)>,
     /// Legacy ratio of sidebar height once allocated to the workspaces
     /// section. Kept so older sessions still restore.
     pub sidebar_section_split: f32,
@@ -2366,6 +2380,11 @@ impl AppState {
             sidebar_collapsed: false,
             agent_table_collapsed: false,
             spaces_collapsed: false,
+            player_expanded: false,
+            player_link: crate::composer::TextField::default(),
+            player_input_focused: false,
+            player_playlist_scroll: 0,
+            player_bg_click: None,
             sidebar_section_split: 0.5,
             agent_panel_scope: AgentPanelScope::AllWorkspaces,
             agent_table_scroll: 0,

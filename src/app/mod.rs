@@ -42,6 +42,7 @@ pub(crate) const HEADLESS_ANIMATION_TICK_STEP: u32 = ANIMATION_TICKS_PER_FRAME;
 pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
+pub(crate) const PLAYER_POLL_INTERVAL: Duration = Duration::from_millis(750);
 pub(crate) const AGENT_MODEL_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const PENDING_AGENT_RESUME_THEME_WAIT: Duration = Duration::from_millis(750);
@@ -141,6 +142,8 @@ pub struct App {
     pub(crate) toast_deadline: Option<Instant>,
     pub(crate) copy_feedback_deadline: Option<Instant>,
     pub(crate) last_git_remote_status_refresh: Instant,
+    pub(crate) last_player_poll: Instant,
+    pub(crate) last_player_snapshot: crate::ui::player::PlayerSnapshot,
     pub(crate) git_refresh_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
@@ -502,6 +505,11 @@ impl App {
             sidebar_collapsed: restored_sidebar_collapsed,
             agent_table_collapsed: restored_agent_table_collapsed,
             spaces_collapsed: restored_spaces_collapsed,
+            player_expanded: false,
+            player_link: crate::composer::TextField::default(),
+            player_input_focused: false,
+            player_playlist_scroll: 0,
+            player_bg_click: None,
             sidebar_section_split: restored_sidebar_section_split.unwrap_or(0.5),
             agent_panel_scope: state::AgentPanelScope::AllWorkspaces,
             agent_table_scroll: 0,
@@ -629,6 +637,8 @@ impl App {
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
+            last_player_poll: Instant::now() - PLAYER_POLL_INTERVAL,
+            last_player_snapshot: crate::ui::player::PlayerSnapshot::default(),
             git_refresh_in_flight: false,
             git_refresh_due_after_in_flight: false,
             git_status_cache: HashMap::new(),
@@ -1422,7 +1432,10 @@ impl App {
                     let key_id = repeat_key_identity(&key);
                     match key.kind {
                         crossterm::event::KeyEventKind::Press => {
-                            if input::agent_table_delete_intercept(&mut self.state, key) {
+                            if input::handle_player_link_key(&mut self.state, key) {
+                                // Player field claimed this key the way Composer
+                                // claims task-prompt keys: it must not reach a pane.
+                            } else if input::agent_table_delete_intercept(&mut self.state, key) {
                                 self.suppressed_repeat_keys.insert(key_id);
                             } else if self.state.mode == Mode::Terminal {
                                 self.suppressed_repeat_keys.remove(&key_id);
@@ -1459,6 +1472,9 @@ impl App {
                         self.commander_paste(&text);
                     } else if self.state.mode == Mode::Settings {
                         self.settings_paste(&text);
+                    } else if self.state.mode == Mode::PlayerInput || self.state.player_input_focused {
+                        let first = text.lines().next().unwrap_or_default();
+                        self.state.player_link.insert_str(first);
                     } else if self.state.mode == Mode::Composer {
                         self.state.composer.task.insert_str(&text);
                     } else if self.state.mode == Mode::Terminal {
@@ -1518,6 +1534,10 @@ impl App {
                 }
             }
             Mode::Commander => self.commander_key(key),
+            Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
+            Mode::PlayerInput => {
+                let _ = input::handle_player_link_key(&mut self.state, key);
+            }
             Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
                 input::handle_rename_key(&mut self.state, key_event);
             }
@@ -3872,6 +3892,7 @@ mod tests {
         app.session_save_deadline = Some(now + Duration::from_secs(2));
         app.next_resize_poll = now + Duration::from_secs(5);
         app.next_auto_update_check = Some(now + Duration::from_secs(6));
+        app.last_player_poll = now + Duration::from_secs(6) - PLAYER_POLL_INTERVAL;
 
         assert_eq!(
             app.next_loop_deadline(now, false),
@@ -3886,6 +3907,7 @@ mod tests {
         app.next_resize_poll = now + Duration::from_millis(100);
         app.session_save_deadline = Some(now + Duration::from_secs(2));
         app.next_auto_update_check = Some(now + Duration::from_secs(6));
+        app.last_player_poll = now + Duration::from_secs(6) - PLAYER_POLL_INTERVAL;
 
         assert_eq!(
             app.next_headless_loop_deadline_with_git_refresh(now, false, true),
@@ -3905,8 +3927,13 @@ mod tests {
         app.session_save_deadline = None;
         app.state.workspaces.clear();
 
+        // include_git_refresh mirrors self.has_app_client() at the real call
+        // site (server/headless.rs) — false here matches this test's own
+        // premise, a clientless headless server with resize_poll as the only
+        // deadline. The player poll deadline is correctly gated behind the
+        // same flag, since there is no UI to show playback state to.
         assert_eq!(
-            app.next_headless_loop_deadline_with_git_refresh(now, false, true),
+            app.next_headless_loop_deadline_with_git_refresh(now, false, false),
             None
         );
     }
@@ -3929,6 +3956,7 @@ mod tests {
         app.selection_autoscroll_deadline = Some(now + Duration::from_millis(5));
         app.next_animation_tick = Some(now + Duration::from_millis(100));
         app.session_save_deadline = Some(now + Duration::from_millis(200));
+        app.last_player_poll = now + Duration::from_millis(300) - PLAYER_POLL_INTERVAL;
         assert_eq!(
             app.next_loop_deadline(now, false),
             app.selection_autoscroll_deadline
