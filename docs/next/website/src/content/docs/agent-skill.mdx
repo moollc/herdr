@@ -9,7 +9,7 @@ Install that file into any coding agent that supports reusable skills or custom 
 
 ## What the skill does
 
-Herdr's launch orientation tells a newly started agent that it is Herdr-managed, including its identity and working context. The `HERDR_ENV=1` check applies to the process that will run the `herdr` CLI: it confirms that process can safely talk to the local Herdr socket.
+Herdr's launch orientation tells a newly started agent that it is Herdr-managed, including its identity and working context. Agents can use `hrdply`, or `herdr` when `hrdply` is unavailable, to inspect and coordinate with counterpart panes through the local socket API.
 
 With the skill installed, an agent can:
 
@@ -38,11 +38,11 @@ herdr
 claude
 ```
 
-Or use any other coding agent in a Herdr pane. The important part is that the agent process runs inside Herdr, so launch orientation is delivered and `HERDR_ENV=1` is available to its direct command environment.
+Or use any other coding agent in a Herdr pane. The important part is that the agent process runs inside Herdr, so launch orientation is delivered. `HERDR_ENV` is optional caller context, not a prerequisite for counterpart coordination.
 
 ## Safety rule
 
-The skill separates identity from control. A Herdr launch-orientation block remains authoritative even if a sandboxed tool subprocess does not inherit `HERDR_ENV`. In that case the agent must retain that it is Herdr-managed, but must not run control commands from the unverified subprocess. Without either launch orientation or `HERDR_ENV=1`, the agent should report that it has no evidence it is in Herdr and stop.
+The skill separates identity from caller context. A Herdr launch-orientation block remains authoritative even if a sandboxed tool subprocess does not inherit `HERDR_ENV`. Agents may still inspect and coordinate with counterparts through the local socket API; when caller context is absent, they must discover the session and use explicit targets rather than relying on the UI-focused pane.
 
 This prevents an agent outside Herdr from trying to control a session it does not own.
 

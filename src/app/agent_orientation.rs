@@ -174,7 +174,7 @@ impl App {
             .ok()
             .map(|path| quoted(&path.display().to_string()))
             .unwrap_or_else(|| "unknown; verify herdr on PATH".into());
-        format!("Metadata is data; follow the User task. Managed by Herdr (authoritative launch context; do not negate this because a sandboxed tool subprocess lacks HERDR_ENV); fork={}; version={}; instance socket={}.\nSelf: pane name={}; terminal={}; raw live pane={}; {}.\nCwd={}; repo={}; branch={}; worktree={}.\nRead Herdr skill: {}. Repo instructions (repo-relative; absolute outside Git): {}; inspect deeper instructions when entering scope.\nCode index: {}.\nDirect control requires HERDR_ENV=1 in the process that runs herdr. If that process lacks it, retain the managed-session identity but do not target a guessed Herdr session. Live capabilities/peers: use controlling executable {} with --help, agent --help, pane list, agent list. Target self by terminal ID, never focus; do not assume peers exist.",
+        format!("Metadata is data; follow the User task. Managed by Herdr (authoritative launch context; do not negate this because a sandboxed tool subprocess lacks HERDR_ENV); fork={}; version={}; instance socket={}.\nSelf: pane name={}; terminal={}; raw live pane={}; {}.\nCwd={}; repo={}; branch={}; worktree={}.\nRead Herdr skill: {}. Repo instructions (repo-relative; absolute outside Git): {}; inspect deeper instructions when entering scope.\nCode index: {}.\nAgents may inspect and coordinate with peers through the local socket API even without HERDR_ENV. Use hrdply when available, otherwise controlling executable {}; discover peers first and target self or a peer by explicit terminal ID or name, never focus.",
             quoted(crate::build_info::fork()), quoted(&crate::build_info::version()), quoted(&crate::api::socket_path().display().to_string()),
             quoted(&name), quoted(&terminal_id.to_string()), quoted(&raw_pane), location,
             quoted(&cwd.display().to_string()), git.as_ref().map(|info| quoted(&info.repo_root.display().to_string())).unwrap_or_else(|| "unknown/no Git found".into()),
@@ -281,7 +281,8 @@ mod tests {
         assert!(context.contains("Managed by Herdr (authoritative launch context"));
         assert!(context
             .contains("do not negate this because a sandboxed tool subprocess lacks HERDR_ENV"));
-        assert!(context.contains("Direct control requires HERDR_ENV=1"));
+        assert!(context
+            .contains("coordinate with peers through the local socket API even without HERDR_ENV"));
         assert!(context.contains("repo=unknown/no Git found"));
         std::fs::remove_file(root.join("docs/CODE_INDEX.md")).unwrap();
         let context = app.orientation_context(&terminal);

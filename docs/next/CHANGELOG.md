@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Preserve a fresh agent's Herdr-managed identity when a sandboxed command environment does not inherit `HERDR_ENV`; the variable now gates direct CLI control rather than contradicting launch orientation.
+- Preserve a fresh agent's Herdr-managed identity when a sandboxed command environment does not inherit `HERDR_ENV`, and allow agents to inspect and coordinate with counterparts through the local socket API without that variable.
 
 ### Added
 - Fresh agents started by the composer, Commander, or `agent start --session new --task` receive a short Herdr orientation with their first task: their own pane name and terminal identity, current location and checkout, readable instruction and index paths, and live help/list routes. Idle fresh starts receive it on the first structured prompt. Follow-ups and restored/resumed sessions do not repeat it; raw input and opaque argv remain literal.
