@@ -1,11 +1,15 @@
 ---
 name: herdr
-description: "Control herdr from inside it. Manage workspaces and tabs, split panes, spawn agents, read output, and wait for state changes — all via CLI commands that talk to the running herdr instance over a local unix socket. Use when running inside herdr (HERDR_ENV=1)."
+description: "Control Herdr from a Herdr-managed agent session. The launch orientation establishes session identity; HERDR_ENV=1 in the command process authorizes local CLI control."
 ---
 
 # herdr — agent skill
 
-before using this skill, check that `HERDR_ENV=1`. if it is not set to `1`, say you are not running inside a herdr-managed pane and stop. do not inspect or control the focused herdr pane from outside herdr.
+## startup identity and control guard
+
+If your first task includes a `[Herdr orientation ...]` block that says `Managed by Herdr`, that launch orientation is authoritative: you are a Herdr-managed agent. Keep that identity even when a sandboxed tool, remote executor, or nested process does not inherit `HERDR_ENV`.
+
+Before issuing a Herdr control command, verify that the process which will run it has `HERDR_ENV=1`. That variable authorizes direct access to the local Herdr socket; it is not the sole source of your runtime identity. If it is absent, say that this is a Herdr-managed agent session whose current command environment cannot control Herdr, and stop. Do not inspect or control the focused session from that environment. If you have neither launch orientation nor `HERDR_ENV=1`, say you do not have evidence that you are in Herdr and stop.
 
 you are running inside herdr, a terminal-native agent multiplexer. herdr gives you workspaces, tabs, and panes — each pane is a real terminal with its own shell, agent, server, or log stream — and you can control all of it from the cli.
 

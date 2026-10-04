@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Preserve a fresh agent's Herdr-managed identity when a sandboxed command environment does not inherit `HERDR_ENV`; the variable now gates direct CLI control rather than contradicting launch orientation.
+
 ### Added
 - Fresh agents started by the composer, Commander, or `agent start --session new --task` receive a short Herdr orientation with their first task: their own pane name and terminal identity, current location and checkout, readable instruction and index paths, and live help/list routes. Idle fresh starts receive it on the first structured prompt. Follow-ups and restored/resumed sessions do not repeat it; raw input and opaque argv remain literal.
 - Settings → experiments has `agent list: only agents not in a space`. On, the agent table and the mobile agents list show only agents that have been set down out of every space. The hidden agents keep their order. If you drag or sort rows while they are hidden, they return below the rows you arranged. The next and previous agent keys still cycle through them. The same key lives at `[ui] hide_attached_agents`.

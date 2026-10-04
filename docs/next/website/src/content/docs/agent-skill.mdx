@@ -9,7 +9,7 @@ Install that file into any coding agent that supports reusable skills or custom 
 
 ## What the skill does
 
-The skill tells an agent to use the `herdr` CLI when `HERDR_ENV=1` is set. That means the agent is running inside a Herdr-managed pane and can safely talk to the local Herdr socket.
+Herdr's launch orientation tells a newly started agent that it is Herdr-managed, including its identity and working context. The `HERDR_ENV=1` check applies to the process that will run the `herdr` CLI: it confirms that process can safely talk to the local Herdr socket.
 
 With the skill installed, an agent can:
 
@@ -38,11 +38,11 @@ herdr
 claude
 ```
 
-Or use any other coding agent in a Herdr pane. The important part is that the agent process runs inside Herdr, so `HERDR_ENV=1` is available.
+Or use any other coding agent in a Herdr pane. The important part is that the agent process runs inside Herdr, so launch orientation is delivered and `HERDR_ENV=1` is available to its direct command environment.
 
 ## Safety rule
 
-The skill starts with one guardrail: if `HERDR_ENV=1` is not set, the agent should stop and say it is not running inside a Herdr-managed pane.
+The skill separates identity from control. A Herdr launch-orientation block remains authoritative even if a sandboxed tool subprocess does not inherit `HERDR_ENV`. In that case the agent must retain that it is Herdr-managed, but must not run control commands from the unverified subprocess. Without either launch orientation or `HERDR_ENV=1`, the agent should report that it has no evidence it is in Herdr and stop.
 
 This prevents an agent outside Herdr from trying to control a session it does not own.
 
