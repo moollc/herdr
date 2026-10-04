@@ -1264,8 +1264,8 @@ impl App {
             .iter()
             .position(|ws| ws.id == delivery.workspace_id)
             .and_then(|ws_idx| {
-                self.lookup_runtime_sender(ws_idx, delivery.pane_id)
-                    .map(|runtime| super::api_helpers::send_prompt(runtime, &delivery.text))
+                self.state.workspaces[ws_idx].pane_state(delivery.pane_id)?;
+                Some(self.send_agent_task(delivery.pane_id, &delivery.text))
             });
         let trouble = match pane {
             Some(Ok(())) => return,

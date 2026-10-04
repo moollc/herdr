@@ -101,6 +101,7 @@ pub struct TerminalState {
     metadata_report_sequences: HashMap<String, u64>,
     pub state: AgentState,
     pub revision: u64,
+    pub orientation: crate::agent_orientation::OrientationState,
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
@@ -143,6 +144,7 @@ impl TerminalState {
             metadata_report_sequences: HashMap::new(),
             state: AgentState::Unknown,
             revision: 0,
+            orientation: crate::agent_orientation::OrientationState::Suppressed,
             launch_argv: None,
             respawn_shell_on_exit: false,
             starting_up: false,
@@ -303,6 +305,11 @@ impl TerminalState {
         {
             self.persisted_agent_session = None;
         }
+        if previous_session.is_some()
+            && previous_session != self.current_session_identity_for_persistence()
+        {
+            self.orientation = crate::agent_orientation::OrientationState::Suppressed;
+        }
         self.update_stale_hook_idle_window(now);
         TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
@@ -409,6 +416,9 @@ impl TerminalState {
         });
         self.stale_hook_idle_since = None;
         let current_session = self.current_session_identity_for_persistence();
+        if previous_session.is_some() && previous_session != current_session {
+            self.orientation = crate::agent_orientation::OrientationState::Suppressed;
+        }
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -553,6 +563,9 @@ impl TerminalState {
             session_ref,
         });
         let current_session = self.current_session_identity_for_persistence();
+        if previous_session.is_some() && previous_session != current_session {
+            self.orientation = crate::agent_orientation::OrientationState::Suppressed;
+        }
         Some(TerminalStateMutation {
             effective_state_change: None,
             session_ref_changed: previous_session != current_session,
@@ -626,6 +639,9 @@ impl TerminalState {
         self.hook_authority = None;
         self.stale_hook_idle_since = None;
         self.persisted_agent_session = None;
+        if previous_session.is_some() {
+            self.orientation = crate::agent_orientation::OrientationState::Suppressed;
+        }
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -686,6 +702,9 @@ impl TerminalState {
         self.hook_authority = None;
         self.stale_hook_idle_since = None;
         self.persisted_agent_session = None;
+        if previous_session.is_some() {
+            self.orientation = crate::agent_orientation::OrientationState::Suppressed;
+        }
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -843,6 +862,7 @@ impl TerminalState {
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
+        self.orientation = crate::agent_orientation::OrientationState::Suppressed;
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
         self.fallback_visible_blocker = false;
@@ -1047,6 +1067,38 @@ mod tests {
 
     fn test_terminal() -> TerminalState {
         TerminalState::new(TerminalId::alloc(), "/tmp".into())
+    }
+
+    #[test]
+    fn orientation_is_invalidated_by_native_session_switch_and_shell_respawn() {
+        use crate::agent_orientation::OrientationState;
+        let mut terminal = test_terminal();
+        terminal.orientation = OrientationState::Pending;
+        terminal
+            .set_agent_session_ref(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("first"),
+                Some(1),
+            )
+            .unwrap();
+        assert_eq!(
+            terminal.orientation,
+            OrientationState::Pending,
+            "first native identity binds the known fresh launch"
+        );
+        terminal
+            .set_agent_session_ref(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("other"),
+                Some(2),
+            )
+            .unwrap();
+        assert_eq!(terminal.orientation, OrientationState::Suppressed);
+        terminal.orientation = OrientationState::Pending;
+        terminal.clear_agent_runtime_identity_after_respawn();
+        assert_eq!(terminal.orientation, OrientationState::Suppressed);
     }
 
     #[test]

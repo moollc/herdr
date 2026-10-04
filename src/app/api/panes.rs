@@ -391,6 +391,20 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        if params.keys.len() == 1 && params.keys[0].eq_ignore_ascii_case("enter") {
+            return match self.send_agent_task(pane_id, &params.text) {
+                Ok(()) => encode_success(id, ResponseResult::Ok {}),
+                Err((code, message)) => encode_error(
+                    id,
+                    if code == "agent_send_failed" {
+                        "pane_send_failed"
+                    } else {
+                        code
+                    },
+                    message,
+                ),
+            };
+        }
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };

@@ -19,6 +19,7 @@ const NESTED_HERDR_MESSAGES: [&str; 6] = [
 ];
 
 mod agent_model;
+mod agent_orientation;
 mod agent_resume;
 mod agent_summary;
 mod api;

@@ -513,7 +513,7 @@ mod tests {
             panic!("a task with a folder should submit");
         };
         assert_eq!(pending.cwd, std::path::PathBuf::from("/tmp"));
-        assert!(pending.message().ends_with("fix the tab bar"));
+        assert!(pending.message().ends_with("  fix the tab bar  "));
     }
 
     #[test]

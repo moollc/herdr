@@ -159,3 +159,19 @@ herdr agent attach reviewer --takeover
 ```
 
 Use `herdr terminal attach <terminal_id>` when you want the same direct attach behavior for a non-agent terminal.
+
+## First-task orientation
+
+Agents started by the composer or Commander receive a short Herdr orientation with their first task. It names their own pane and terminal, current location (or detached state), working directory and Git checkout, and readable instructions, skill and code index paths. It directs them to live help and lists for capabilities and peers. Follow-up tasks and restored or resumed sessions do not receive another orientation. An idle fresh start receives it with its first nonblank `agent prompt`, Commander message, or `pane run` task.
+
+Use the explicit fresh launch contract from the CLI:
+
+```bash
+herdr agent start reviewer --session new --task "review the parser tests" --cwd ~/project -- claude
+```
+
+With `--session new`, argv must be one known harness executable, including an absolute executable path. Omit `--task` to start idle. A replacement started this way is a fresh conversation even if the previous agent has exited. Native resume or continue argv remains literal; do not declare it new. `--session resume` and the default `unknown` preserve literal argv and do not accept a separate `--task`.
+
+Raw keyboard input, paste, `agent send`, `pane send-text`, arbitrary keys, opaque argv and shell-launched agents have no reliable first-task boundary; they retain their existing behavior. If a task is sent manually before the first structured prompt, orientation can arrive late. Use structured task delivery consistently when first-task orientation matters. Only Auto's `/who` first-task slash command can receive orientation as an argument; other first-task slash commands return an error so their command semantics are preserved. Later slash commands pass through normally.
+
+Orientation is a delivery-time snapshot. Tab and pane addresses can change after closes or moves; use terminal identity and live lists. Queue admission is atomic for paste plus Enter, but it does not acknowledge model consumption. Crash recovery cannot guarantee exactly-once model acceptance.

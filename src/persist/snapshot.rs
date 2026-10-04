@@ -234,6 +234,8 @@ pub struct PaneSnapshot {
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    #[serde(default)]
+    pub orientation: crate::agent_orientation::OrientationState,
     /// Whether the finish had been acknowledged. An agent that finished wears
     /// the done marker until its marker is clicked, and clicking it leaves the
     /// check behind until it is clicked again or another run finishes, so both
@@ -560,6 +562,9 @@ fn capture_pane(
         }),
         agent_session,
         launch_argv: terminal.and_then(|terminal| terminal.launch_argv.clone()),
+        orientation: terminal
+            .map(|terminal| terminal.orientation)
+            .unwrap_or_default(),
         seen: pane.seen,
         completed: pane.completed,
         agent_timing: terminal.and_then(AgentTimingSnapshot::from_terminal),
@@ -754,6 +759,30 @@ mod tests {
     }
 
     #[test]
+    fn orientation_snapshot_roundtrip_and_legacy_default() {
+        let legacy = serde_json::json!({"cwd":"/tmp"});
+        let mut pane: PaneSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            pane.orientation,
+            crate::agent_orientation::OrientationState::Suppressed
+        );
+        for state in [
+            crate::agent_orientation::OrientationState::Pending,
+            crate::agent_orientation::OrientationState::Delivered,
+        ] {
+            pane.orientation = state;
+            let restored: PaneSnapshot =
+                serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
+            assert_eq!(restored.orientation, state);
+            assert_eq!(restored.orientation.restored(true), state);
+            assert_eq!(
+                restored.orientation.restored(false),
+                crate::agent_orientation::OrientationState::Suppressed
+            );
+        }
+    }
+
+    #[test]
     fn round_trip_empty_session() {
         let snap = SessionSnapshot {
             version: SNAPSHOT_VERSION,
@@ -805,6 +834,7 @@ mod tests {
                 agent_name: None,
                 agent_session: None,
                 launch_argv: None,
+                orientation: crate::agent_orientation::OrientationState::Suppressed,
                 seen: true,
                 completed: false,
                 agent_timing: None,
@@ -821,6 +851,7 @@ mod tests {
                 agent_name: None,
                 agent_session: None,
                 launch_argv: None,
+                orientation: crate::agent_orientation::OrientationState::Suppressed,
                 seen: true,
                 completed: false,
                 agent_timing: None,
@@ -1397,6 +1428,7 @@ mod tests {
                 agent_name: None,
                 agent_session: None,
                 launch_argv: None,
+                orientation: crate::agent_orientation::OrientationState::Suppressed,
                 seen: true,
                 completed: false,
                 agent_timing: None,
@@ -1415,6 +1447,7 @@ mod tests {
                 agent_name: None,
                 agent_session: None,
                 launch_argv: None,
+                orientation: crate::agent_orientation::OrientationState::Suppressed,
                 seen: true,
                 completed: false,
                 agent_timing: None,

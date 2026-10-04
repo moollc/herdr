@@ -688,10 +688,19 @@ impl ComposerState {
     /// chosen agent in the chosen folder, with nothing typed into it. `None`
     /// when there is nowhere to send it.
     pub fn pending(&self) -> Option<Pending> {
+        let harness = self.harness()?;
+        let task = self.task.text();
+        // Empty starts stay idle. Preserve agent task bytes; the Terminal row
+        // keeps its existing shell-command trimming behavior.
+        let task = if task.trim().is_empty() || harness.agent.is_none() {
+            task.trim()
+        } else {
+            &task
+        };
         Some(Pending {
             cwd: self.folder_path()?.to_path_buf(),
-            harness: self.harness()?,
-            task: self.task.text().trim().to_string(),
+            harness,
+            task: task.to_string(),
             worktree: self.worktree,
         })
     }
@@ -1362,6 +1371,16 @@ mod tests {
         );
         assert_eq!(composer.folder_rows().len(), 2, "the remembered list stays");
         assert!(composer.pointing(), "the chosen row is still the value");
+    }
+
+    #[test]
+    fn pending_agent_orientation_task_preserves_user_whitespace() {
+        let mut composer = composer_with_folders(&["/tmp"]);
+        composer.task.set_text("  preserve\n exact task\n");
+        assert_eq!(
+            composer.pending().unwrap().task,
+            "  preserve\n exact task\n"
+        );
     }
 
     #[test]

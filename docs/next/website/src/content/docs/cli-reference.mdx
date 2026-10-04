@@ -202,7 +202,7 @@ herdr agent rename <target> <name>|--clear
 herdr agent focus <target>
 herdr agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]
 herdr agent attach <target> [--takeover]
-herdr agent start <name> [--cwd PATH] [--worktree [BRANCH]] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>
+herdr agent start <name> [--session new|resume|unknown] [--task TEXT] [--cwd PATH] [--worktree [BRANCH]] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>
 herdr agent worktree land [target] [--json]
 ```
 
@@ -293,3 +293,7 @@ Prints the profile snippet PowerShell needs to report its working directory to H
 | `HERDR_SOCKET_PATH` | Low-level socket path override. |
 | `HERDR_LOG` | Set log filter, for example `HERDR_LOG=herdr=debug`. |
 | `HERDR_DISABLE_SOUND` | Disable sound playback even when sound notifications are enabled. |
+
+### Structured fresh-agent tasks
+
+`agent start NAME --session new --task TEXT -- HARNESS` gives a known harness its first task with Herdr orientation. `HARNESS` must be the only argv word, and may be an absolute path. Placement and worktree options work as usual. Omit `--task` for an idle fresh conversation; the first nonblank `agent prompt` supplies orientation. Subsequent prompts are literal. `resume` and `unknown` session intent preserve ordinary argv and reject a separate task field. Raw sends and shell-launched agents do not receive automatic orientation. The first slash command must be `/who`; other slash commands require an existing session or the literal argv route.

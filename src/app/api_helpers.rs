@@ -50,17 +50,17 @@ pub(super) fn send_prompt(
 ) -> Result<(), (&'static str, String)> {
     let encoded_enter = encode_api_keys(runtime, &["Enter".into()])
         .map_err(|key| ("invalid_key", format!("unsupported key {key}")))?;
-    if !text.is_empty() {
-        let text_bytes = encode_api_text(runtime, text);
-        runtime
-            .try_send_bytes(bytes::Bytes::from(text_bytes))
-            .map_err(|err| ("agent_send_failed", err.to_string()))?;
-    }
+    let mut batch = if text.is_empty() {
+        Vec::new()
+    } else {
+        encode_api_text(runtime, text)
+    };
     for bytes in encoded_enter {
-        runtime
-            .try_send_bytes(bytes::Bytes::from(bytes))
-            .map_err(|err| ("agent_send_failed", err.to_string()))?;
+        batch.extend(bytes);
     }
+    runtime
+        .try_send_bytes(bytes::Bytes::from(batch))
+        .map_err(|err| ("agent_send_failed", err.to_string()))?;
     Ok(())
 }
 

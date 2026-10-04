@@ -2,6 +2,11 @@
 
 pub const BASE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Set by a fork build; task-repository remotes are not build identity.
+pub fn fork() -> &'static str {
+    non_empty(option_env!("HERDR_BUILD_FORK")).unwrap_or("unknown")
+}
+
 pub fn channel() -> &'static str {
     non_empty(option_env!("HERDR_BUILD_CHANNEL")).unwrap_or("stable")
 }

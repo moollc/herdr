@@ -768,6 +768,10 @@ fn restore_pane(
             // An imported pane holds the process it always held, so nothing
             // about it is starting up. A restarted one is booting its harness
             // again, and that boot is not work the marker should answer to.
+            terminal.orientation = saved_pane
+                .map(|pane| pane.orientation)
+                .unwrap_or_default()
+                .restored(was_imported);
             if !was_imported {
                 terminal = terminal.with_restore_startup();
             }
@@ -1306,6 +1310,7 @@ mod tests {
                     agent_name: Some("scout".into()),
                     agent_session: None,
                     launch_argv: None,
+                    orientation: crate::agent_orientation::OrientationState::Suppressed,
                     seen: true,
                     completed: false,
                     agent_timing: None,
@@ -1370,6 +1375,7 @@ mod tests {
                     agent_name: None,
                     agent_session: None,
                     launch_argv: Some(launch_argv.clone()),
+                    orientation: crate::agent_orientation::OrientationState::Pending,
                     seen: true,
                     completed: false,
                     agent_timing: None,
@@ -1406,6 +1412,10 @@ mod tests {
         );
         assert!(terminals[&terminal_id].is_agent_terminal());
         assert!(runtimes.contains_key(&terminal_id));
+        assert_eq!(
+            terminals[&terminal_id].orientation,
+            crate::agent_orientation::OrientationState::Suppressed
+        );
         for runtime in runtimes.into_values() {
             runtime.shutdown();
         }
@@ -1438,6 +1448,7 @@ mod tests {
                             agent_name: None,
                             agent_session: None,
                             launch_argv: Some(launch_argv.clone()),
+                            orientation: crate::agent_orientation::OrientationState::Suppressed,
                             seen: true,
                             completed: false,
                             agent_timing: None,
@@ -1506,6 +1517,7 @@ mod tests {
                 agent_name: Some("scout".into()),
                 agent_session: None,
                 launch_argv: None,
+                orientation: crate::agent_orientation::OrientationState::Suppressed,
                 seen,
                 completed,
                 agent_timing: None,
@@ -1642,6 +1654,7 @@ mod tests {
                                 value: "opencode-session".into(),
                             }),
                             launch_argv: None,
+                            orientation: crate::agent_orientation::OrientationState::Suppressed,
                             seen: true,
                             completed: false,
                             agent_timing: None,
@@ -1727,6 +1740,7 @@ mod tests {
                                 value: "codex-session".into(),
                             }),
                             launch_argv: None,
+                            orientation: crate::agent_orientation::OrientationState::Pending,
                             seen: true,
                             completed: false,
                             agent_timing: None,
@@ -1767,6 +1781,10 @@ mod tests {
             .values()
             .next()
             .expect("native agent restore should create terminal state");
+        assert_eq!(
+            terminal.orientation,
+            crate::agent_orientation::OrientationState::Suppressed
+        );
         assert!(
             terminal.pending_agent_resume_plan.is_some(),
             "restored native agent panes should defer resume until client terminal context is known"
@@ -1896,6 +1914,7 @@ mod tests {
                 agent_name: None,
                 agent_session: None,
                 launch_argv: None,
+                orientation: crate::agent_orientation::OrientationState::Suppressed,
                 seen: true,
                 completed: false,
                 agent_timing: None,
@@ -1960,6 +1979,7 @@ mod tests {
             agent_name: None,
             agent_session: None,
             launch_argv: None,
+            orientation: crate::agent_orientation::OrientationState::Suppressed,
             seen: true,
             completed: false,
             agent_timing: None,

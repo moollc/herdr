@@ -36,12 +36,12 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let Some(name) = args.first() else {
-        eprintln!("usage: herdr agent start <name> [--cwd PATH] [--worktree [BRANCH]] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
+        eprintln!("usage: herdr agent start <name> [--session new|resume|unknown] [--task TEXT] [--cwd PATH] [--worktree [BRANCH]] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
         return Ok(2);
     };
 
     let Some(separator) = args.iter().position(|arg| arg == "--") else {
-        eprintln!("usage: herdr agent start <name> [--cwd PATH] [--worktree [BRANCH]] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
+        eprintln!("usage: herdr agent start <name> [--session new|resume|unknown] [--task TEXT] [--cwd PATH] [--worktree [BRANCH]] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
         return Ok(2);
     };
     if separator == args.len() - 1 {
@@ -49,6 +49,8 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     }
 
+    let mut task = None;
+    let mut session = crate::api::schema::AgentLaunchSession::Unknown;
     let mut cwd = None;
     let mut workspace_id = None;
     let mut tab_id = None;
@@ -59,6 +61,30 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let mut index = 1;
     while index < separator {
         match args[index].as_str() {
+            "--task" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for --task");
+                    return Ok(2);
+                };
+                task = Some(value.clone());
+                index += 2;
+            }
+            "--session" => {
+                session = match args
+                    .get(index + 1)
+                    .filter(|_| index + 1 < separator)
+                    .map(String::as_str)
+                {
+                    Some("new") => crate::api::schema::AgentLaunchSession::New,
+                    Some("resume") => crate::api::schema::AgentLaunchSession::Resume,
+                    Some("unknown") => crate::api::schema::AgentLaunchSession::Unknown,
+                    _ => {
+                        eprintln!("--session requires new|resume|unknown");
+                        return Ok(2);
+                    }
+                };
+                index += 2;
+            }
             "--cwd" => {
                 let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
                     eprintln!("missing value for --cwd");
@@ -120,6 +146,8 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:start".into(),
         method: Method::AgentStart(AgentStartParams {
+            task,
+            session,
             name: name.clone(),
             cwd,
             workspace_id,
@@ -575,7 +603,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]");
     eprintln!("  herdr agent attach <target> [--takeover]");
-    eprintln!("  herdr agent start <name> [--cwd PATH] [--worktree [BRANCH]] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
+    eprintln!("  herdr agent start <name> [--session new|resume|unknown] [--task TEXT] [--cwd PATH] [--worktree [BRANCH]] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
     eprintln!("  herdr agent worktree land [target] [--json]");
     eprintln!("  targets accept terminal ids, pane names, unique agent names, detected/reported agent labels, and legacy pane ids");
     eprintln!(

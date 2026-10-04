@@ -272,7 +272,6 @@ pub fn installed() -> Vec<&'static Harness> {
 /// it runs. `Auto` and `Claude Code` run the same program, so a lookup by
 /// program finds `Auto` first and a saved choice of one is never read as the
 /// other — the name is what is written down.
-#[cfg(test)]
 pub fn named(name: &str) -> Option<&'static Harness> {
     ALL.iter()
         .find(|harness| harness.name.eq_ignore_ascii_case(name))

@@ -122,10 +122,7 @@ impl App {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
         };
-        let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
-            return agent_not_found(id, &params.target);
-        };
-        match super::super::api_helpers::send_prompt(runtime, &params.text) {
+        match self.send_agent_task(resolved.pane_id, &params.text) {
             Ok(()) => encode_success(id, ResponseResult::Ok {}),
             Err((code, message)) => encode_error(id, code, message),
         }

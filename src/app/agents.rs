@@ -6,6 +6,12 @@ use bytes::Bytes;
 use super::{terminal_targets::TerminalTargetError, App, Mode};
 use crate::api::schema::{AgentStartParams, SplitDirection};
 
+pub(super) enum AgentPlacement {
+    Detached,
+    Workspace,
+    Split(usize, crate::layout::PaneId, SplitDirection),
+}
+
 impl App {
     pub(super) fn create_managed_worktree(
         &self,
@@ -71,31 +77,10 @@ impl App {
         }
     }
 
-    pub(super) fn start_managed_worktree_agent(
+    pub(super) fn mark_parent_repo_worktree_space(
         &mut self,
-        cwd: &std::path::Path,
-        argv: &[String],
-        agent: crate::detect::Agent,
-    ) -> Result<(crate::layout::PaneId, PathBuf), AgentStartError> {
-        let managed = self.create_managed_worktree(cwd, "")?;
-        let pane_id = match self.start_hidden_agent(managed.1.clone(), argv, Some(agent)) {
-            Ok(pane_id) => pane_id,
-            Err(err) => {
-                if !managed.0.is_linked_worktree {
-                    let _ = crate::worktree::remove_worktree_and_branch(
-                        &managed.0.repo_root,
-                        &managed.1,
-                        true,
-                    );
-                }
-                return Err(err);
-            }
-        };
-        self.mark_parent_repo_worktree_space(&managed.0);
-        Ok((pane_id, managed.1))
-    }
-
-    fn mark_parent_repo_worktree_space(&mut self, space: &crate::workspace::GitSpaceMetadata) {
+        space: &crate::workspace::GitSpaceMetadata,
+    ) {
         if let Some(parent) = self.state.workspaces.iter_mut().find(|workspace| {
             workspace
                 .resolved_identity_cwd()
@@ -202,6 +187,266 @@ impl App {
             })
     }
 
+    /// Prepare identity and membership before spawning the structured argv.
+    // This launch boundary needs destination, adapter, identity, and task
+    // together so none can be inferred from argv or process detection.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn start_task_agent(
+        &mut self,
+        cwd: PathBuf,
+        harness: &crate::harness::Harness,
+        executable: &str,
+        task: &str,
+        name: Option<String>,
+        placement: AgentPlacement,
+    ) -> Result<(crate::layout::PaneId, Vec<String>), AgentStartError> {
+        if !cwd.is_dir() {
+            return Err(AgentStartError::SpawnFailed(
+                "agent working directory does not exist".into(),
+            ));
+        }
+        if !crate::agent_orientation::supported_task(task) {
+            return Err(AgentStartError::SpawnFailed("first-task slash command cannot safely receive orientation; only /who is supported".into()));
+        }
+        let pane_id = crate::layout::PaneId::alloc();
+        let terminal_id = crate::terminal::TerminalId::alloc();
+        let mut terminal = crate::terminal::TerminalState::new(terminal_id.clone(), cwd.clone());
+        terminal.orientation = crate::agent_orientation::OrientationState::Pending;
+        terminal.agent_name = name;
+        terminal.detected_agent = harness.agent;
+        let pane = crate::pane::PaneState::new(terminal_id.clone());
+        let new_workspace = matches!(placement, AgentPlacement::Workspace);
+        let old_active = self.state.active;
+        let old_focus = self.state.current_pane_focus_target();
+        self.state.terminals.insert(terminal_id.clone(), terminal);
+        match placement {
+            AgentPlacement::Detached => self
+                .state
+                .detached_agents
+                .push(crate::app::state::DetachedAgent { pane_id, pane }),
+            AgentPlacement::Workspace => {
+                self.state
+                    .workspaces
+                    .push(crate::workspace::Workspace::from_existing_pane(
+                        pane_id,
+                        pane,
+                        cwd.clone(),
+                        self.event_tx.clone(),
+                        self.render_notify.clone(),
+                        self.render_dirty.clone(),
+                    ));
+            }
+            AgentPlacement::Split(ws_idx, target, direction) => {
+                let side = match direction {
+                    SplitDirection::Right => crate::layout::SplitSide::Right,
+                    SplitDirection::Down => crate::layout::SplitSide::Bottom,
+                };
+                if !self.state.workspaces[ws_idx].dock_detached_at_edge(
+                    target,
+                    side,
+                    (pane_id, pane),
+                ) {
+                    self.state.terminals.remove(&terminal_id);
+                    return Err(AgentStartError::SpawnFailed(
+                        "could not place agent pane".into(),
+                    ));
+                }
+                if let Some(tab_idx) = self.state.workspaces[ws_idx].find_tab_index_for_pane(target)
+                {
+                    self.state.workspaces[ws_idx].tabs[tab_idx]
+                        .layout
+                        .focus_pane(target);
+                }
+            }
+        }
+        let text = if task.trim().is_empty() {
+            task.to_string()
+        } else {
+            crate::agent_orientation::envelope(&self.orientation_context(&terminal_id), task)
+        };
+        // Auto's command is already the task prefix; avoid adding /who twice.
+        let mut adapter = *harness;
+        adapter.prefix = "";
+        let crate::harness::Launch::Agent { mut argv, .. } = adapter.launch(&text, false) else {
+            return Err(AgentStartError::SpawnFailed(
+                "structured launch requires an agent".into(),
+            ));
+        };
+        argv[0] = executable.to_string();
+        let (rows, cols) = self.state.estimate_pane_size();
+        let result = crate::terminal::TerminalRuntime::spawn_argv_command(
+            pane_id,
+            rows,
+            cols,
+            cwd,
+            &argv,
+            self.state.pane_scrollback_limit_bytes,
+            self.state.host_terminal_theme,
+            self.event_tx.clone(),
+            self.render_notify.clone(),
+            self.render_dirty.clone(),
+        );
+        match result {
+            Ok(runtime) => {
+                self.terminal_runtimes.insert(terminal_id.clone(), runtime);
+                if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                    terminal.launch_argv = Some(argv.clone());
+                    terminal.respawn_shell_on_exit = true;
+                    if !task.trim().is_empty() {
+                        terminal.orientation =
+                            crate::agent_orientation::OrientationState::Delivered;
+                    }
+                }
+                self.state.mark_session_dirty();
+                self.schedule_session_save();
+                Ok((pane_id, argv))
+            }
+            Err(err) => {
+                if new_workspace {
+                    self.state.workspaces.pop();
+                } else if let Some((ws_idx, _)) = self.find_pane(pane_id) {
+                    self.state.workspaces[ws_idx].take_pane(pane_id);
+                }
+                self.state
+                    .detached_agents
+                    .retain(|entry| entry.pane_id != pane_id);
+                self.state.terminals.remove(&terminal_id);
+                self.state.active = old_active;
+                if let Some(focus) = old_focus {
+                    if let Some(ws_idx) = self
+                        .state
+                        .workspaces
+                        .iter()
+                        .position(|ws| ws.id == focus.workspace_id)
+                    {
+                        self.state.focus_pane_in_workspace(ws_idx, focus.pane_id);
+                    }
+                }
+                Err(AgentStartError::SpawnFailed(err.to_string()))
+            }
+        }
+    }
+
+    fn start_structured_agent(
+        &mut self,
+        params: AgentStartParams,
+        name: String,
+    ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
+        if params.session != crate::api::schema::AgentLaunchSession::New || params.argv.len() != 1 {
+            return Err(AgentStartError::SpawnFailed("structured task requires session=new and one known harness executable; resume/opaque argv must carry its own task".into()));
+        }
+        let executable = &params.argv[0];
+        let program = std::path::Path::new(executable)
+            .file_name()
+            .and_then(|name| name.to_str());
+        let harness = program
+            .and_then(crate::harness::named)
+            .filter(|harness| harness.agent.is_some() && harness.program() == program)
+            .ok_or_else(|| {
+                AgentStartError::SpawnFailed("unknown structured harness executable".into())
+            })?;
+        let cwd = params
+            .cwd
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/"));
+        if params.worktree.is_some()
+            && (params.workspace_id.is_some() || params.tab_id.is_some() || params.split.is_some())
+        {
+            return Err(AgentStartError::WorktreePlacementConflict);
+        }
+        // Resolve placement before creating any checkout or process.
+        let requested = if let Some(tab) = &params.tab_id {
+            let (ws_idx, tab_idx) =
+                self.parse_tab_id(tab)
+                    .ok_or_else(|| AgentStartError::TargetNotFound {
+                        target: tab.clone(),
+                    })?;
+            if let Some(ws) = &params.workspace_id {
+                if self.parse_workspace_id(ws) != Some(ws_idx) {
+                    return Err(AgentStartError::PlacementConflict);
+                }
+            }
+            Some((
+                ws_idx,
+                self.state.workspaces[ws_idx].tabs[tab_idx].layout.focused(),
+            ))
+        } else if let Some(ws) = &params.workspace_id {
+            let ws_idx = self
+                .parse_workspace_id(ws)
+                .ok_or_else(|| AgentStartError::TargetNotFound { target: ws.clone() })?;
+            Some((
+                ws_idx,
+                self.state.workspaces[ws_idx]
+                    .focused_pane_id()
+                    .ok_or(AgentStartError::PlacementConflict)?,
+            ))
+        } else {
+            None
+        };
+        let managed = params
+            .worktree
+            .as_deref()
+            .map(|branch| self.create_managed_worktree(&cwd, branch))
+            .transpose()?;
+        let cwd = managed
+            .as_ref()
+            .map(|(_, checkout, _)| checkout.clone())
+            .unwrap_or(cwd);
+        let target = requested.or_else(|| {
+            let ws_idx = if managed.is_some() {
+                self.workspace_for_checkout(&cwd)?
+            } else {
+                self.state
+                    .active
+                    .or_else(|| (!self.state.workspaces.is_empty()).then_some(0))?
+            };
+            Some((ws_idx, self.state.workspaces[ws_idx].focused_pane_id()?))
+        });
+        let placement = target
+            .map(|(ws, pane)| {
+                AgentPlacement::Split(ws, pane, params.split.unwrap_or(SplitDirection::Right))
+            })
+            .unwrap_or(AgentPlacement::Workspace);
+        let started = self.start_task_agent(
+            cwd.clone(),
+            harness,
+            executable,
+            params.task.as_deref().unwrap_or(""),
+            Some(name),
+            placement,
+        );
+        let (pane_id, argv) = match started {
+            Ok(value) => value,
+            Err(err) => {
+                if let Some((space, checkout, _)) = &managed {
+                    if !space.is_linked_worktree {
+                        let _ = crate::worktree::remove_worktree_and_branch(
+                            &space.repo_root,
+                            checkout,
+                            true,
+                        );
+                    }
+                }
+                return Err(err);
+            }
+        };
+        let ws_idx = self
+            .state
+            .workspace_index_for_pane(pane_id)
+            .ok_or_else(|| AgentStartError::SpawnFailed("agent disappeared".into()))?;
+        if let Some((space, checkout, _)) = managed {
+            self.mark_managed_worktree_workspace(ws_idx, &space, &checkout);
+        }
+        if params.focus || self.state.active.is_none() {
+            self.state.focus_pane_in_workspace(ws_idx, pane_id);
+        }
+        let agent = self
+            .agent_info(ws_idx, pane_id)
+            .ok_or_else(|| AgentStartError::SpawnFailed("agent disappeared".into()))?;
+        Ok((agent, argv))
+    }
+
     pub(super) fn start_agent(
         &mut self,
         params: AgentStartParams,
@@ -216,6 +461,9 @@ impl App {
                 name,
                 candidates: conflicts,
             });
+        }
+        if params.task.is_some() || params.session == crate::api::schema::AgentLaunchSession::New {
+            return self.start_structured_agent(params, name);
         }
         let (ws_idx, pane_id, argv) = self.place_agent(params)?;
         self.name_started_agent(ws_idx, pane_id, name)?;
@@ -238,6 +486,7 @@ impl App {
     /// its own process while detection catches up; a row has nothing else to
     /// show, so the row would be blank for as long as that took. Detection
     /// overwrites this the moment the agent draws.
+    #[cfg(test)]
     pub(super) fn start_hidden_agent(
         &mut self,
         cwd: PathBuf,
@@ -816,6 +1065,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn structured_launch_orients_actual_identity_and_fresh_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut app = test_app();
+        let root = unique_temp_path("orientation-launch");
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("claude");
+        let output = root.join("task");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$1\" > '{}'\nsleep 30\n",
+                output.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for task in ["first\n  exact task\n", "replacement task"] {
+            let (pane, argv) = app
+                .start_task_agent(
+                    root.clone(),
+                    crate::harness::named("Claude Code").unwrap(),
+                    executable.to_str().unwrap(),
+                    task,
+                    Some("Worker".into()),
+                    super::AgentPlacement::Workspace,
+                )
+                .unwrap_or_else(|_| panic!("launch"));
+            assert_eq!(argv.len(), 2);
+            assert!(argv[1].ends_with(task));
+            assert_eq!(argv[1].matches(crate::agent_orientation::OPEN).count(), 1);
+            assert!(argv[1].contains("pane name=\"Worker\""));
+            let terminal = app.state.terminal_id_for_any_pane(pane).unwrap();
+            assert!(argv[1].contains(&terminal.to_string()));
+            let ws = app.state.workspace_index_for_pane(pane).unwrap();
+            assert!(argv[1].contains(&app.state.workspaces[ws].id));
+            for _ in 0..100 {
+                if std::fs::read_to_string(&output).ok().as_deref() == Some(&argv[1]) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(std::fs::read_to_string(&output).unwrap(), argv[1]);
+            assert_eq!(
+                app.state.terminals[&terminal].orientation,
+                crate::agent_orientation::OrientationState::Delivered
+            );
+            app.terminal_runtimes.remove(&terminal).unwrap().shutdown();
+            app.state.workspaces.pop();
+            app.state.terminals.remove(&terminal);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn structured_idle_and_spawn_failure_keep_no_pseudo_task() {
+        let mut app = test_app();
+        let before = app.state.terminals.len();
+        let result = app.start_task_agent(
+            std::env::temp_dir(),
+            crate::harness::named("Codex").unwrap(),
+            "/nonexistent/herdr-test-codex",
+            "task",
+            None,
+            super::AgentPlacement::Workspace,
+        );
+        assert!(result.is_err());
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(app.state.terminals.len(), before);
+        let (pane, argv) = app
+            .start_task_agent(
+                std::env::temp_dir(),
+                crate::harness::named("Codex").unwrap(),
+                "/bin/cat",
+                "",
+                None,
+                super::AgentPlacement::Detached,
+            )
+            .unwrap_or_else(|_| panic!("idle launch"));
+        assert_eq!(argv, vec!["/bin/cat"]);
+        let terminal = app.state.terminal_id_for_any_pane(pane).unwrap();
+        assert_eq!(
+            app.state.terminals[&terminal].orientation,
+            crate::agent_orientation::OrientationState::Pending
+        );
+        app.terminal_runtimes.remove(&terminal).unwrap().shutdown();
+    }
+
+    #[tokio::test]
+    async fn structured_api_requires_explicit_new_and_bare_known_harness() {
+        let mut app = test_app();
+        let params = crate::api::schema::AgentStartParams {
+            name: "fresh".into(),
+            task: Some("task".into()),
+            session: crate::api::schema::AgentLaunchSession::Unknown,
+            cwd: None,
+            workspace_id: None,
+            tab_id: None,
+            split: None,
+            worktree: None,
+            focus: false,
+            argv: vec!["claude".into()],
+        };
+        assert!(app.start_agent(params.clone()).is_err());
+        let mut resume = params.clone();
+        resume.session = crate::api::schema::AgentLaunchSession::Resume;
+        assert!(app.start_agent(resume).is_err());
+        let mut opaque = params;
+        opaque.session = crate::api::schema::AgentLaunchSession::New;
+        opaque.argv.push("--continue".into());
+        assert!(app.start_agent(opaque).is_err());
+        use std::os::unix::fs::PermissionsExt;
+        let root = unique_temp_path("orientation-api");
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("claude");
+        std::fs::write(&executable, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let target = app.state.workspaces[0].focused_pane_id();
+        let started = app
+            .start_agent(crate::api::schema::AgentStartParams {
+                name: "api-worker".into(),
+                task: Some("exact api task\n".into()),
+                session: crate::api::schema::AgentLaunchSession::New,
+                cwd: Some(root.display().to_string()),
+                workspace_id: Some(app.state.workspaces[0].id.clone()),
+                tab_id: None,
+                split: Some(crate::api::schema::SplitDirection::Down),
+                worktree: None,
+                focus: false,
+                argv: vec![executable.display().to_string()],
+            })
+            .unwrap_or_else(|_| panic!("structured API start"));
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), target);
+        assert_eq!(started.0.name.as_deref(), Some("api-worker"));
+        assert!(started.1.last().unwrap().ends_with("exact api task\n"));
+        assert!(started.1.last().unwrap().contains(&started.0.terminal_id));
+        assert!(started
+            .1
+            .last()
+            .unwrap()
+            .contains("pane name=\"api-worker\""));
+        shutdown_started_runtimes(&mut app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_hidden_agent_runs_without_taking_a_pane() {
         let mut app = test_app();
         let panes_before = app.state.workspaces[0].tabs[0].layout.pane_ids();
@@ -987,6 +1381,8 @@ mod tests {
 
         let mut app = test_app();
         let started = app.start_agent(crate::api::schema::AgentStartParams {
+            task: None,
+            session: crate::api::schema::AgentLaunchSession::Unknown,
             name: "reviewer".into(),
             cwd: Some(checkout.display().to_string()),
             workspace_id: None,
@@ -1043,6 +1439,8 @@ mod tests {
         let workspaces_before = app.state.workspaces.len();
 
         let started = app.start_agent(crate::api::schema::AgentStartParams {
+            task: None,
+            session: crate::api::schema::AgentLaunchSession::Unknown,
             name: "reviewer".into(),
             cwd: Some(checkout.display().to_string()),
             workspace_id: None,
@@ -1086,6 +1484,8 @@ mod tests {
 
         let mut app = test_app();
         let started = app.start_agent(crate::api::schema::AgentStartParams {
+            task: None,
+            session: crate::api::schema::AgentLaunchSession::Unknown,
             name: "reviewer".into(),
             cwd: Some(nested.display().to_string()),
             workspace_id: None,

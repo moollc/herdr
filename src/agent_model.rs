@@ -490,7 +490,7 @@ fn parse_codex_rollout_title(tail: &str) -> Option<String> {
         else {
             continue;
         };
-        if let Some(title) = action_title_from_prompt(text) {
+        if let Some(title) = action_title_from_prompt(crate::agent_orientation::user_task(text)) {
             return Some(title);
         }
     }
@@ -574,6 +574,7 @@ fn grok_title_from_user_text(text: &str) -> Option<String> {
 /// Inner `<user_query>` text, or the message itself when it is not wrapped in
 /// a harness tag. Injected blocks that open a tag are skipped.
 fn raw_user_request_text(text: &str) -> Option<String> {
+    let text = crate::agent_orientation::user_task(text);
     const OPEN: &str = "<user_query>";
     const CLOSE: &str = "</user_query>";
     let inner = if let Some(start) = text.find(OPEN) {
@@ -1150,6 +1151,20 @@ pub fn display_model_name(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orientation_envelope_summary_uses_user_task() {
+        let text = crate::agent_orientation::envelope("Managed by Herdr", "fix parser tests");
+        assert_eq!(
+            raw_user_request_text(&text).as_deref(),
+            Some("fix parser tests")
+        );
+        let json = serde_json::json!({"type":"response_item", "payload":{"type":"message", "role":"user", "content":[{"text":text}]}}).to_string();
+        assert_eq!(
+            parse_codex_rollout_title(&json),
+            action_title_from_prompt("fix parser tests")
+        );
+    }
 
     #[test]
     fn display_model_name_prettifies_known_ids() {

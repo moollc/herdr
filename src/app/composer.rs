@@ -59,23 +59,58 @@ impl App {
         &mut self,
         pending: &Pending,
     ) -> Result<(crate::layout::PaneId, PathBuf), String> {
-        match pending.launch() {
-            Launch::Agent { agent, argv }
-                if pending.worktree
-                    && pending.harness.prefix != crate::harness::AUTO_PREFIX
-                    && crate::workspace::git_space_metadata(&pending.cwd)
-                        .is_some_and(|space| !space.is_linked_worktree) =>
-            {
-                self.start_managed_worktree_agent(&pending.cwd, &argv, agent)
-            }
-            Launch::Agent { agent, argv } => self
-                .start_hidden_agent(pending.cwd.clone(), &argv, Some(agent))
-                .map(|pane_id| (pane_id, pending.cwd.clone())),
-            Launch::Terminal { command } => self
+        if pending.harness.agent.is_none() {
+            let Launch::Terminal { command } = pending.launch() else {
+                unreachable!("terminal row")
+            };
+            return self
                 .start_hidden_terminal(pending.cwd.clone(), &command)
-                .map(|pane_id| (pane_id, pending.cwd.clone())),
+                .map(|pane_id| (pane_id, pending.cwd.clone()))
+                .map_err(|err| self.agent_start_error_body(err).message);
         }
-        .map_err(|err| self.agent_start_error_body(err).message)
+        let managed = if pending.worktree
+            && pending.harness.prefix != crate::harness::AUTO_PREFIX
+            && crate::workspace::git_space_metadata(&pending.cwd)
+                .is_some_and(|space| !space.is_linked_worktree)
+        {
+            Some(
+                self.create_managed_worktree(&pending.cwd, "")
+                    .map_err(|err| self.agent_start_error_body(err).message)?,
+            )
+        } else {
+            None
+        };
+        let cwd = managed
+            .as_ref()
+            .map(|(_, checkout, _)| checkout.clone())
+            .unwrap_or_else(|| pending.cwd.clone());
+        let result = self.start_task_agent(
+            cwd.clone(),
+            pending.harness,
+            pending.harness.program().unwrap_or(""),
+            &pending.message(),
+            None,
+            super::agents::AgentPlacement::Detached,
+        );
+        if result.is_err() {
+            if let Some((space, checkout, _)) = &managed {
+                if !space.is_linked_worktree {
+                    let _ = crate::worktree::remove_worktree_and_branch(
+                        &space.repo_root,
+                        checkout,
+                        true,
+                    );
+                }
+            }
+        }
+        if result.is_ok() {
+            if let Some((space, _, _)) = &managed {
+                self.mark_parent_repo_worktree_space(space);
+            }
+        }
+        result
+            .map(|(pane_id, _)| (pane_id, cwd))
+            .map_err(|err| self.agent_start_error_body(err).message)
     }
 
     /// Put the keyboard on the agent the band just started.

@@ -39,9 +39,7 @@ if you need the raw protocol or full api reference, read the [socket api docs](h
 
 plain shells still exist as panes, but herdr's sidebar agent section intentionally focuses on detected agents rather than listing every shell.
 
-**ids** — workspace ids look like `1`, `2`. tab ids look like `1:1`, `1:2`, `2:1`. pane ids look like `1-1`, `1-2`, `2-1`. these are compact public ids for the current live session.
-
-important: ids can compact when tabs, panes, or workspaces are closed. do not treat them as durable ids. re-read ids from `workspace list`, `tab list`, `pane list`, or create/split responses when you need a current id. do not guess that an older `1-3` is still the same pane later.
+**ids** — terminal ids (`term_...`) identify the server-owned terminal across moves and restarts. workspace ids (`w...`) identify saved workspaces. tab and pane addresses include the workspace id and a current position; they can change when tabs or panes close. re-read addresses from live lists or create/split responses; do not treat an old address as durable identity.
 
 **pane names** — every pane also has a stable human name, shown in the table and returned as `name` in `pane list` and `pane get`. names come from a first-name word list hashed from the terminal id (`Olivia`, `Olivia-2` on collision). a manual rename still wins. any command that takes a pane id also accepts the name, case-insensitive. names stay with their pane for the life of the terminal and survive restarts, so they are safer than compact ids across closes.
 
@@ -53,7 +51,7 @@ see what panes exist and which one is focused:
 herdr pane list
 ```
 
-the focused pane is yours. other panes are your neighbors.
+focus belongs to the user and may be on another pane. use the terminal id and pane name supplied in your Herdr orientation to identify yourself; `HERDR_PANE_ID` is your raw live pane id, not the focused pane. an agent may be detached and have no workspace/tab address until docked. re-read current addresses after moves or closes. use `herdr --help`, `herdr agent --help`, and the live lists to discover available capabilities and peers; do not assume that peers exist.
 
 list workspaces:
 
@@ -287,11 +285,10 @@ herdr pane read 1-3 --source recent-unwrapped --lines 40
 ### spawn a new agent and give it a task
 
 ```bash
-herdr pane split 1-2 --direction right --no-focus
-herdr pane run 1-3 "claude"
-herdr wait output 1-3 --match ">" --timeout 15000
-herdr agent prompt 1-3 "review the test coverage in src/api/"
+herdr agent start reviewer --session new --task "review the test coverage in src/api/" --cwd /path/to/project -- claude
 ```
+
+`--session new` declares a fresh conversation and accepts one known harness executable after `--`. Herdr adds orientation to this first task. to start idle, omit `--task` and deliver the first task with `agent prompt`; later prompts stay unchanged. native resume commands and opaque argv use the ordinary literal start route without `--task`. raw typing, `agent send`, and shell-launched agents do not establish freshness or a first-task boundary and receive no automatic orientation.
 
 ### coordinate with another agent
 

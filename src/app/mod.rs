@@ -5,6 +5,7 @@
 //! - `input.rs` — key/mouse → action translation
 
 pub(crate) mod actions;
+mod agent_orientation;
 mod agent_resume;
 mod agents;
 mod api;
@@ -1478,7 +1479,9 @@ impl App {
                         self.commander_paste(&text);
                     } else if self.state.mode == Mode::Settings {
                         self.settings_paste(&text);
-                    } else if self.state.mode == Mode::PlayerInput || self.state.player_input_focused {
+                    } else if self.state.mode == Mode::PlayerInput
+                        || self.state.player_input_focused
+                    {
                         let first = text.lines().next().unwrap_or_default();
                         self.state.player_link.insert_str(first);
                     } else if self.state.mode == Mode::Composer {
@@ -1540,7 +1543,6 @@ impl App {
                 }
             }
             Mode::Commander => self.commander_key(key),
-            Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
             Mode::PlayerInput => {
                 let _ = input::handle_player_link_key(&mut self.state, key);
             }
@@ -3789,6 +3791,8 @@ mod tests {
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_focus".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                task: None,
+                session: crate::api::schema::AgentLaunchSession::Unknown,
                 name: "worker".into(),
                 cwd: None,
                 workspace_id: None,

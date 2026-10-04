@@ -2340,7 +2340,7 @@ fn player_line(p: &Palette, snapshot: &PlayerSnapshot, width: u16) -> Line<'stat
     let cover_fg = if dim {
         p.overlay0
     } else {
-        super::widgets::contrasting_label_fg(p, cover_bg)
+        super::widgets::panel_contrast_fg(p)
     };
     let title_fg = if dim || (!playing && title == "no track") {
         p.overlay0

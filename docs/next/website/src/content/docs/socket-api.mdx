@@ -311,3 +311,15 @@ Errors look like this:
 Herdr has a protocol version for client/server compatibility. Protocol changes are reviewed with release compatibility in mind.
 
 Check the server protocol with `ping` or `herdr status` before depending on new behavior. Handle unknown fields gracefully.
+
+## Structured first-agent tasks
+
+`agent.start` accepts optional `session` (`new`, `resume`, or `unknown`, default `unknown`) and `task` fields. A `new` start requires a single known harness executable in `argv`; `task` is transported using the existing harness adapter with a one-time Herdr orientation. Omit `task` for an idle fresh start. Workspace, tab, split and managed-worktree placement retain their normal meaning. A separate `task` with `resume` or `unknown`, opaque wrappers, or extra harness argv is rejected conservatively; native resume/task argv can still use the literal start contract.
+
+```json
+{"id":"start-review","method":"agent.start","params":{"name":"reviewer","session":"new","task":"review the parser tests","argv":["claude"]}}
+```
+
+`agent.prompt`, Commander delivery, and `pane.send_input` with text and exactly one Enter use the same terminal-aware task policy. Only positively known fresh sessions receive orientation. Blank tasks do not consume eligibility. Follow-ups, legacy snapshots, deferred native resumes, and saved-argv restarts suppress injection. Live PTY handoffs preserve pending/delivered state. Raw sends and arbitrary keys remain literal.
+
+Prompt paste and Enter occupy a single ordered input queue entry. A full or closed queue leaves fresh eligibility intact. Successful queue admission consumes it and schedules persistence; this guarantees no blind duplicate from a separately failed Enter, not model acknowledgement across crashes.
