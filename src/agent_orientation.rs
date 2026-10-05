@@ -8,6 +8,8 @@ pub enum OrientationState {
     #[default]
     Suppressed,
     Pending,
+    /// A startup hook has received an offer but has not acknowledged emitting it.
+    Offered,
     Delivered,
 }
 
@@ -23,6 +25,15 @@ impl OrientationState {
             Self::Suppressed
         }
     }
+}
+
+/// The server's durable side of a hook offer.  The nonce binds acknowledgement
+/// to one terminal generation and native conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrientationOffer {
+    pub session_id: String,
+    pub nonce: String,
+    pub context: String,
 }
 
 pub const OPEN: &str = "[Herdr orientation v1]\n";

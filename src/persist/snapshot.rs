@@ -236,6 +236,8 @@ pub struct PaneSnapshot {
     pub launch_argv: Option<Vec<String>>,
     #[serde(default)]
     pub orientation: crate::agent_orientation::OrientationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orientation_offer: Option<crate::agent_orientation::OrientationOffer>,
     /// Whether the finish had been acknowledged. An agent that finished wears
     /// the done marker until its marker is clicked, and clicking it leaves the
     /// check behind until it is clicked again or another run finishes, so both
@@ -565,6 +567,7 @@ fn capture_pane(
         orientation: terminal
             .map(|terminal| terminal.orientation)
             .unwrap_or_default(),
+        orientation_offer: terminal.and_then(|terminal| terminal.orientation_offer.clone()),
         seen: pane.seen,
         completed: pane.completed,
         agent_timing: terminal.and_then(AgentTimingSnapshot::from_terminal),
@@ -768,6 +771,7 @@ mod tests {
         );
         for state in [
             crate::agent_orientation::OrientationState::Pending,
+            crate::agent_orientation::OrientationState::Offered,
             crate::agent_orientation::OrientationState::Delivered,
         ] {
             pane.orientation = state;
@@ -835,6 +839,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
+                orientation_offer: None,
                 seen: true,
                 completed: false,
                 agent_timing: None,
@@ -852,6 +857,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
+                orientation_offer: None,
                 seen: true,
                 completed: false,
                 agent_timing: None,
@@ -1429,6 +1435,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
+                orientation_offer: None,
                 seen: true,
                 completed: false,
                 agent_timing: None,
@@ -1448,6 +1455,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
+                orientation_offer: None,
                 seen: true,
                 completed: false,
                 agent_timing: None,

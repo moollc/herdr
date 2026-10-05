@@ -92,6 +92,8 @@ pub enum Method {
     PaneReportAgent(PaneReportAgentParams),
     #[serde(rename = "pane.report_agent_session")]
     PaneReportAgentSession(PaneReportAgentSessionParams),
+    #[serde(rename = "pane.ack_orientation")]
+    PaneAckOrientation(PaneAckOrientationParams),
     #[serde(rename = "pane.report_metadata")]
     PaneReportMetadata(PaneReportMetadataParams),
     #[serde(rename = "pane.clear_agent_authority")]
@@ -474,6 +476,14 @@ pub struct PaneReportAgentSessionParams {
     pub agent_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneAckOrientationParams {
+    pub pane_id: String,
+    pub source: String,
+    pub agent_session_id: String,
+    pub nonce: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -861,6 +871,7 @@ pub enum ResponseResult {
     },
     OrientationContext {
         context: String,
+        nonce: String,
     },
     Ok {},
 }

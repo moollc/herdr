@@ -101,14 +101,7 @@ impl App {
         let Some(terminal) = self.state.terminals.get(terminal_id) else {
             return String::new();
         };
-        let name = terminal
-            .manual_label
-            .as_deref()
-            .or(terminal.agent_name.as_deref())
-            .map(str::to_string)
-            .or_else(|| {
-                crate::pane_names::assigned_names(&self.state.terminals).remove(terminal_id)
-            })
+        let name = crate::pane_names::effective_name(&self.state.terminals, terminal_id)
             .unwrap_or_else(|| "unknown".into());
         let mut raw_pane = self
             .state

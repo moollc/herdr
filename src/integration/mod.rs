@@ -26,7 +26,7 @@ const CLAUDE_INTEGRATION_VERSION: u32 = 6;
 const CLAUDE_CONFIG_DIR_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
 const CODEX_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
 const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/herdr-agent-state.sh");
-const CODEX_INTEGRATION_VERSION: u32 = 6;
+const CODEX_INTEGRATION_VERSION: u32 = 7;
 const CODEX_HOME_ENV_VAR: &str = "CODEX_HOME";
 const KIMI_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
 const KIMI_HOOK_ASSET: &str = include_str!("assets/kimi/herdr-agent-state.sh");
@@ -3493,7 +3493,7 @@ mod tests {
 
         assert_eq!(codex.path, hook_path);
         assert_eq!(codex.installed_version, Some(2));
-        assert_eq!(codex.expected_version, 6);
+        assert_eq!(codex.expected_version, 7);
         assert_eq!(codex.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");

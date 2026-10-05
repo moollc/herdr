@@ -219,6 +219,22 @@ pub fn assigned_names(
     names
 }
 
+/// The one public pane-name precedence used by the UI, API, and orientation.
+pub fn effective_name(
+    terminals: &HashMap<TerminalId, TerminalState>,
+    terminal_id: &TerminalId,
+) -> Option<String> {
+    terminals
+        .get(terminal_id)
+        .and_then(|terminal| {
+            terminal
+                .manual_label
+                .clone()
+                .or_else(|| terminal.agent_name.clone())
+        })
+        .or_else(|| assigned_names(terminals).remove(terminal_id))
+}
+
 /// The name a pane carries independently of the list, if any.
 fn own_name(terminal: &TerminalState) -> Option<&str> {
     terminal

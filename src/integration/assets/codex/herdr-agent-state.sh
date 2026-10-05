@@ -3,7 +3,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=codex
-# HERDR_INTEGRATION_VERSION=6
+# HERDR_INTEGRATION_VERSION=7
 
 set -eu
 
@@ -68,25 +68,55 @@ if agent_session_id:
 else:
     raise SystemExit(0)
 
-try:
+def call(request):
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(0.5)
     client.connect(socket_path)
     client.sendall((json.dumps(request) + "\n").encode())
-    try:
-        response = b""
-        while not response.endswith(b"\n") and len(response) < 65536:
-            chunk = client.recv(4096)
-            if not chunk:
-                break
-            response += chunk
-        context = json.loads(response).get("result", {}).get("context")
-        if isinstance(context, str) and context:
-            print(json.dumps({"hookSpecificOutput": {
-                "hookEventName": "SessionStart", "additionalContext": context}}))
-    except Exception:
-        pass
+    response = b""
+    while not response.endswith(b"\n") and len(response) < 65536:
+        chunk = client.recv(4096)
+        if not chunk:
+            break
+        response += chunk
     client.close()
+    return json.loads(response)
+
+# A receipt survives a lost acknowledgement response.  It is deliberately
+# written after stdout: a process crash in that tiny interval is uncertain and
+# may duplicate context; pretending that it was delivered would lose context.
+receipt = os.path.join(os.environ.get("TMPDIR", "/tmp"),
+    "herdr-codex-orientation-" + str(abs(hash((pane_id, agent_session_id)))) + ".json")
+try:
+    response = call(request)
+    result = response.get("result", {}) if isinstance(response, dict) else {}
+    context, nonce = result.get("context"), result.get("nonce")
+    if isinstance(context, str) and context and isinstance(nonce, str) and nonce:
+        emitted = False
+        try:
+            with open(receipt, encoding="utf-8") as handle:
+                emitted = json.load(handle).get("nonce") == nonce
+        except Exception:
+            pass
+        if not emitted:
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "SessionStart", "additionalContext": context}}), flush=True)
+            try:
+                with open(receipt, "w", encoding="utf-8") as handle:
+                    json.dump({"nonce": nonce}, handle)
+            except Exception:
+                pass
+        ack = {"id": request_id + ":ack", "method": "pane.ack_orientation", "params": {
+            "pane_id": pane_id, "source": source, "agent_session_id": agent_session_id, "nonce": nonce}}
+        for _ in range(2):
+            try:
+                ack_response = call(ack)
+                if isinstance(ack_response, dict) and "error" not in ack_response:
+                    try: os.unlink(receipt)
+                    except OSError: pass
+                    break
+            except Exception:
+                time.sleep(0.05)
 except Exception:
     pass
 PY

@@ -102,6 +102,9 @@ pub struct TerminalState {
     pub state: AgentState,
     pub revision: u64,
     pub orientation: crate::agent_orientation::OrientationState,
+    /// SessionStart offer/receipt metadata; retained after delivery so a lost
+    /// acknowledgement response can be acknowledged idempotently.
+    pub orientation_offer: Option<crate::agent_orientation::OrientationOffer>,
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
@@ -145,6 +148,7 @@ impl TerminalState {
             state: AgentState::Unknown,
             revision: 0,
             orientation: crate::agent_orientation::OrientationState::Suppressed,
+            orientation_offer: None,
             launch_argv: None,
             respawn_shell_on_exit: false,
             starting_up: false,
@@ -309,6 +313,7 @@ impl TerminalState {
             && previous_session != self.current_session_identity_for_persistence()
         {
             self.orientation = crate::agent_orientation::OrientationState::Suppressed;
+            self.orientation_offer = None;
         }
         self.update_stale_hook_idle_window(now);
         TerminalStateMutation {
@@ -418,6 +423,7 @@ impl TerminalState {
         let current_session = self.current_session_identity_for_persistence();
         if previous_session.is_some() && previous_session != current_session {
             self.orientation = crate::agent_orientation::OrientationState::Suppressed;
+            self.orientation_offer = None;
         }
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
@@ -565,6 +571,7 @@ impl TerminalState {
         let current_session = self.current_session_identity_for_persistence();
         if previous_session.is_some() && previous_session != current_session {
             self.orientation = crate::agent_orientation::OrientationState::Suppressed;
+            self.orientation_offer = None;
         }
         Some(TerminalStateMutation {
             effective_state_change: None,
@@ -641,6 +648,7 @@ impl TerminalState {
         self.persisted_agent_session = None;
         if previous_session.is_some() {
             self.orientation = crate::agent_orientation::OrientationState::Suppressed;
+            self.orientation_offer = None;
         }
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
@@ -704,6 +712,7 @@ impl TerminalState {
         self.persisted_agent_session = None;
         if previous_session.is_some() {
             self.orientation = crate::agent_orientation::OrientationState::Suppressed;
+            self.orientation_offer = None;
         }
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
@@ -863,6 +872,7 @@ impl TerminalState {
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
         self.orientation = crate::agent_orientation::OrientationState::Suppressed;
+        self.orientation_offer = None;
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
         self.fallback_visible_blocker = false;

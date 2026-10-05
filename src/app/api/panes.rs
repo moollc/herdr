@@ -1,8 +1,8 @@
 use bytes::Bytes;
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneListParams,
-    PaneReadParams, PaneReadResult, PaneReleaseAgentParams, PaneRenameParams,
+    EventData, EventEnvelope, EventKind, PaneAckOrientationParams, PaneClearAgentAuthorityParams,
+    PaneListParams, PaneReadParams, PaneReadResult, PaneReleaseAgentParams, PaneRenameParams,
     PaneReportAgentParams, PaneReportAgentSessionParams, PaneReportMetadataParams,
     PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneTarget,
     ReadFormat, ReadSource, ResponseResult,
@@ -273,18 +273,42 @@ impl App {
                     == crate::agent_orientation::OrientationState::Delivered
                     && (same || old_session.is_none());
                 if fresh && !already_delivered {
-                    let context = format!(
-                        "{}{}\n[/Herdr orientation]",
-                        crate::agent_orientation::OPEN,
-                        self.orientation_context(&terminal_id)
-                    );
+                    let existing = self
+                        .state
+                        .terminals
+                        .get(&terminal_id)
+                        .and_then(|terminal| terminal.orientation_offer.clone())
+                        .filter(|offer| offer.session_id == session_id.clone().unwrap_or_default());
+                    let offer =
+                        existing.unwrap_or_else(|| crate::agent_orientation::OrientationOffer {
+                            session_id: session_id.clone().unwrap_or_default(),
+                            nonce: format!(
+                                "{}:{}",
+                                terminal_id,
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_nanos())
+                                    .unwrap_or_default()
+                            ),
+                            context: format!(
+                                "{}{}\n[/Herdr orientation]",
+                                crate::agent_orientation::OPEN,
+                                self.orientation_context(&terminal_id)
+                            ),
+                        });
                     if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                        terminal.orientation =
-                            crate::agent_orientation::OrientationState::Delivered;
+                        terminal.orientation = crate::agent_orientation::OrientationState::Offered;
+                        terminal.orientation_offer = Some(offer.clone());
                     }
                     self.state.mark_session_dirty();
                     self.schedule_session_save();
-                    return encode_success(id, ResponseResult::OrientationContext { context });
+                    return encode_success(
+                        id,
+                        ResponseResult::OrientationContext {
+                            context: offer.context,
+                            nonce: offer.nonce,
+                        },
+                    );
                 }
                 if already_delivered {
                     if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
@@ -294,6 +318,49 @@ impl App {
             }
         }
 
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    pub(super) fn handle_pane_ack_orientation(
+        &mut self,
+        id: String,
+        params: PaneAckOrientationParams,
+    ) -> String {
+        let Some(pane_id) = self.parse_reporting_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        if params.source != "herdr:codex" {
+            return encode_error(
+                id,
+                "invalid_orientation_ack",
+                "unrecognized orientation source",
+            );
+        }
+        let Some(terminal_id) = self.state.terminal_id_for_any_pane(pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let accepted = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| {
+                terminal.orientation_offer.as_ref().filter(|offer| {
+                    offer.session_id == params.agent_session_id && offer.nonce == params.nonce
+                })
+            })
+            .is_some();
+        if !accepted {
+            return encode_error(
+                id,
+                "invalid_orientation_ack",
+                "orientation offer does not match this conversation",
+            );
+        }
+        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            terminal.orientation = crate::agent_orientation::OrientationState::Delivered;
+        }
+        self.state.mark_session_dirty();
+        self.schedule_session_save();
         encode_success(id, ResponseResult::Ok {})
     }
 

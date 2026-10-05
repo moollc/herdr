@@ -772,12 +772,18 @@ fn restore_pane(
                 .map(|pane| pane.orientation)
                 .unwrap_or_default()
                 .restored(was_imported);
+            terminal.orientation_offer = if was_imported {
+                saved_pane.and_then(|pane| pane.orientation_offer.clone())
+            } else {
+                None
+            };
             if restarted_saved_command
                 && saved_pane.is_some_and(|pane| {
                     pane.orientation != crate::agent_orientation::OrientationState::Suppressed
                 })
             {
                 terminal.orientation = crate::agent_orientation::OrientationState::Pending;
+                terminal.orientation_offer = None;
             }
             if !was_imported {
                 terminal = terminal.with_restore_startup();
@@ -1318,6 +1324,7 @@ mod tests {
                     agent_session: None,
                     launch_argv: None,
                     orientation: crate::agent_orientation::OrientationState::Suppressed,
+                    orientation_offer: None,
                     seen: true,
                     completed: false,
                     agent_timing: None,
@@ -1383,6 +1390,7 @@ mod tests {
                     agent_session: None,
                     launch_argv: Some(launch_argv.clone()),
                     orientation: crate::agent_orientation::OrientationState::Pending,
+                    orientation_offer: None,
                     seen: true,
                     completed: false,
                     agent_timing: None,
@@ -1396,6 +1404,7 @@ mod tests {
         };
         for orientation in [
             crate::agent_orientation::OrientationState::Pending,
+            crate::agent_orientation::OrientationState::Offered,
             crate::agent_orientation::OrientationState::Delivered,
         ] {
             snapshot.detached_agents[0].pane.orientation = orientation;
@@ -1462,6 +1471,7 @@ mod tests {
                             agent_session: None,
                             launch_argv: Some(launch_argv.clone()),
                             orientation: crate::agent_orientation::OrientationState::Suppressed,
+                            orientation_offer: None,
                             seen: true,
                             completed: false,
                             agent_timing: None,
@@ -1531,6 +1541,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
+                orientation_offer: None,
                 seen,
                 completed,
                 agent_timing: None,
@@ -1668,6 +1679,7 @@ mod tests {
                             }),
                             launch_argv: None,
                             orientation: crate::agent_orientation::OrientationState::Suppressed,
+                            orientation_offer: None,
                             seen: true,
                             completed: false,
                             agent_timing: None,
@@ -1754,6 +1766,7 @@ mod tests {
                             }),
                             launch_argv: None,
                             orientation: crate::agent_orientation::OrientationState::Pending,
+                            orientation_offer: None,
                             seen: true,
                             completed: false,
                             agent_timing: None,
@@ -1928,6 +1941,7 @@ mod tests {
                 agent_session: None,
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
+                orientation_offer: None,
                 seen: true,
                 completed: false,
                 agent_timing: None,
@@ -1993,6 +2007,7 @@ mod tests {
             agent_session: None,
             launch_argv: None,
             orientation: crate::agent_orientation::OrientationState::Suppressed,
+            orientation_offer: None,
             seen: true,
             completed: false,
             agent_timing: None,

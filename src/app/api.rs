@@ -704,6 +704,9 @@ impl App {
             Method::PaneReportAgentSession(params) => {
                 return self.handle_pane_report_agent_session(request.id, params);
             }
+            Method::PaneAckOrientation(params) => {
+                return self.handle_pane_ack_orientation(request.id, params);
+            }
             Method::PaneReportMetadata(params) => {
                 return self.handle_pane_report_metadata(request.id, params);
             }

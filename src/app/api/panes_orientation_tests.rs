@@ -23,8 +23,21 @@ fn session_start(
     )
 }
 
+fn acknowledge(app: &mut App, pane: crate::layout::PaneId, session: &str, offer: &str) -> String {
+    let response: serde_json::Value = serde_json::from_str(offer).unwrap();
+    let nonce = response["result"]["nonce"].as_str().unwrap();
+    app.handle_pane_ack_orientation(
+        "ack".into(),
+        PaneAckOrientationParams {
+            pane_id: format!("p_{}", pane.raw()),
+            source: "herdr:codex".into(),
+            agent_session_id: session.into(),
+            nonce: nonce.into(),
+        },
+    )
+}
+
 #[tokio::test]
-#[ignore = "requires local Codex client with SessionStart hooks; uses only a loopback model fixture"]
 async fn external_codex_deepseek_model_request_receives_orientation_before_task() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
@@ -87,6 +100,28 @@ async fn external_codex_deepseek_model_request_receives_orientation_before_task(
         stream,
         "{}",
         app.handle_api_request(serde_json::from_str(&request).unwrap())
+    )
+    .unwrap();
+    let (mut ack_stream, _) = loop {
+        match listener.accept() {
+            Ok(stream) => break stream,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => panic!("startup hook did not acknowledge orientation: {err}"),
+        }
+    };
+    let mut ack = String::new();
+    BufReader::new(ack_stream.try_clone().unwrap())
+        .read_line(&mut ack)
+        .unwrap();
+    writeln!(
+        ack_stream,
+        "{}",
+        app.handle_api_request(serde_json::from_str(&ack).unwrap())
     )
     .unwrap();
     let output = child.wait_with_output().unwrap();
@@ -201,6 +236,17 @@ async fn external_codex_deepseek_panel_hook_delivers_generated_identity_before_l
     let request: crate::api::schema::Request = serde_json::from_str(&request).unwrap();
     let response = app.handle_api_request(request);
     writeln!(stream, "{response}").unwrap();
+    let (mut ack_stream, _) = listener.accept().unwrap();
+    let mut ack = String::new();
+    BufReader::new(ack_stream.try_clone().unwrap())
+        .read_line(&mut ack)
+        .unwrap();
+    writeln!(
+        ack_stream,
+        "{}",
+        app.handle_api_request(serde_json::from_str(&ack).unwrap())
+    )
+    .unwrap();
     let output = child.join().unwrap();
     assert!(output.status.success());
     let output: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -271,7 +317,13 @@ async fn orientation_hook_coordinates_structured_delivery_and_new_generation() {
         app.state.terminals[&terminal_id].orientation,
         crate::agent_orientation::OrientationState::Delivered
     );
-    assert!(session_start(&mut app, pane, "next", "startup", 2).contains("Managed by Herdr"));
+    let offer = session_start(&mut app, pane, "next", "startup", 2);
+    assert!(offer.contains("Managed by Herdr"));
+    assert_eq!(
+        app.state.terminals[&terminal_id].orientation,
+        crate::agent_orientation::OrientationState::Offered
+    );
+    assert!(acknowledge(&mut app, pane, "next", &offer).contains("result"));
     assert!(!session_start(&mut app, pane, "next", "startup", 3).contains("context"));
     app.state
         .terminals
@@ -283,6 +335,54 @@ async fn orientation_hook_coordinates_structured_delivery_and_new_generation() {
         app.state.terminals[&terminal_id].orientation,
         crate::agent_orientation::OrientationState::Suppressed
     );
+}
+
+#[tokio::test]
+async fn orientation_offer_retries_after_lost_response_and_only_acknowledgement_delivers() {
+    let (mut app, pane) = app_with_two_panes();
+    let terminal_id = app.state.terminal_id_for_any_pane(pane).unwrap();
+    app.state
+        .terminals
+        .get_mut(&terminal_id)
+        .unwrap()
+        .detected_agent = Some(crate::detect::Agent::Codex);
+    let first = session_start(&mut app, pane, "external", "startup", 1);
+    let retry = session_start(&mut app, pane, "external", "startup", 2);
+    let first_value: serde_json::Value = serde_json::from_str(&first).unwrap();
+    let retry_value: serde_json::Value = serde_json::from_str(&retry).unwrap();
+    assert_eq!(
+        first_value["result"]["nonce"],
+        retry_value["result"]["nonce"]
+    );
+    assert_eq!(
+        first_value["result"]["context"],
+        retry_value["result"]["context"]
+    );
+    assert_eq!(
+        app.state.terminals[&terminal_id].orientation,
+        crate::agent_orientation::OrientationState::Offered
+    );
+    // A bad nonce models a lost/timed-out hook response: it must not deliver.
+    let bad = app.handle_pane_ack_orientation(
+        "bad".into(),
+        PaneAckOrientationParams {
+            pane_id: format!("p_{}", pane.raw()),
+            source: "herdr:codex".into(),
+            agent_session_id: "external".into(),
+            nonce: "lost".into(),
+        },
+    );
+    assert!(bad.contains("invalid_orientation_ack"));
+    assert_eq!(
+        app.state.terminals[&terminal_id].orientation,
+        crate::agent_orientation::OrientationState::Offered
+    );
+    assert!(acknowledge(&mut app, pane, "external", &retry).contains("result"));
+    assert_eq!(
+        app.state.terminals[&terminal_id].orientation,
+        crate::agent_orientation::OrientationState::Delivered
+    );
+    assert!(acknowledge(&mut app, pane, "external", &retry).contains("result"));
 }
 
 #[tokio::test]
