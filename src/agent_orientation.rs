@@ -27,6 +27,26 @@ impl OrientationState {
     }
 }
 
+/// Hook-free startup orientation for agents Herdr only detects, such as ones
+/// typed into a shell. Runtime only: each new agent process, including one
+/// coming back after a cold restart, is oriented once when it first goes idle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AutoOrientation {
+    /// No agent process is being tracked.
+    #[default]
+    Unarmed,
+    /// An agent appeared and has not yet been oriented or interrupted.
+    Armed,
+    /// Oriented, skipped, or cancelled for the current agent process.
+    Done,
+}
+
+pub const AUTO_NOTE: &str = "Herdr sent this automatically when you started. It is context, not a task. Reply with one short line naming your pane, workspace and session, then wait for the user.";
+
+pub fn auto_message(context: &str) -> String {
+    format!("{OPEN}{context}\n[/Herdr orientation]\n{AUTO_NOTE}")
+}
+
 /// The server's durable side of a hook offer.  The nonce binds acknowledgement
 /// to one terminal generation and native conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,5 +1,5 @@
 //! Collect delivery-time evidence outside rendering and share task delivery.
-use crate::agent_orientation::{quoted, OrientationState};
+use crate::agent_orientation::{quoted, AutoOrientation, OrientationState};
 use crate::app::App;
 use crate::terminal::TerminalId;
 use std::path::{Path, PathBuf};
@@ -90,10 +90,88 @@ impl App {
         let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
             return;
         };
+        // Typing into an agent before it settles means the user is already
+        // talking to it; a late injection would land inside their draft.
+        if terminal.auto_orientation == AutoOrientation::Armed {
+            terminal.auto_orientation = AutoOrientation::Done;
+            tracing::info!(terminal = %terminal_id, "auto orientation cancelled by user input");
+        }
         if terminal.orientation == OrientationState::Pending {
             terminal.orientation = OrientationState::Suppressed;
             self.state.mark_session_dirty();
             self.schedule_session_save();
+        }
+    }
+
+    /// Orient an agent that no hook or Herdr launch has oriented, once per
+    /// agent process, as soon as it is ready for input.
+    pub(super) fn maybe_auto_orient(&mut self, pane_id: crate::layout::PaneId) {
+        let Some(terminal_id) = self.state.terminal_id_for_any_pane(pane_id) else {
+            return;
+        };
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        let hook_owned = matches!(
+            terminal.orientation,
+            OrientationState::Offered | OrientationState::Delivered
+        );
+        match (terminal.effective_known_agent(), terminal.auto_orientation) {
+            (None, AutoOrientation::Unarmed) => return,
+            (None, _) => {
+                // The agent exited. Its successor in this pane is a new
+                // conversation and needs its own orientation.
+                terminal.auto_orientation = AutoOrientation::Unarmed;
+                if terminal.orientation == OrientationState::Delivered {
+                    terminal.orientation = OrientationState::Suppressed;
+                    terminal.orientation_offer = None;
+                    self.state.mark_session_dirty();
+                    self.schedule_session_save();
+                }
+                return;
+            }
+            (Some(_), AutoOrientation::Unarmed) => {
+                // Already oriented here means a Herdr launch task or a live
+                // handoff carried it; a cold restore arrives suppressed.
+                terminal.auto_orientation = if hook_owned {
+                    AutoOrientation::Done
+                } else {
+                    AutoOrientation::Armed
+                };
+            }
+            (Some(_), AutoOrientation::Armed) if hook_owned => {
+                terminal.auto_orientation = AutoOrientation::Done;
+                return;
+            }
+            (Some(_), _) => {}
+        }
+        if terminal.auto_orientation != AutoOrientation::Armed
+            || terminal.state != crate::detect::AgentState::Idle
+        {
+            return;
+        }
+        let text = crate::agent_orientation::auto_message(&self.orientation_context(&terminal_id));
+        let Some(runtime) = self
+            .state
+            .runtime_for_agent_pane(&self.terminal_runtimes, pane_id)
+        else {
+            return;
+        };
+        let sent = super::api_helpers::send_prompt(runtime, &text);
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        terminal.auto_orientation = AutoOrientation::Done;
+        match sent {
+            Ok(()) => {
+                terminal.orientation = OrientationState::Delivered;
+                tracing::info!(terminal = %terminal_id, "auto orientation delivered");
+                self.state.mark_session_dirty();
+                self.schedule_session_save();
+            }
+            Err((_, error)) => {
+                tracing::warn!(terminal = %terminal_id, %error, "auto orientation could not be sent");
+            }
         }
     }
 
@@ -297,6 +375,152 @@ mod tests {
         let (runtime, rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
         app.terminal_runtimes.insert(terminal_id.clone(), runtime);
         (app, pane_id, terminal_id, rx)
+    }
+
+    fn observe(
+        app: &mut App,
+        pane: crate::layout::PaneId,
+        terminal: &TerminalId,
+        agent: Option<crate::detect::Agent>,
+        state: crate::detect::AgentState,
+    ) {
+        let _ = app
+            .state
+            .terminals
+            .get_mut(terminal)
+            .unwrap()
+            .set_detected_state_with_screen_signals_at(
+                agent,
+                state,
+                false,
+                false,
+                false,
+                false,
+                std::time::Instant::now(),
+            );
+        app.maybe_auto_orient(pane);
+    }
+
+    fn sent(rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>) -> String {
+        let mut text = String::new();
+        while let Ok(bytes) = rx.try_recv() {
+            text.push_str(&String::from_utf8_lossy(&bytes));
+        }
+        text
+    }
+
+    #[tokio::test]
+    async fn detected_agent_is_oriented_once_when_first_ready_and_again_after_restart() {
+        use crate::detect::{Agent, AgentState};
+        let (mut app, pane, terminal, mut rx) = prompt_app(OrientationState::Suppressed);
+        observe(
+            &mut app,
+            pane,
+            &terminal,
+            Some(Agent::Codex),
+            AgentState::Working,
+        );
+        assert_eq!(sent(&mut rx), "", "booting agent is not ready for input");
+        observe(
+            &mut app,
+            pane,
+            &terminal,
+            Some(Agent::Codex),
+            AgentState::Idle,
+        );
+        let first = sent(&mut rx);
+        assert!(first.contains(crate::agent_orientation::OPEN.trim_end()));
+        assert!(first.contains(crate::agent_orientation::AUTO_NOTE));
+        assert!(first.contains(&format!("raw live pane=\"p_{}\"", pane.raw())));
+        assert_eq!(
+            app.state.terminals[&terminal].orientation,
+            OrientationState::Delivered
+        );
+        observe(
+            &mut app,
+            pane,
+            &terminal,
+            Some(Agent::Codex),
+            AgentState::Working,
+        );
+        observe(
+            &mut app,
+            pane,
+            &terminal,
+            Some(Agent::Codex),
+            AgentState::Idle,
+        );
+        assert_eq!(sent(&mut rx), "", "one orientation per agent process");
+
+        observe(&mut app, pane, &terminal, None, AgentState::Unknown);
+        assert_eq!(
+            app.state.terminals[&terminal].orientation,
+            OrientationState::Suppressed
+        );
+        observe(
+            &mut app,
+            pane,
+            &terminal,
+            Some(Agent::Claude),
+            AgentState::Idle,
+        );
+        assert!(sent(&mut rx).contains(crate::agent_orientation::AUTO_NOTE));
+    }
+
+    #[tokio::test]
+    async fn user_input_before_ready_cancels_auto_orientation() {
+        use crate::detect::{Agent, AgentState};
+        let (mut app, pane, terminal, mut rx) = prompt_app(OrientationState::Suppressed);
+        observe(
+            &mut app,
+            pane,
+            &terminal,
+            Some(Agent::Claude),
+            AgentState::Working,
+        );
+        app.suppress_pending_orientation(pane);
+        observe(
+            &mut app,
+            pane,
+            &terminal,
+            Some(Agent::Claude),
+            AgentState::Idle,
+        );
+        assert_eq!(sent(&mut rx), "");
+    }
+
+    #[tokio::test]
+    async fn hook_and_launch_orientation_are_not_duplicated() {
+        use crate::detect::{Agent, AgentState};
+        for state in [OrientationState::Offered, OrientationState::Delivered] {
+            let (mut app, pane, terminal, mut rx) = prompt_app(state);
+            observe(
+                &mut app,
+                pane,
+                &terminal,
+                Some(Agent::Codex),
+                AgentState::Idle,
+            );
+            assert_eq!(sent(&mut rx), "", "{state:?} already owns orientation");
+        }
+        // A startup hook that offers after detection still wins.
+        let (mut app, pane, terminal, mut rx) = prompt_app(OrientationState::Suppressed);
+        observe(
+            &mut app,
+            pane,
+            &terminal,
+            Some(Agent::Codex),
+            AgentState::Working,
+        );
+        app.state.terminals.get_mut(&terminal).unwrap().orientation = OrientationState::Offered;
+        observe(
+            &mut app,
+            pane,
+            &terminal,
+            Some(Agent::Codex),
+            AgentState::Idle,
+        );
+        assert_eq!(sent(&mut rx), "");
     }
 
     #[tokio::test]

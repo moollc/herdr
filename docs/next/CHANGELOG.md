@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Agents started by typing their command into a pane, such as Claude Code or a Codex wrapper, now receive the Herdr orientation as soon as they are ready for input, with no hook needed. Each agent gets it once. An agent that exits and starts again in the same pane, including after a cold restart, gets it again; live handoffs do not. Typing into the agent before it is ready cancels it, and agents already oriented by a hook or a Herdr launch are skipped.
 - Codex startup orientation now uses durable receipts across hook processes, retries failed socket requests, and reports delivery failures instead of silently sending tasks without context. Integration install and status include existing provider homes and check profile hook overrides, so wrapper-selected Codex homes can receive the startup hook.
 - Preserve a fresh agent's Herdr-managed identity when a sandboxed command environment does not inherit `HERDR_ENV`, and allow agents to inspect and coordinate with counterparts through the local socket API without that variable.
 

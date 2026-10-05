@@ -236,8 +236,18 @@ impl App {
         } else {
             None
         };
+        let orient_pane = match &ev {
+            AppEvent::StateChanged { pane_id, .. }
+            | AppEvent::HookStateReported { pane_id, .. }
+            | AppEvent::HookAuthorityCleared { pane_id, .. }
+            | AppEvent::HookAgentReleased { pane_id, .. } => Some(*pane_id),
+            _ => None,
+        };
         let previous_toast = self.state.toast.clone();
         let pane_updates = self.state.handle_app_event(ev);
+        if let Some(pane_id) = orient_pane {
+            self.maybe_auto_orient(pane_id);
+        }
         for update in &pane_updates {
             self.refresh_new_herdr_toast_context_for_update(update, &previous_toast);
             self.emit_pane_state_update(update);
