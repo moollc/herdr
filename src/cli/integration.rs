@@ -54,6 +54,10 @@ fn integration_status(args: &[String]) -> std::io::Result<i32> {
         println!("{target}: {state} ({})", status.path.display());
     }
 
+    for diagnostic in crate::integration::codex_readiness_diagnostics() {
+        println!("{diagnostic}");
+    }
+
     Ok(0)
 }
 

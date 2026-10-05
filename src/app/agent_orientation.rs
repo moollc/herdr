@@ -223,6 +223,15 @@ impl App {
             .state
             .terminal_id_for_any_pane(pane_id)
             .ok_or_else(|| ("agent_not_found", "terminal not found".into()))?;
+        if !task.trim().is_empty()
+            && self
+                .state
+                .terminals
+                .get(&terminal_id)
+                .is_some_and(|terminal| terminal.orientation == OrientationState::Offered)
+        {
+            return Err(("orientation_delivery_pending", "startup orientation emission is unacknowledged; retry the SessionStart hook or start a fresh conversation before sending a task".into()));
+        }
         let orient = self
             .state
             .terminals
@@ -473,8 +482,25 @@ mod tests {
         use std::os::unix::net::UnixStream;
         use std::time::Duration;
 
-        for orientation in [OrientationState::Pending, OrientationState::Delivered] {
+        for orientation in [
+            OrientationState::Pending,
+            OrientationState::Offered,
+            OrientationState::Delivered,
+        ] {
             let (mut original, old_pane, terminal, _rx) = prompt_app(orientation);
+            let offer = crate::agent_orientation::OrientationOffer {
+                session_id: "native-session".into(),
+                nonce: "retained-nonce".into(),
+                context: "retained orientation fields".into(),
+            };
+            if orientation == OrientationState::Offered {
+                original
+                    .state
+                    .terminals
+                    .get_mut(&terminal)
+                    .unwrap()
+                    .orientation_offer = Some(offer.clone());
+            }
             let detached = original.state.detached_agents.remove(0);
             original
                 .state
@@ -534,6 +560,33 @@ mod tests {
                 Some(terminal.clone())
             );
             restored.unpause_handoff_readers();
+            if orientation == OrientationState::Offered {
+                assert_eq!(
+                    restored.state.terminals[&terminal]
+                        .orientation_offer
+                        .as_ref(),
+                    Some(&offer)
+                );
+                assert_eq!(
+                    restored
+                        .send_agent_task(pane, "pending task")
+                        .unwrap_err()
+                        .0,
+                    "orientation_delivery_pending"
+                );
+                let ack = restored.handle_api_request(crate::api::schema::Request {
+                    id: "handoff-ack".into(),
+                    method: crate::api::schema::Method::PaneAckOrientation(
+                        crate::api::schema::PaneAckOrientationParams {
+                            pane_id: format!("p_{}", pane.raw()),
+                            source: "herdr:codex".into(),
+                            agent_session_id: offer.session_id,
+                            nonce: offer.nonce,
+                        },
+                    ),
+                });
+                assert!(ack.contains("result"), "{ack}");
+            }
 
             let first = "first task after handoff";
             let expected = if orientation == OrientationState::Pending {

@@ -113,7 +113,11 @@ herdr integration install codex
 
 The Codex hook reports session identity through the same local socket API used by other integrations. Codex state comes from Herdr's screen detection.
 
-Herdr uses `~/.codex` by default, or `CODEX_HOME` when set. The Codex config directory must already exist. Install writes `herdr-agent-state.sh`, updates `hooks.json`, and ensures `[features] hooks = true` in `config.toml`. It also removes the deprecated top-level `codex_hooks` flag when present. Uninstall removes Herdr entries from `hooks.json` and deletes the hook script, but leaves `config.toml` unchanged.
+Herdr uses `CODEX_HOME` when set. Otherwise install, uninstall, and status include `~/.codex` and existing `~/.codex-*` provider homes containing `config.toml`, such as those selected by `codex-switch`. For another wrapper-selected directory, run the command with that wrapper's `CODEX_HOME`. Config directories must already exist. Install writes `herdr-agent-state.sh`, updates `hooks.json`, and enables `[features] hooks = true`, including explicit profile feature-table overrides, while removing deprecated `codex_hooks` flags from those tables. Uninstall removes Herdr hook entries and the script, leaving `config.toml` unchanged.
+
+Run `herdr integration status` to check each discovered home's hook registration and feature settings. A configured integration still requires normal Codex hook trust approval in that home; Herdr does not bypass trust. Approve the SessionStart hook before submitting the first task. A compatible Codex client supplies orientation as SessionStart `additionalContext` for a fresh conversation, before the unchanged user task. Native resume and compact events do not supply it again.
+
+The hook retries socket delivery before emission and reports failures on stderr. Durable receipts serialize concurrent hooks and prevent a lost acknowledgement from repeating context. An acknowledgement means the hook emitted stdout, not that the model received it. If a crash leaves emission uncertain, the hook reports that state and avoids re-emitting or acknowledging it; start a fresh conversation to recover. Structured task delivery reports an error while a startup offer remains unacknowledged.
 
 ## GitHub Copilot CLI
 

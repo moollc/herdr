@@ -775,9 +775,15 @@ mod tests {
             crate::agent_orientation::OrientationState::Delivered,
         ] {
             pane.orientation = state;
+            pane.orientation_offer = Some(crate::agent_orientation::OrientationOffer {
+                session_id: "native-session".into(),
+                nonce: "term_1:nonce".into(),
+                context: "all accepted fields".into(),
+            });
             let restored: PaneSnapshot =
                 serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
             assert_eq!(restored.orientation, state);
+            assert_eq!(restored.orientation_offer, pane.orientation_offer);
             assert_eq!(restored.orientation.restored(true), state);
             assert_eq!(
                 restored.orientation.restored(false),

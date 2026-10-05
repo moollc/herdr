@@ -38,6 +38,7 @@ fn acknowledge(app: &mut App, pane: crate::layout::PaneId, session: &str, offer:
 }
 
 #[tokio::test]
+#[ignore = "requires a separately provisioned compatible Codex client; set HERDR_TEST_CODEX and run explicitly"]
 async fn external_codex_deepseek_model_request_receives_orientation_before_task() {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
@@ -335,6 +336,33 @@ async fn orientation_hook_coordinates_structured_delivery_and_new_generation() {
         app.state.terminals[&terminal_id].orientation,
         crate::agent_orientation::OrientationState::Suppressed
     );
+}
+
+#[tokio::test]
+async fn orientation_offered_blocks_task_until_hook_emission_is_acknowledged() {
+    let (mut app, pane) = app_with_two_panes();
+    let terminal_id = app.state.terminal_id_for_any_pane(pane).unwrap();
+    app.state
+        .terminals
+        .get_mut(&terminal_id)
+        .unwrap()
+        .detected_agent = Some(crate::detect::Agent::Codex);
+    let offer = session_start(&mut app, pane, "external", "startup", 1);
+    let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+    app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+    let task = "  exact task\n";
+    assert_eq!(
+        app.send_agent_task(pane, task).unwrap_err().0,
+        "orientation_delivery_pending"
+    );
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        app.state.terminals[&terminal_id].orientation,
+        crate::agent_orientation::OrientationState::Offered
+    );
+    assert!(acknowledge(&mut app, pane, "external", &offer).contains("result"));
+    app.send_agent_task(pane, task).unwrap();
+    assert_eq!(&rx.try_recv().unwrap()[..], format!("{task}\r").as_bytes());
 }
 
 #[tokio::test]

@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Codex startup orientation now uses durable receipts across hook processes, retries failed socket requests, and reports delivery failures instead of silently sending tasks without context. Integration install and status include existing provider homes and check profile hook overrides, so wrapper-selected Codex homes can receive the startup hook.
 - Preserve a fresh agent's Herdr-managed identity when a sandboxed command environment does not inherit `HERDR_ENV`, and allow agents to inspect and coordinate with counterparts through the local socket API without that variable.
 
 ### Added

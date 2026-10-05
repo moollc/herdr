@@ -325,18 +325,25 @@ pub(crate) fn install_target(
             messages
         }
         crate::api::schema::IntegrationTarget::Codex => {
-            let installed = install_codex()?;
-            vec![
-                format!(
+            let mut messages = Vec::new();
+            for dir in codex_homes()? {
+                let installed = install_codex_at(&dir)?;
+                messages.push(format!(
                     "installed codex integration hook to {}",
                     installed.hook_path.display()
-                ),
-                format!("ensured codex hooks at {}", installed.hooks_path.display()),
-                format!(
+                ));
+                messages.push(format!(
+                    "ensured codex hooks at {}",
+                    installed.hooks_path.display()
+                ));
+                messages.push(format!(
                     "ensured codex config at {}",
                     installed.config_path.display()
-                ),
-            ]
+                ));
+            }
+            messages.extend(codex_readiness_diagnostics());
+            messages.push("approve the Herdr SessionStart hook in each Codex home using normal hook trust before submitting the first task".into());
+            messages
         }
         crate::api::schema::IntegrationTarget::Copilot => {
             let installed = install_copilot()?;
@@ -503,34 +510,36 @@ pub(crate) fn uninstall_target(
             messages
         }
         crate::api::schema::IntegrationTarget::Codex => {
-            let result = uninstall_codex()?;
             let mut messages = Vec::new();
-            if result.removed_hook_file {
+            for dir in codex_homes()? {
+                let result = uninstall_codex_at(&dir)?;
+                if result.removed_hook_file {
+                    messages.push(format!(
+                        "removed codex hook at {}",
+                        result.hook_path.display()
+                    ));
+                } else {
+                    messages.push(format!(
+                        "no codex hook found at {}",
+                        result.hook_path.display()
+                    ));
+                }
+                if result.updated_hooks {
+                    messages.push(format!(
+                        "removed herdr codex hook entries from {}",
+                        result.hooks_path.display()
+                    ));
+                } else {
+                    messages.push(format!(
+                        "no herdr codex hook entries found in {}",
+                        result.hooks_path.display()
+                    ));
+                }
                 messages.push(format!(
-                    "removed codex hook at {}",
-                    result.hook_path.display()
-                ));
-            } else {
-                messages.push(format!(
-                    "no codex hook found at {}",
-                    result.hook_path.display()
+                    "left codex config unchanged at {}",
+                    result.config_path.display()
                 ));
             }
-            if result.updated_hooks {
-                messages.push(format!(
-                    "removed herdr codex hook entries from {}",
-                    result.hooks_path.display()
-                ));
-            } else {
-                messages.push(format!(
-                    "no herdr codex hook entries found in {}",
-                    result.hooks_path.display()
-                ));
-            }
-            messages.push(format!(
-                "left codex config unchanged at {}",
-                result.config_path.display()
-            ));
             messages
         }
         crate::api::schema::IntegrationTarget::Copilot => {
@@ -826,12 +835,12 @@ fn outdated_installed_integrations() -> Vec<IntegrationStatus> {
         .collect()
 }
 
-fn integration_specs() -> [(
+fn integration_specs() -> Vec<(
     crate::api::schema::IntegrationTarget,
     io::Result<PathBuf>,
     u32,
-); 11] {
-    [
+)> {
+    let mut specs = vec![
         (
             crate::api::schema::IntegrationTarget::Pi,
             pi_extension_dir().map(|dir| dir.join(PI_EXTENSION_INSTALL_NAME)),
@@ -887,7 +896,17 @@ fn integration_specs() -> [(
             grok_dir().map(|dir| dir.join("hooks").join(GROK_HOOK_INSTALL_NAME)),
             GROK_INTEGRATION_VERSION,
         ),
-    ]
+    ];
+    if let Ok(homes) = codex_homes() {
+        for dir in homes.into_iter().skip(1) {
+            specs.push((
+                crate::api::schema::IntegrationTarget::Codex,
+                Ok(dir.join(CODEX_HOOK_INSTALL_NAME)),
+                CODEX_INTEGRATION_VERSION,
+            ));
+        }
+    }
+    specs
 }
 
 pub(crate) fn integration_update_instructions(
@@ -1156,8 +1175,12 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn install_codex() -> io::Result<CodexInstallPaths> {
-    let dir = codex_dir()?;
+    install_codex_at(&codex_dir()?)
+}
+
+fn install_codex_at(dir: &Path) -> io::Result<CodexInstallPaths> {
     if !dir.is_dir() {
         return Err(io::Error::other(format!(
             "codex config directory not found at {}. install codex first",
@@ -1596,8 +1619,12 @@ pub(crate) fn uninstall_claude() -> io::Result<ClaudeUninstallResult> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn uninstall_codex() -> io::Result<CodexUninstallResult> {
-    let codex_dir = codex_dir()?;
+    uninstall_codex_at(&codex_dir()?)
+}
+
+fn uninstall_codex_at(codex_dir: &Path) -> io::Result<CodexUninstallResult> {
     let hook_path = codex_dir.join(CODEX_HOOK_INSTALL_NAME);
     let hooks_path = codex_dir.join("hooks.json");
     let config_path = codex_dir.join("config.toml");
@@ -2434,7 +2461,7 @@ fn build_codex_config_with_hooks(content: &str) -> String {
     if hooks_index.is_none() {
         if let Some(index) = features_header_index {
             lines.insert(index + 1, "hooks = true".to_string());
-            return join_toml_lines(lines, trailing_newline);
+            return enable_codex_profile_hooks(&join_toml_lines(lines, trailing_newline));
         }
 
         let mut result = content.trim_end_matches('\n').to_string();
@@ -2443,10 +2470,41 @@ fn build_codex_config_with_hooks(content: &str) -> String {
             result.push('\n');
         }
         result.push_str("[features]\nhooks = true\n");
-        return result;
+        return enable_codex_profile_hooks(&result);
     }
 
-    join_toml_lines(lines, trailing_newline)
+    enable_codex_profile_hooks(&join_toml_lines(lines, trailing_newline))
+}
+
+fn enable_codex_profile_hooks(content: &str) -> String {
+    let mut profile_features = false;
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        if let Some(header) = toml_table_header(line) {
+            // Parse the header to support quoted profile names too.
+            profile_features = toml::from_str::<toml::Value>(&format!("{header}\nhooks = false"))
+                .ok()
+                .and_then(|value| value.get("profiles").cloned())
+                .and_then(|value| value.as_table().cloned())
+                .is_some_and(|profiles| {
+                    profiles.values().any(|profile| {
+                        profile
+                            .get("features")
+                            .and_then(|features| features.get("hooks"))
+                            .is_some()
+                    })
+                });
+        }
+        if profile_features && is_toml_key(line, "codex_hooks") {
+            continue;
+        }
+        lines.push(if profile_features && is_toml_key(line, "hooks") {
+            "hooks = true".to_string()
+        } else {
+            line.to_string()
+        });
+    }
+    join_toml_lines(lines, content.ends_with('\n'))
 }
 
 fn build_kimi_config_with_hooks(content: &str, hook_path: &Path) -> String {
@@ -2612,6 +2670,71 @@ pub(crate) fn claude_dir() -> io::Result<PathBuf> {
 
 pub(crate) fn codex_dir() -> io::Result<PathBuf> {
     config_dir_from_env_or_home(CODEX_HOME_ENV_VAR, &[".codex"])
+}
+
+/// An explicit CODEX_HOME is authoritative. Otherwise include existing provider
+/// homes used by wrappers such as codex-switch, without executing the wrapper.
+fn codex_homes() -> io::Result<Vec<PathBuf>> {
+    let primary = codex_dir()?;
+    let mut homes = vec![primary.clone()];
+    if std::env::var_os(CODEX_HOME_ENV_VAR).is_some_and(|value| !value.is_empty()) {
+        return Ok(homes);
+    }
+    let mut siblings = Vec::new();
+    for entry in fs::read_dir(home_dir()?)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with(".codex-")
+            && path.is_dir()
+            && path.join("config.toml").is_file()
+            && path != primary
+        {
+            siblings.push(path);
+        }
+    }
+    siblings.sort();
+    homes.extend(siblings);
+    Ok(homes)
+}
+
+/// Config readiness is separate from an asset version: a current hook file can
+/// still be disabled, unregistered or untrusted by the client.
+pub(crate) fn codex_readiness_diagnostics() -> Vec<String> {
+    let homes = match codex_homes() {
+        Ok(homes) => homes,
+        Err(error) => return vec![format!("codex orientation: cannot discover homes: {error}")],
+    };
+    homes.into_iter().map(|dir| {
+        let check = || -> Result<(), String> {
+            if !dir.join(CODEX_HOOK_INSTALL_NAME).is_file() {
+                return Err("missing integration; run herdr integration install codex in the wrapper's CODEX_HOME".into());
+            }
+            let content = fs::read_to_string(dir.join("config.toml")).map_err(|e| e.to_string())?;
+            let config: toml::Value = toml::from_str(&content).map_err(|e| e.to_string())?;
+            let enabled = |value: &toml::Value| value.get("features").and_then(|f| f.get("hooks")).and_then(toml::Value::as_bool);
+            if enabled(&config) != Some(true) {
+                return Err("hooks disabled or unset in config.toml".into());
+            }
+            if let Some(profiles) = config.get("profiles").and_then(toml::Value::as_table) {
+                for (name, profile) in profiles {
+                    if enabled(profile) == Some(false) {
+                        return Err(format!("hooks disabled in profile {name}"));
+                    }
+                }
+            }
+            let hooks: Value = serde_json::from_str(&fs::read_to_string(dir.join("hooks.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            let command = format!("bash {} session", shell_single_quote(&dir.join(CODEX_HOOK_INSTALL_NAME).display().to_string()));
+            let registered = hooks.get("hooks").and_then(|h| h.get("SessionStart")).and_then(Value::as_array).is_some_and(|entries| entries.iter().any(|entry| {
+                entry.get("hooks").and_then(Value::as_array).is_some_and(|items| items.iter().any(|item| item.get("command").and_then(Value::as_str) == Some(command.as_str())))
+            }));
+            if !registered { return Err("missing Herdr SessionStart registration".into()); }
+            Ok(())
+        };
+        match check() {
+            Ok(()) => format!("codex orientation ({}): configured; normal Codex hook trust approval is still required", dir.display()),
+            Err(error) => format!("codex orientation ({}): unavailable: {error}", dir.display()),
+        }
+    }).collect()
 }
 
 fn kimi_dir() -> io::Result<PathBuf> {
@@ -3501,6 +3624,73 @@ mod tests {
     }
 
     #[test]
+    fn codex_orientation_provider_homes_install_and_readiness() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home");
+        for name in [
+            ".codex",
+            ".codex-deepseek",
+            ".codex-openrouter",
+            ".codex-gpt",
+        ] {
+            let dir = home.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("config.toml"), "# keep comment\nprofile = \"flash\"\n[profiles.flash.features]\nhooks = false\n[profiles.pro.features]\nhooks = false\n").unwrap();
+        }
+        std::env::set_var("HOME", &home);
+        std::env::remove_var(CODEX_HOME_ENV_VAR);
+        assert_eq!(codex_homes().unwrap().len(), 4);
+        assert!(codex_readiness_diagnostics()
+            .iter()
+            .all(|message| message.contains("missing integration")));
+        install_target(crate::api::schema::IntegrationTarget::Codex).unwrap();
+        assert!(codex_readiness_diagnostics()
+            .iter()
+            .all(|message| message.contains("configured; normal Codex hook trust")));
+        for dir in codex_homes().unwrap() {
+            assert!(dir.join(CODEX_HOOK_INSTALL_NAME).is_file());
+            assert!(fs::read_to_string(dir.join("config.toml"))
+                .unwrap()
+                .contains("# keep comment"));
+        }
+        let provider = home.join(".codex-deepseek");
+        std::env::set_var(CODEX_HOME_ENV_VAR, &provider);
+        assert_eq!(codex_homes().unwrap(), vec![provider.clone()]);
+        fs::write(
+            provider.join("config.toml"),
+            "[features]\nhooks = true\n[profiles.flash.features]\nhooks = false\n",
+        )
+        .unwrap();
+        assert!(codex_readiness_diagnostics()[0].contains("hooks disabled in profile flash"));
+        install_target(crate::api::schema::IntegrationTarget::Codex).unwrap();
+        fs::write(provider.join("hooks.json"), "{}").unwrap();
+        assert!(codex_readiness_diagnostics()[0].contains("missing Herdr SessionStart"));
+        std::env::remove_var(CODEX_HOME_ENV_VAR);
+        uninstall_target(crate::api::schema::IntegrationTarget::Codex).unwrap();
+        assert!(codex_homes()
+            .unwrap()
+            .iter()
+            .all(|dir| !dir.join(CODEX_HOOK_INSTALL_NAME).exists()));
+        std::env::remove_var("HOME");
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn production_codex_orientation_hook_regressions() {
+        let output = std::process::Command::new("python3")
+            .args(["-m", "unittest", "scripts.test_codex_orientation_hook"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn install_codex_writes_hook_and_updates_hooks_and_config() {
         let _lock = integration_env_lock();
         let base = unique_base();
@@ -3592,7 +3782,27 @@ mod tests {
     }
 
     #[test]
-    fn install_codex_only_migrates_top_level_feature_flags() {
+    fn codex_profile_migration_preserves_nested_tables_and_quoted_names() {
+        let config = "[profiles.\"work space\".features]\nhooks = false\nother = true\n[profiles.\"work space\".features.nested]\nhooks = false\n";
+        let updated = build_codex_config_with_hooks(config);
+        let parsed: toml::Value = toml::from_str(&updated).unwrap();
+        assert_eq!(
+            parsed["profiles"]["work space"]["features"]["hooks"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parsed["profiles"]["work space"]["features"]["nested"]["hooks"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parsed["profiles"]["work space"]["features"]["other"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(build_codex_config_with_hooks(&updated), updated);
+    }
+
+    #[test]
+    fn install_codex_migrates_profile_feature_overrides() {
         let _lock = integration_env_lock();
         let base = unique_base();
         let home = base.join("home");
@@ -3609,7 +3819,8 @@ mod tests {
 
         let config = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
 
-        assert!(config.contains("[profiles.work.features]\nhooks = false\ncodex_hooks = false"));
+        assert!(config.contains("[profiles.work.features]\nhooks = true"));
+        assert!(!config.contains("codex_hooks"));
         assert!(config.contains("[features]\nhooks = true\nother = true"));
 
         std::env::remove_var("HOME");
