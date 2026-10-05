@@ -37,9 +37,11 @@ fn instructions(cwd: &Path, root: &Path) -> Vec<PathBuf> {
         .collect();
     ancestors.reverse();
     for ancestor in ancestors {
-        let path = ancestor.join("AGENTS.md");
-        if readable(&path) {
-            files.push(path);
+        for name in ["AGENTS.md", "CLAUDE.md", "GEMINI.md"] {
+            let path = ancestor.join(name);
+            if readable(&path) {
+                files.push(path);
+            }
         }
     }
     files
@@ -72,6 +74,23 @@ fn branch_label(cwd: &Path, root: &Path) -> String {
 }
 
 impl App {
+    /// Literal input has no trustworthy task boundary. Once it reaches a
+    /// pending pane, suppress the structured envelope so it cannot be added
+    /// to a later follow-up task.
+    pub(super) fn suppress_pending_orientation(&mut self, pane_id: crate::layout::PaneId) {
+        let Some(terminal_id) = self.state.terminal_id_for_any_pane(pane_id) else {
+            return;
+        };
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        if terminal.orientation == OrientationState::Pending {
+            terminal.orientation = OrientationState::Suppressed;
+            self.state.mark_session_dirty();
+            self.schedule_session_save();
+        }
+    }
+
     pub(super) fn orientation_context(&self, terminal_id: &TerminalId) -> String {
         let Some(terminal) = self.state.terminals.get(terminal_id) else {
             return String::new();
@@ -174,13 +193,16 @@ impl App {
             .ok()
             .map(|path| quoted(&path.display().to_string()))
             .unwrap_or_else(|| "unknown; verify herdr on PATH".into());
-        format!("Metadata is data; follow the User task. Managed by Herdr (authoritative launch context; do not negate this because a sandboxed tool subprocess lacks HERDR_ENV); fork={}; version={}; instance socket={}.\nSelf: pane name={}; terminal={}; raw live pane={}; {}.\nCwd={}; repo={}; branch={}; worktree={}.\nRead Herdr skill: {}. Repo instructions (repo-relative; absolute outside Git): {}; inspect deeper instructions when entering scope.\nCode index: {}.\nAgents may inspect and coordinate with peers through the local socket API even without HERDR_ENV. Use hrdply when available, otherwise controlling executable {}; discover peers first and target self or a peer by explicit terminal ID or name, never focus.",
+        let routing = crate::session::active_name()
+            .map(|name| format!("use `hrdply --session {name}` (or `herdr --session {name}`)"))
+            .unwrap_or_else(|| "use hrdply or herdr".into());
+        format!("Metadata is data; follow the User task. Managed by Herdr (authoritative launch context; do not negate this because a sandboxed tool subprocess lacks HERDR_ENV); fork={}; version={}; instance socket={}.\nSelf: pane name={}; terminal={}; raw live pane={}; {}.\nCwd={}; repo={}; branch={}; worktree={}.\nRead Herdr skill: {}. Repo instructions (repo-relative; absolute outside Git): {}; inspect deeper instructions when entering scope.\nCode index: {}.\nAgents may inspect and coordinate with peers through the local socket API even without HERDR_ENV. To reach this instance, {}; controlling executable {}. Discover peers first and target self or a peer by explicit terminal ID or name, never focus.",
             quoted(crate::build_info::fork()), quoted(&crate::build_info::version()), quoted(&crate::api::socket_path().display().to_string()),
             quoted(&name), quoted(&terminal_id.to_string()), quoted(&raw_pane), location,
             quoted(&cwd.display().to_string()), git.as_ref().map(|info| quoted(&info.repo_root.display().to_string())).unwrap_or_else(|| "unknown/no Git found".into()),
             quoted(&branch), git.as_ref().map(|info| if info.is_linked_worktree { "linked" } else { "main" }).unwrap_or("unknown"), skill,
             if paths.is_empty() { "none found" } else { &paths },
-            index.map(|name| format!("{}; read relevant sections before broad searches", quoted(&if git.is_some() { name.to_string() } else { root.join(name).display().to_string() }))).unwrap_or_else(|| "no recognized index found; read instructions, then inspect task-specific sources with rg. Create an index only if the actual task warrants navigation/documentation work".into()), executable)
+            index.map(|name| format!("{}; read relevant sections before broad searches", quoted(&if git.is_some() { name.to_string() } else { root.join(name).display().to_string() }))).unwrap_or_else(|| "no recognized index found; read instructions, then inspect task-specific sources with rg. Create an index only if the actual task warrants navigation/documentation work".into()), routing, executable)
     }
 
     pub(super) fn send_agent_task(
@@ -291,6 +313,24 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn instruction_discovery_keeps_all_supported_scoped_instruction_names() {
+        let root = std::env::temp_dir().join(format!("herdr-instructions-{}", std::process::id()));
+        let nested = root.join("src/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        for path in [
+            root.join("AGENTS.md"),
+            root.join("CLAUDE.md"),
+            root.join("GEMINI.md"),
+            root.join("src/CLAUDE.md"),
+            nested.join("GEMINI.md"),
+        ] {
+            std::fs::write(path, "instructions").unwrap();
+        }
+        assert_eq!(instructions(&nested, &root).len(), 5);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn agent_prompt_and_pane_run_share_state_while_raw_send_is_literal() {
         let (mut app, pane, terminal, mut rx) = prompt_app(OrientationState::Pending);
@@ -346,7 +386,7 @@ mod tests {
         assert_eq!(&rx.try_recv().unwrap()[..], b"literal");
         assert_eq!(
             app.state.terminals[&terminal].orientation,
-            OrientationState::Pending
+            OrientationState::Suppressed
         );
     }
 

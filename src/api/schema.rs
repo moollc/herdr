@@ -334,7 +334,7 @@ pub struct AgentRenameParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStartParams {
     pub name: String,
-    /// Structured first task. Requires explicit new session and a bare known
+    /// Structured first task. Requires explicit new conversation and a bare known
     /// harness executable in argv; opaque/resume argv stays literal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,

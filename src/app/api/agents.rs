@@ -113,6 +113,7 @@ impl App {
         if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
             return encode_error(id, "agent_send_failed", err.to_string());
         }
+        self.suppress_pending_orientation(resolved.pane_id);
 
         encode_success(id, ResponseResult::Ok {})
     }

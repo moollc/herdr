@@ -379,6 +379,7 @@ impl App {
         if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
+        self.suppress_pending_orientation(pane_id);
 
         encode_success(id, ResponseResult::Ok {})
     }
@@ -422,6 +423,9 @@ impl App {
             if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
                 return encode_error(id, "pane_send_failed", err.to_string());
             }
+        }
+        if !params.text.is_empty() || !params.keys.is_empty() {
+            self.suppress_pending_orientation(pane_id);
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -501,6 +505,9 @@ impl App {
             if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
                 return encode_error(id, "pane_send_failed", err.to_string());
             }
+        }
+        if !params.keys.is_empty() {
+            self.suppress_pending_orientation(pane_id);
         }
 
         encode_success(id, ResponseResult::Ok {})

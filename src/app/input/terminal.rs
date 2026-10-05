@@ -30,7 +30,9 @@ impl App {
             return;
         };
         if let Some(runtime) = self.lookup_runtime_sender(input.ws_idx, input.pane_id) {
-            let _ = runtime.try_send_bytes(input.bytes);
+            if runtime.try_send_bytes(input.bytes).is_ok() {
+                self.suppress_pending_orientation(input.pane_id);
+            }
         }
     }
 
@@ -234,7 +236,9 @@ impl App {
             return;
         };
         if let Some(runtime) = self.lookup_runtime_sender(input.ws_idx, input.pane_id) {
-            let _ = runtime.send_bytes(input.bytes).await;
+            if runtime.send_bytes(input.bytes).await.is_ok() {
+                self.suppress_pending_orientation(input.pane_id);
+            }
         }
     }
 }

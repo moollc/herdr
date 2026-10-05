@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- Fresh structured agent launches now use `--conversation new`, keeping their model-conversation intent separate from `--session`, which selects a named Herdr instance. This prevents an external launcher targeting a named instance from accidentally losing its first-task orientation.
+
 ### Fixed
 
 - Preserve a fresh agent's Herdr-managed identity when a sandboxed command environment does not inherit `HERDR_ENV`, and allow agents to inspect and coordinate with counterparts through the local socket API without that variable.

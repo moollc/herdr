@@ -36,12 +36,12 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
     let Some(name) = args.first() else {
-        eprintln!("usage: herdr agent start <name> [--session new|resume|unknown] [--task TEXT] [--cwd PATH] [--worktree [BRANCH]] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
+        eprintln!("usage: herdr agent start <name> [--conversation new|resume|unknown] [--task TEXT] [--cwd PATH] [--worktree [BRANCH]] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
         return Ok(2);
     };
 
     let Some(separator) = args.iter().position(|arg| arg == "--") else {
-        eprintln!("usage: herdr agent start <name> [--session new|resume|unknown] [--task TEXT] [--cwd PATH] [--worktree [BRANCH]] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
+        eprintln!("usage: herdr agent start <name> [--conversation new|resume|unknown] [--task TEXT] [--cwd PATH] [--worktree [BRANCH]] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
         return Ok(2);
     };
     if separator == args.len() - 1 {
@@ -69,7 +69,10 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                 task = Some(value.clone());
                 index += 2;
             }
-            "--session" => {
+            // `--session` belongs to the top-level client and chooses a Herdr
+            // server. Keep conversation intent distinct so a named server and
+            // a fresh model conversation can be selected in the same argv.
+            "--conversation" => {
                 session = match args
                     .get(index + 1)
                     .filter(|_| index + 1 < separator)
@@ -79,7 +82,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                     Some("resume") => crate::api::schema::AgentLaunchSession::Resume,
                     Some("unknown") => crate::api::schema::AgentLaunchSession::Unknown,
                     _ => {
-                        eprintln!("--session requires new|resume|unknown");
+                        eprintln!("--conversation requires new|resume|unknown");
                         return Ok(2);
                     }
                 };

@@ -618,6 +618,48 @@ mod tests {
     }
 
     #[test]
+    fn named_instance_and_agent_conversation_intent_do_not_collide() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(SESSION_ENV_VAR);
+        clear_explicit_session_for_test();
+        let args = vec![
+            "herdr".to_string(),
+            "--session".to_string(),
+            "team".to_string(),
+            "agent".to_string(),
+            "start".to_string(),
+            "panel".to_string(),
+            "--conversation".to_string(),
+            "new".to_string(),
+            "--task".to_string(),
+            "first task".to_string(),
+            "--".to_string(),
+            "codex".to_string(),
+        ];
+
+        let cleaned = configure_from_args(&args).unwrap();
+
+        assert_eq!(std::env::var(SESSION_ENV_VAR).as_deref(), Ok("team"));
+        assert_eq!(
+            cleaned,
+            vec![
+                "herdr",
+                "agent",
+                "start",
+                "panel",
+                "--conversation",
+                "new",
+                "--task",
+                "first task",
+                "--",
+                "codex"
+            ]
+        );
+        std::env::remove_var(SESSION_ENV_VAR);
+        clear_explicit_session_for_test();
+    }
+
+    #[test]
     fn configure_from_args_rewrites_session_attach_to_default_launch() {
         let _guard = env_lock().lock().unwrap();
         std::env::set_var(SESSION_ENV_VAR, "bad/name");

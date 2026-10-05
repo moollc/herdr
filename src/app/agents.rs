@@ -1210,6 +1210,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_codex_panel_style_structured_launch_receives_identity_before_task() {
+        use std::os::unix::fs::PermissionsExt;
+        // An external panel may select an unverified backend (for example a
+        // DeepSeek-branded Codex client), but its owning launcher can submit
+        // this exact structured Codex launch without claiming that backend is
+        // a Herdr harness. The script is the model-visible task transport.
+        let mut app = test_app();
+        let root = unique_temp_path("orientation-external-codex");
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("codex");
+        let output = root.join("received-task");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$1\" > '{}'\nsleep 30\n",
+                output.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let task = "  panel task\nwith 'quotes' and --flags  \n";
+        let (agent, argv) = app
+            .start_agent(crate::api::schema::AgentStartParams {
+                name: "external-panel".into(),
+                task: Some(task.into()),
+                session: crate::api::schema::AgentLaunchSession::New,
+                cwd: Some(root.display().to_string()),
+                workspace_id: None,
+                tab_id: None,
+                split: None,
+                worktree: None,
+                focus: false,
+                argv: vec![executable.display().to_string()],
+            })
+            .unwrap_or_else(|_| panic!("external structured Codex launch"));
+        let delivered = argv.last().unwrap();
+        assert_eq!(delivered.matches(crate::agent_orientation::OPEN).count(), 1);
+        assert!(delivered.ends_with(task));
+        assert!(delivered.contains("pane name=\"external-panel\""));
+        assert!(delivered.contains(&agent.terminal_id));
+        for _ in 0..100 {
+            if std::fs::read_to_string(&output).ok().as_deref() == Some(delivered) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            delivered.as_str()
+        );
+        shutdown_started_runtimes(&mut app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_hidden_agent_runs_without_taking_a_pane() {
         let mut app = test_app();
         let panes_before = app.state.workspaces[0].tabs[0].layout.pane_ids();
