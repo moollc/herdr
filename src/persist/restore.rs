@@ -772,6 +772,13 @@ fn restore_pane(
                 .map(|pane| pane.orientation)
                 .unwrap_or_default()
                 .restored(was_imported);
+            if restarted_saved_command
+                && saved_pane.is_some_and(|pane| {
+                    pane.orientation != crate::agent_orientation::OrientationState::Suppressed
+                })
+            {
+                terminal.orientation = crate::agent_orientation::OrientationState::Pending;
+            }
             if !was_imported {
                 terminal = terminal.with_restore_startup();
             }
@@ -1359,7 +1366,7 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let terminal_id = TerminalId::alloc();
         let launch_argv = vec!["/bin/sleep".into(), "30".into()];
-        let snapshot = SessionSnapshot {
+        let mut snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: Vec::new(),
             active: None,
@@ -1387,37 +1394,43 @@ mod tests {
             }],
             ..Default::default()
         };
-        let (events, _event_rx) = mpsc::channel(4);
+        for orientation in [
+            crate::agent_orientation::OrientationState::Pending,
+            crate::agent_orientation::OrientationState::Delivered,
+        ] {
+            snapshot.detached_agents[0].pane.orientation = orientation;
+            let (events, _event_rx) = mpsc::channel(4);
 
-        let (_workspaces, terminals, runtimes, detached) = restore(
-            &snapshot,
-            None,
-            24,
-            80,
-            0,
-            "/usr/bin/true",
-            crate::config::ShellModeConfig::NonLogin,
-            true,
-            events,
-            Arc::new(Notify::new()),
-            Arc::new(AtomicBool::new(false)),
-        );
+            let (_workspaces, terminals, runtimes, detached) = restore(
+                &snapshot,
+                None,
+                24,
+                80,
+                0,
+                "/usr/bin/true",
+                crate::config::ShellModeConfig::NonLogin,
+                true,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+            );
 
-        assert_eq!(detached.len(), 1);
-        assert_eq!(
-            terminals
-                .get(&terminal_id)
-                .and_then(|terminal| terminal.launch_argv.clone()),
-            Some(launch_argv)
-        );
-        assert!(terminals[&terminal_id].is_agent_terminal());
-        assert!(runtimes.contains_key(&terminal_id));
-        assert_eq!(
-            terminals[&terminal_id].orientation,
-            crate::agent_orientation::OrientationState::Suppressed
-        );
-        for runtime in runtimes.into_values() {
-            runtime.shutdown();
+            assert_eq!(detached.len(), 1);
+            assert_eq!(
+                terminals
+                    .get(&terminal_id)
+                    .and_then(|terminal| terminal.launch_argv.clone()),
+                Some(launch_argv.clone())
+            );
+            assert!(terminals[&terminal_id].is_agent_terminal());
+            assert!(runtimes.contains_key(&terminal_id));
+            assert_eq!(
+                terminals[&terminal_id].orientation,
+                crate::agent_orientation::OrientationState::Pending
+            );
+            for runtime in runtimes.into_values() {
+                runtime.shutdown();
+            }
         }
     }
 

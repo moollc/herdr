@@ -110,10 +110,12 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
+        if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text.clone())) {
             return encode_error(id, "agent_send_failed", err.to_string());
         }
-        self.suppress_pending_orientation(resolved.pane_id);
+        if !params.text.trim().is_empty() {
+            self.suppress_pending_orientation(resolved.pane_id);
+        }
 
         encode_success(id, ResponseResult::Ok {})
     }

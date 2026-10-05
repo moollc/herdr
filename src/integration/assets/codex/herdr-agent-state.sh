@@ -3,7 +3,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=codex
-# HERDR_INTEGRATION_VERSION=5
+# HERDR_INTEGRATION_VERSION=6
 
 set -eu
 
@@ -62,6 +62,7 @@ if agent_session_id:
             "agent": "codex",
             "seq": report_seq,
             "agent_session_id": agent_session_id,
+            "startup_source": hook_input.get("source"),
         },
     }
 else:
@@ -73,7 +74,16 @@ try:
     client.connect(socket_path)
     client.sendall((json.dumps(request) + "\n").encode())
     try:
-        client.recv(4096)
+        response = b""
+        while not response.endswith(b"\n") and len(response) < 65536:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        context = json.loads(response).get("result", {}).get("context")
+        if isinstance(context, str) and context:
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "SessionStart", "additionalContext": context}}))
     except Exception:
         pass
     client.close()

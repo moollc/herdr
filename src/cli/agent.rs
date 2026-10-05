@@ -34,19 +34,19 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
-fn agent_start(args: &[String]) -> std::io::Result<i32> {
+fn parse_agent_start(args: &[String]) -> std::io::Result<Option<AgentStartParams>> {
     let Some(name) = args.first() else {
         eprintln!("usage: herdr agent start <name> [--conversation new|resume|unknown] [--task TEXT] [--cwd PATH] [--worktree [BRANCH]] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
-        return Ok(2);
+        return Ok(None);
     };
 
     let Some(separator) = args.iter().position(|arg| arg == "--") else {
         eprintln!("usage: herdr agent start <name> [--conversation new|resume|unknown] [--task TEXT] [--cwd PATH] [--worktree [BRANCH]] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
-        return Ok(2);
+        return Ok(None);
     };
     if separator == args.len() - 1 {
         eprintln!("agent start requires argv after --");
-        return Ok(2);
+        return Ok(None);
     }
 
     let mut task = None;
@@ -64,7 +64,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             "--task" => {
                 let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
                     eprintln!("missing value for --task");
-                    return Ok(2);
+                    return Ok(None);
                 };
                 task = Some(value.clone());
                 index += 2;
@@ -83,7 +83,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                     Some("unknown") => crate::api::schema::AgentLaunchSession::Unknown,
                     _ => {
                         eprintln!("--conversation requires new|resume|unknown");
-                        return Ok(2);
+                        return Ok(None);
                     }
                 };
                 index += 2;
@@ -91,7 +91,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             "--cwd" => {
                 let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
                     eprintln!("missing value for --cwd");
-                    return Ok(2);
+                    return Ok(None);
                 };
                 cwd = Some(value.clone());
                 index += 2;
@@ -99,7 +99,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             "--workspace" => {
                 let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
                     eprintln!("missing value for --workspace");
-                    return Ok(2);
+                    return Ok(None);
                 };
                 workspace_id = Some(super::normalize_workspace_id(value));
                 index += 2;
@@ -107,7 +107,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             "--tab" => {
                 let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
                     eprintln!("missing value for --tab");
-                    return Ok(2);
+                    return Ok(None);
                 };
                 tab_id = Some(super::normalize_tab_id(value));
                 index += 2;
@@ -115,7 +115,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             "--split" => {
                 let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
                     eprintln!("missing value for --split");
-                    return Ok(2);
+                    return Ok(None);
                 };
                 split = Some(super::parse_split_direction(value)?);
                 index += 2;
@@ -137,7 +137,7 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             }
             other => {
                 eprintln!("unknown option: {other}");
-                return Ok(2);
+                return Ok(None);
             }
         }
     }
@@ -146,20 +146,27 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         cwd = Some(std::env::current_dir()?.display().to_string());
     }
 
+    Ok(Some(AgentStartParams {
+        task,
+        session,
+        name: name.clone(),
+        cwd,
+        workspace_id,
+        tab_id,
+        split,
+        worktree,
+        focus,
+        argv: args[separator + 1..].to_vec(),
+    }))
+}
+
+fn agent_start(args: &[String]) -> std::io::Result<i32> {
+    let Some(params) = parse_agent_start(args)? else {
+        return Ok(2);
+    };
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:start".into(),
-        method: Method::AgentStart(AgentStartParams {
-            task,
-            session,
-            name: name.clone(),
-            cwd,
-            workspace_id,
-            tab_id,
-            split,
-            worktree,
-            focus,
-            argv: args[separator + 1..].to_vec(),
-        }),
+        method: Method::AgentStart(params),
     })?)
 }
 
@@ -645,5 +652,43 @@ mod tests {
     fn status_line_defaults_status_to_unknown() {
         let agent = json!({});
         assert_eq!(agent_status_line("term_1", &agent), "term_1: unknown");
+    }
+}
+
+#[cfg(test)]
+mod orientation_tests {
+    #[test]
+    fn skill_spawn_example_constructs_a_fresh_task_request() {
+        let skill = include_str!("../../SKILL.md");
+        assert!(skill.contains("herdr agent start reviewer --conversation new --task"));
+        assert!(!skill.contains("--session new"));
+        let args = [
+            "herdr",
+            "agent",
+            "start",
+            "reviewer",
+            "--conversation",
+            "new",
+            "--task",
+            "review the test coverage in src/api/",
+            "--cwd",
+            "/path/to/project",
+            "--",
+            "claude",
+        ]
+        .map(String::from);
+        let cleaned = crate::session::configure_from_args(&args).unwrap();
+        let params = super::parse_agent_start(&cleaned[3..]).unwrap().unwrap();
+        let request = crate::api::schema::Request {
+            id: "test".into(),
+            method: crate::api::schema::Method::AgentStart(params.clone()),
+        };
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["params"]["session"], "new");
+        assert_eq!(
+            params.task.as_deref(),
+            Some("review the test coverage in src/api/")
+        );
+        assert_eq!(params.argv, ["claude"]);
     }
 }

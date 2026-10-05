@@ -462,6 +462,9 @@ pub struct PaneReportAgentParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneReportAgentSessionParams {
+    /// SessionStart provenance: only `startup` establishes a fresh conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_source: Option<String>,
     pub pane_id: String,
     pub source: String,
     pub agent: String,
@@ -856,6 +859,9 @@ pub enum ResponseResult {
     ViewSet {
         parts: Vec<ViewPartInfo>,
     },
+    OrientationContext {
+        context: String,
+    },
     Ok {},
 }
 
@@ -1224,6 +1230,7 @@ mod tests {
         let request = Request {
             id: "req_session".into(),
             method: Method::PaneReportAgentSession(PaneReportAgentSessionParams {
+                startup_source: None,
                 pane_id: "1-1".into(),
                 source: "herdr:claude".into(),
                 agent: "claude".into(),

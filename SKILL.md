@@ -7,7 +7,7 @@ description: "Control Herdr from any agent environment. Agents can inspect and c
 
 ## startup identity and counterpart access
 
-If your first task includes a `[Herdr orientation ...]` block that says `Managed by Herdr`, that launch orientation is authoritative: you are a Herdr-managed agent. Keep that identity even when a sandboxed tool, remote executor, or nested process does not inherit `HERDR_ENV`.
+If your startup context or first task includes a `[Herdr orientation ...]` block that says `Managed by Herdr`, that launch orientation is authoritative: you are a Herdr-managed agent. Keep that identity even when a sandboxed tool, remote executor, or nested process does not inherit `HERDR_ENV`.
 
 Use `hrdply` when available, otherwise `herdr`, to inspect and coordinate with counterpart panes and agents through the local socket API. `HERDR_ENV` and the `HERDR_*_ID` variables are optional caller-context hints, not a control gate. If they are absent, discover sessions and peers first, then use an explicit agent name, terminal ID, or pane ID. Do not use the UI-focused pane as a proxy for self.
 
@@ -289,10 +289,10 @@ herdr pane read 1-3 --source recent-unwrapped --lines 40
 ### spawn a new agent and give it a task
 
 ```bash
-herdr agent start reviewer --session new --task "review the test coverage in src/api/" --cwd /path/to/project -- claude
+herdr agent start reviewer --conversation new --task "review the test coverage in src/api/" --cwd /path/to/project -- claude
 ```
 
-`--session new` declares a fresh conversation and accepts one known harness executable after `--`. Herdr adds orientation to this first task. to start idle, omit `--task` and deliver the first task with `agent prompt`; later prompts stay unchanged. native resume commands and opaque argv use the ordinary literal start route without `--task`. raw typing, `agent send`, and shell-launched agents do not establish freshness or a first-task boundary and receive no automatic orientation.
+`--conversation new` declares a fresh conversation and accepts one known harness executable after `--`. Herdr adds orientation to this first task. to start idle, omit `--task` and deliver the first task with `agent prompt`; later prompts stay unchanged. native resume commands and opaque argv use the ordinary literal start route without `--task`. Codex SessionStart hooks provide orientation as startup context for fresh shell and external panel launches, including alternate model backends, without rewriting their task input. This requires the installed Herdr Codex integration in the client’s CODEX_HOME and a client that supports SessionStart additionalContext. Resume/compact events do not orient. Other literal launch routes require a supported startup integration or structured delivery; PTY bytes alone do not prove freshness.
 
 ### coordinate with another agent
 

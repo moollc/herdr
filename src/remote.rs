@@ -2279,7 +2279,7 @@ mod tests {
         let manifest: RemotePreviewManifest = serde_json::from_str(
             r#"{
                 "build_id": "2026-06-06-new",
-                "protocol": 12,
+                "protocol": 13,
                 "assets": {
                     "linux-x86_64": {
                         "url": "https://example.com/new",

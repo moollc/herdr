@@ -57,15 +57,6 @@ pub fn envelope(context: &str, task: &str) -> String {
     if task.trim().is_empty() {
         return task.to_string();
     }
-    // Omit optional long path inventories before the immutable task.
-    let compact;
-    let context = if context.len() > 8192 {
-        compact = format!("{}\nAdditional instruction/skill paths exceed the orientation budget; inspect applicable AGENTS.md, CLAUDE.md, GEMINI.md and task-specific code indexes.\n{}",
-            context.lines().take(3).collect::<Vec<_>>().join("\n"), context.lines().last().unwrap_or(""));
-        compact.as_str()
-    } else {
-        context
-    };
     // Keep slash-command dispatch at the front, including Auto's /who.
     let command = if task.starts_with('/') {
         match task.find(char::is_whitespace) {
@@ -131,8 +122,7 @@ mod tests {
         let context = format!("identity\nself\ncwd\n{}\nlive help", "paths".repeat(3000));
         let text = envelope(&context, &task);
         assert_eq!(user_task(&text), task);
-        assert!(text.len() - task.len() < 8192);
-        assert!(text.contains("paths exceed"));
+        assert!(text.contains(&context));
         assert!(quoted(&"\n".repeat(500)).contains("unknown"));
     }
 

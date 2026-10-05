@@ -214,6 +214,19 @@ impl App {
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };
+        let terminal_id = self.state.terminal_id_for_any_pane(pane_id);
+        let previous = terminal_id
+            .as_ref()
+            .and_then(|id| self.state.terminals.get(id))
+            .map(|terminal| {
+                (
+                    terminal.persisted_agent_session.clone(),
+                    terminal.orientation,
+                )
+            });
+        let session_id = params.agent_session_id.clone();
+        let startup_source = params.startup_source.clone();
+        let codex_startup = params.source == "herdr:codex" && agent_label == "codex";
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: crate::agent_resume::session_ref_from_report(
@@ -226,6 +239,60 @@ impl App {
             agent_label,
             seq: params.seq,
         });
+
+        if codex_startup && matches!(startup_source.as_deref(), Some("resume" | "compact")) {
+            if let Some(terminal) = terminal_id
+                .as_ref()
+                .and_then(|id| self.state.terminals.get_mut(id))
+            {
+                if terminal.orientation == crate::agent_orientation::OrientationState::Pending {
+                    terminal.orientation = crate::agent_orientation::OrientationState::Suppressed;
+                    self.state.mark_session_dirty();
+                    self.schedule_session_save();
+                }
+            }
+        }
+        // SessionStart is a context channel, independent of literal task input.
+        // Native resume/compact and unknown provenance cannot establish freshness.
+        if codex_startup && startup_source.as_deref() == Some("startup") {
+            if let (Some(terminal_id), Some((old_session, old_orientation))) =
+                (terminal_id, previous)
+            {
+                let accepted = self
+                    .state
+                    .terminals
+                    .get(&terminal_id)
+                    .and_then(|terminal| terminal.persisted_agent_session.as_ref());
+                let fresh = accepted.is_some_and(|session| {
+                    session.source == "herdr:codex"
+                        && session.agent == "codex"
+                        && Some(&session.session_ref.value) == session_id.as_ref()
+                });
+                let same = old_session.as_ref() == accepted;
+                let already_delivered = old_orientation
+                    == crate::agent_orientation::OrientationState::Delivered
+                    && (same || old_session.is_none());
+                if fresh && !already_delivered {
+                    let context = format!(
+                        "{}{}\n[/Herdr orientation]",
+                        crate::agent_orientation::OPEN,
+                        self.orientation_context(&terminal_id)
+                    );
+                    if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                        terminal.orientation =
+                            crate::agent_orientation::OrientationState::Delivered;
+                    }
+                    self.state.mark_session_dirty();
+                    self.schedule_session_save();
+                    return encode_success(id, ResponseResult::OrientationContext { context });
+                }
+                if already_delivered {
+                    if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                        terminal.orientation = old_orientation;
+                    }
+                }
+            }
+        }
 
         encode_success(id, ResponseResult::Ok {})
     }
@@ -376,10 +443,12 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
+        if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text.clone())) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
-        self.suppress_pending_orientation(pane_id);
+        if !params.text.trim().is_empty() {
+            self.suppress_pending_orientation(pane_id);
+        }
 
         encode_success(id, ResponseResult::Ok {})
     }
@@ -413,18 +482,20 @@ impl App {
             Ok(encoded_keys) => encoded_keys,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
-        if !params.text.is_empty() {
-            let text_bytes = encode_api_text(runtime, &params.text);
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(text_bytes)) {
-                return encode_error(id, "pane_send_failed", err.to_string());
-            }
-        }
+        let mut batch = if params.text.is_empty() {
+            Vec::new()
+        } else {
+            encode_api_text(runtime, &params.text)
+        };
         for bytes in encoded_keys {
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+            batch.extend(bytes);
+        }
+        if !batch.is_empty() {
+            if let Err(err) = runtime.try_send_bytes(Bytes::from(batch)) {
                 return encode_error(id, "pane_send_failed", err.to_string());
             }
         }
-        if !params.text.is_empty() || !params.keys.is_empty() {
+        if !params.text.trim().is_empty() {
             self.suppress_pending_orientation(pane_id);
         }
 
@@ -501,13 +572,11 @@ impl App {
             Ok(encoded_keys) => encoded_keys,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
-        for bytes in encoded_keys {
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+        let batch: Vec<u8> = encoded_keys.into_iter().flatten().collect();
+        if !batch.is_empty() {
+            if let Err(err) = runtime.try_send_bytes(Bytes::from(batch)) {
                 return encode_error(id, "pane_send_failed", err.to_string());
             }
-        }
-        if !params.keys.is_empty() {
-            self.suppress_pending_orientation(pane_id);
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -581,7 +650,7 @@ mod tests {
         app
     }
 
-    fn app_with_two_panes() -> (App, crate::layout::PaneId) {
+    pub(super) fn app_with_two_panes() -> (App, crate::layout::PaneId) {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &Config::default(),
@@ -621,6 +690,7 @@ mod tests {
         let response = app.handle_pane_report_agent_session(
             "report".into(),
             PaneReportAgentSessionParams {
+                startup_source: None,
                 pane_id: format!("p_{}", detached_pane_id.raw()),
                 source: "herdr:claude".into(),
                 agent: "claude".into(),
@@ -690,3 +760,7 @@ mod tests {
         assert!(app.state.workspaces.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "panes_orientation_tests.rs"]
+mod orientation_tests;

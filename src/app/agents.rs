@@ -1065,6 +1065,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn composer_orientation_location_matches_final_docking_and_failure_rolls_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut app = test_app();
+        let root = unique_temp_path("composer-orientation");
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("codex");
+        std::fs::write(&executable, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let harness = crate::harness::ALL
+            .iter()
+            .find(|h| h.agent == Some(crate::detect::Agent::Codex))
+            .unwrap();
+        let target = app.state.workspaces[0].focused_pane_id().unwrap();
+        let placement = app.composer_agent_placement(false);
+        let (pane, argv) = app
+            .start_task_agent(
+                root.clone(),
+                harness,
+                executable.to_str().unwrap(),
+                "composer task",
+                None,
+                placement,
+            )
+            .unwrap_or_else(|_| panic!("composer start"));
+        app.focus_composer_started_agent(pane, false);
+        let (ws_idx, _) = app.find_pane(pane).unwrap();
+        let text = argv.last().unwrap();
+        assert!(text.contains(&format!(
+            "pane address=\"{}\"",
+            app.public_pane_id(ws_idx, pane).unwrap()
+        )));
+        assert!(text.contains(&format!("id=\"{}\"", app.state.workspaces[ws_idx].id)));
+        assert!(!text.contains("workspace/tab: detached"));
+        assert!(app.state.workspaces[0].pane_state(target).is_some());
+        let before = app.state.workspaces[0].tabs[0].layout.pane_ids().len();
+        let terminal_count = app.state.terminals.len();
+        let focus = app.state.workspaces[0].focused_pane_id();
+        let placement = app.composer_agent_placement(false);
+        assert!(app
+            .start_task_agent(
+                root.clone(),
+                harness,
+                "/no/such/codex",
+                "failed task",
+                None,
+                placement
+            )
+            .is_err());
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].layout.pane_ids().len(),
+            before
+        );
+        assert_eq!(app.state.terminals.len(), terminal_count);
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), focus);
+        let terminal_id = app.state.terminal_id_for_any_pane(pane).unwrap();
+        app.terminal_runtimes
+            .remove(&terminal_id)
+            .unwrap()
+            .shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn structured_launch_orients_actual_identity_and_fresh_replacement() {
         use std::os::unix::fs::PermissionsExt;
         let mut app = test_app();
@@ -1100,7 +1163,7 @@ mod tests {
             assert!(argv[1].contains(&terminal.to_string()));
             let ws = app.state.workspace_index_for_pane(pane).unwrap();
             assert!(argv[1].contains(&app.state.workspaces[ws].id));
-            for _ in 0..100 {
+            for _ in 0..500 {
                 if std::fs::read_to_string(&output).ok().as_deref() == Some(&argv[1]) {
                     break;
                 }

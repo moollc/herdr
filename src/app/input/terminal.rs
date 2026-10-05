@@ -30,7 +30,14 @@ impl App {
             return;
         };
         if let Some(runtime) = self.lookup_runtime_sender(input.ws_idx, input.pane_id) {
-            if runtime.try_send_bytes(input.bytes).is_ok() {
+            if runtime.try_send_bytes(input.bytes).is_ok()
+                && matches!(key.code, KeyCode::Char(ch) if !ch.is_whitespace())
+                && !key.modifiers.intersects(
+                    crossterm::event::KeyModifiers::CONTROL
+                        | crossterm::event::KeyModifiers::ALT
+                        | crossterm::event::KeyModifiers::SUPER,
+                )
+            {
                 self.suppress_pending_orientation(input.pane_id);
             }
         }
@@ -236,7 +243,14 @@ impl App {
             return;
         };
         if let Some(runtime) = self.lookup_runtime_sender(input.ws_idx, input.pane_id) {
-            if runtime.send_bytes(input.bytes).await.is_ok() {
+            if runtime.send_bytes(input.bytes).await.is_ok()
+                && matches!(key.code, KeyCode::Char(ch) if !ch.is_whitespace())
+                && !key.modifiers.intersects(
+                    crossterm::event::KeyModifiers::CONTROL
+                        | crossterm::event::KeyModifiers::ALT
+                        | crossterm::event::KeyModifiers::SUPER,
+                )
+            {
                 self.suppress_pending_orientation(input.pane_id);
             }
         }

@@ -90,7 +90,7 @@ impl App {
             pending.harness.program().unwrap_or(""),
             &pending.message(),
             None,
-            super::agents::AgentPlacement::Detached,
+            self.composer_agent_placement(pending.worktree),
         );
         if result.is_err() {
             if let Some((space, checkout, _)) = &managed {
@@ -111,6 +111,26 @@ impl App {
         result
             .map(|(pane_id, _)| (pane_id, cwd))
             .map_err(|err| self.agent_start_error_body(err).message)
+    }
+
+    pub(super) fn composer_agent_placement(&self, peek: bool) -> super::agents::AgentPlacement {
+        if peek {
+            super::agents::AgentPlacement::Detached
+        } else if let Some((ws_idx, target)) = self.state.active.and_then(|ws_idx| {
+            self.state
+                .workspaces
+                .get(ws_idx)
+                .and_then(|ws| ws.focused_pane_id())
+                .map(|target| (ws_idx, target))
+        }) {
+            super::agents::AgentPlacement::Split(
+                ws_idx,
+                target,
+                crate::api::schema::SplitDirection::Right,
+            )
+        } else {
+            super::agents::AgentPlacement::Workspace
+        }
     }
 
     /// Put the keyboard on the agent the band just started.
