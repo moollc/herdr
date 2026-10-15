@@ -89,6 +89,8 @@ pub struct UsageConfig {
     pub cursor_keychain_service: String,
     pub cursor_min_interval_secs: u64,
     pub fixture: Option<PathBuf>,
+    pub claude_statusline: bool,
+    pub visibility_file: Option<PathBuf>,
 }
 impl Default for UsageConfig {
     fn default() -> Self {
@@ -102,6 +104,8 @@ impl Default for UsageConfig {
             snapshot_file: state.join("usage.json"),
             cursor_keychain_service: "herdr-cursor-usage".into(),
             cursor_min_interval_secs: CURSOR_MIN_INTERVAL_SECS,
+            claude_statusline: true,
+            visibility_file: None,
             fixture: std::env::var_os("HERDR_USAGE_FIXTURE").map(PathBuf::from),
         }
     }
@@ -110,6 +114,8 @@ impl UsageConfig {
     pub fn configured() -> Self {
         let mut config = Self::default();
         let display = crate::config::Config::load().config.ui.usage;
+        config.claude_statusline = display.claude_statusline;
+        config.visibility_file = Some(statusline::visibility_file());
         if let Some(path) = display.codex_home {
             config.codex_home = if let Some(rest) = path.strip_prefix("~/") {
                 PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest)

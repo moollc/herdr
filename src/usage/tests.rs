@@ -858,7 +858,7 @@ fn cli_login_hints_follow_cursor_line() {
         (UsageProblem::NoLogin, "run: herdr usage cursor-login"),
         (
             UsageProblem::LoginExpired,
-            "sign in to cursor.com in your browser",
+            "sign in to cursor.com in your browser; for a pasted login, run herdr usage cursor-login --paste again",
         ),
     ] {
         let snapshot = UsageSnapshot {

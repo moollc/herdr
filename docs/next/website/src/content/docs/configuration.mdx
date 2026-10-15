@@ -371,6 +371,7 @@ sidebar = true
 alerts = false
 alert_command = ""
 cursor_login = false
+claude_statusline = true
 # codex_home = "~/.codex"
 ```
 
@@ -378,7 +379,11 @@ cursor_login = false
 
 Alerts are off by default. `alert_command` is a whitespace-separated program and arguments, with the phrase appended as one final argument; no shell is used. Empty means macOS `say`, and silence on other platforms. `SPEAK=0` silences alerts.
 
-On macOS, run `herdr usage cursor-login` and answer `[y/N]` to import cursor.com cookies from Chrome or Brave into the `herdr-cursor-usage` Keychain item. This saves `cursor_login = true`. `--refresh` never prompts, `--status` shows consent and Keychain presence, and `--forget` removes the item and clears consent after confirming removal. Exit codes are 0 for success or declined consent, 1 for an error, 3 for missing consent (or unsupported platform), and 4 for a signed-out login. Other platforms report `NoLogin`. The app may refresh the login hourly on its worker; `herdr usage` and `--json` never import it. Settings can disable browser login; enabling requires the consent command.
+On macOS, run `herdr usage cursor-login` and answer `[y/N]` to import cursor.com cookies from Chrome, Brave, Edge, Arc, Vivaldi, or Chromium into the `herdr-cursor-usage` Keychain item. This saves `cursor_login = true`. `--refresh` never prompts, `--status` shows consent and Keychain presence, and `--forget` removes the item and clears consent after confirming removal. Exit codes are 0 for success or declined consent, 1 for an error, 3 for missing consent (or unsupported platform), and 4 for a signed-out login. Linux automatic cookie import is deferred; use the paste-once flow below. Windows runtime remains unsupported. The app may refresh the login hourly on its worker; `herdr usage` and `--json` never import it. Settings can disable browser login; enabling automatic import requires the consent command. Pasted logins retain their source and are never replaced by automatic browser refresh.
+
+The Claude status line always records incoming usage for the allowance bars. Set `[ui.usage] claude_statusline = false` (also in Settings → pane labels) to print an empty line instead of meters. `herdr view usage hide` also hides the status line, using a tiny visibility marker saved by the server in Herdr's usage state directory, separately for each named session; `show` restores it if the config switch is on. A missing or unreadable marker defaults to shown; the status line never opens `session.json`, even if it is huge. Keep the status line process in the same `HERDR_SESSION` and config environment as its Herdr pane.
+
+Cursor login tries the macOS default HTTPS browser first when it has an unexpired cursor.com row, then the first supported browser with live matching rows. Profiles are checked Default then Profile directories. If no browser has matching rows, the first available store reports the signed-out result. `herdr usage cursor-login --browser Brave` forces a browser, and works with `--refresh`. Safari and Firefox are not supported yet; an unsupported default is named before trying supported browsers. `--status` reports the saved browser and selection reason (default, first signed in, explicit browser, or first available); records from older builds show an unknown reason until the next import. Selection runs a scoped live-row existence query returning only one bit; it never selects cookie values or ciphertext. Decryption is confined to importing the chosen store. Unsupported default browsers are named by their bundle ID, including defaults other than Safari and Firefox. Only stable browser roots are supported; Beta, Dev, Canary and other channel folders are not supported yet.
 
 `refresh_summary_with_grok` controls `Refresh Summary` on an agent row. Off (the default), Herdr reads the latest typed prompt from that agent's session log. On, it starts a headless `grok -p` session at `--effort none` that names the most recent user request. The column says `refreshing summary` until that session returns. For a Grok pane it forks that session so the live chat is not written. For other harnesses it passes the latest typed requests as prompt context. If Grok is missing or the one-shot fails, the command falls back to the session-log prompt. Settings → experiments toggles the same key and has a `prompt` field next to it for the text sent to Grok. `refresh_summary_prompt` is that text; empty uses the built-in 5–8 word ask.
 
@@ -596,3 +601,14 @@ Common log files:
 ```
 
 Logs rotate automatically. Include the current log and rotated siblings when reporting issues.
+
+
+### Paste a Cursor login
+
+On macOS or Linux, run `herdr usage cursor-login --paste`. In your browser, sign in to cursor.com, open DevTools → Network, select a cursor.com request, and copy its Cookie header value. Paste only the value at Herdr's hidden prompt, then press Enter. The prompt requires an interactive terminal, does not echo input, and accepts at most 16 KiB. Ctrl-C cancels. Herdr checks the login against the usage-summary endpoint before saving it. A pasted login cannot refresh itself: on expiry or `--refresh`, paste again. The app's background worker never imports browser cookies over a pasted login.
+
+macOS stores the login in the existing `herdr-cursor-usage` Keychain item. Linux uses `secret-tool store` with Herdr-owned Secret Service attributes (`application=herdr`, `purpose=cursor-usage`); the value travels over stdin. Install the distribution's libsecret tools if needed. Native KWallet without a Secret Service interface is not supported yet.
+
+If the helper or Secret Service is unavailable, Herdr asks once before saving a **plaintext** fallback. Answering no saves nothing. The fallback is `usage/cursor-login/cookie` under Herdr's state directory (`$XDG_STATE_HOME/herdr`, normally `~/.local/state/herdr`; debug builds use `herdr-dev`). The credential folder is 0700 and the file is 0600. Symlink paths, hardlinks, special files and permissive existing credential files/folders are rejected. Locked, denied or timed-out keyring operations do not silently fall back. Existing plaintext storage is cleared after a successful keyring save. Forget clears only Herdr's keyring item and empties its fallback file; it never changes browser data. These permissions restrict access but do not encrypt the fallback.
+
+Linux default-browser discovery tries `xdg-settings get default-web-browser`, then `xdg-mime query default x-scheme-handler/https`, then mimeapps.list in XDG precedence. Desktop IDs are parsed as data; Exec entries are never run. Stable Chrome, Chromium, Brave, Edge and Vivaldi IDs are recognized; unknown IDs get a plain unsupported message. Discovery helpers share a three-second deadline. Recognition does not enable Linux cookie import: v10/v11 decryption and native Linux integration testing remain follow-up work.

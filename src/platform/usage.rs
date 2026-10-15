@@ -59,9 +59,12 @@ pub(crate) fn cursor_cookie(service: &str) -> Option<String> {
     }
     Some(cookie)
 }
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn cursor_cookie(_service: &str) -> Option<String> {
-    None
+#[cfg(target_os = "linux")]
+pub(crate) fn cursor_cookie(service: &str) -> Option<String> {
+    if service != "herdr-cursor-usage" {
+        return None;
+    }
+    linux_login::read()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,19 +76,17 @@ pub(crate) enum CursorLoginResult {
     Failed,
 }
 
+mod arguments;
+mod browser;
+mod command;
+mod consent;
 #[cfg(target_os = "macos")]
 mod cursor_login;
-#[cfg(target_os = "macos")]
-pub(crate) use cursor_login::{cursor_login_cli, refresh_cursor_login};
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn cursor_login_cli(_args: &[String]) -> i32 {
-    eprintln!("Cursor browser login is available on macOS only (NoLogin).");
-    3
-}
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn refresh_cursor_login(_timeout: std::time::Duration) -> CursorLoginResult {
-    CursorLoginResult::Exited(3)
-}
+#[cfg(any(target_os = "linux", test))]
+mod linux_login;
+mod manual_login;
+mod validation;
+pub(crate) use manual_login::{cursor_login_cli, refresh_cursor_login};
 
 pub(crate) fn speak_alert(command: &str, phrase: &str) {
     let mut parts = command.split_whitespace();

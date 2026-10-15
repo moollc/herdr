@@ -18,7 +18,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
     if args.len() > 1 || args.first().is_some_and(|arg| arg != "--json") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: herdr usage [--json | claude-statusline | cursor-login [--refresh | --status | --forget]]",
+            "usage: herdr usage [--json | claude-statusline | cursor-login [--paste | --refresh | --status | --forget] [--browser <name>]]",
         ));
     }
     run_readings(
@@ -85,7 +85,7 @@ pub(super) fn write_plain(
                     writeln!(output, "run: herdr usage cursor-login")?
                 }
                 Some(super::UsageProblem::LoginExpired) => {
-                    writeln!(output, "sign in to cursor.com in your browser")?
+                    writeln!(output, "sign in to cursor.com in your browser; for a pasted login, run herdr usage cursor-login --paste again")?
                 }
                 _ => {}
             }

@@ -51,6 +51,12 @@ extern "C" {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
+    fn CFStringCreateWithCString(
+        allocator: *const libc::c_void,
+        string: *const libc::c_char,
+        encoding: u32,
+    ) -> CfStringRef;
+
     #[link_name = "CFRelease"]
     fn cf_release(value: CfTypeRef);
 
@@ -902,6 +908,31 @@ pub fn process_exists(pid: u32) -> bool {
         true
     } else {
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
+#[link(name = "CoreServices", kind = "framework")]
+extern "C" {
+    fn LSCopyDefaultHandlerForURLScheme(scheme: CfStringRef) -> CfStringRef;
+}
+
+pub(crate) fn default_browser_bundle_id() -> Option<String> {
+    // SAFETY: the literal is terminated, the encoding is UTF-8, and each Copy/Create
+    // result is released exactly once after conversion. Null means no handler.
+    unsafe {
+        let scheme =
+            CFStringCreateWithCString(std::ptr::null(), c"https".as_ptr(), CF_STRING_ENCODING_UTF8);
+        if scheme.is_null() {
+            return None;
+        }
+        let handler = LSCopyDefaultHandlerForURLScheme(scheme);
+        cf_release(scheme.cast());
+        if handler.is_null() {
+            return None;
+        }
+        let result = cf_string_to_string(handler);
+        cf_release(handler.cast());
+        result
     }
 }
 

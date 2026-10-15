@@ -702,6 +702,8 @@ pub struct UsageDisplayConfig {
     pub alerts: bool,
     /// Permit importing cursor.com browser cookies. Enable with `herdr usage cursor-login`.
     pub cursor_login: bool,
+    /// Show Claude status line meters while continuing to record usage. Default: true.
+    pub claude_statusline: bool,
     pub codex_home: Option<String>,
     /// Program and arguments; the spoken phrase is appended as the final argument.
     pub alert_command: String,
@@ -714,6 +716,7 @@ impl Default for UsageDisplayConfig {
             sidebar: true,
             alerts: false,
             cursor_login: false,
+            claude_statusline: true,
             codex_home: None,
             alert_command: String::new(),
         }
@@ -726,17 +729,25 @@ pub(crate) enum UsageSwitch {
     Table,
     Sidebar,
     Alerts,
+    ClaudeStatusline,
     CursorLogin,
 }
 
 impl UsageSwitch {
-    pub(crate) const ALL: [Self; 4] = [Self::Table, Self::Sidebar, Self::Alerts, Self::CursorLogin];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Table,
+        Self::Sidebar,
+        Self::Alerts,
+        Self::ClaudeStatusline,
+        Self::CursorLogin,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Table => "usage in the agent table",
             Self::Sidebar => "usage in the sidebar",
             Self::Alerts => "usage alert, spoken at 10% left",
+            Self::ClaudeStatusline => "usage in the Claude status line",
             Self::CursorLogin => "Cursor browser login (run herdr usage cursor-login)",
         }
     }
@@ -746,6 +757,7 @@ impl UsageSwitch {
             Self::Table => "table",
             Self::Sidebar => "sidebar",
             Self::Alerts => "alerts",
+            Self::ClaudeStatusline => "claude_statusline",
             Self::CursorLogin => "cursor_login",
         }
     }
@@ -755,6 +767,7 @@ impl UsageSwitch {
             Self::Table => config.table,
             Self::Sidebar => config.sidebar,
             Self::Alerts => config.alerts,
+            Self::ClaudeStatusline => config.claude_statusline,
             Self::CursorLogin => config.cursor_login,
         }
     }
@@ -983,7 +996,10 @@ show_agent_labels_on_pane_borders = false
         for switch in UsageSwitch::ALL {
             assert_eq!(
                 switch.enabled(&config),
-                matches!(switch, UsageSwitch::Table | UsageSwitch::Sidebar)
+                matches!(
+                    switch,
+                    UsageSwitch::Table | UsageSwitch::Sidebar | UsageSwitch::ClaudeStatusline
+                )
             );
         }
         config.table = false;

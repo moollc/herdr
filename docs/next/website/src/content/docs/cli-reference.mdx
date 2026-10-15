@@ -40,12 +40,19 @@ herdr usage
 herdr usage --json
 herdr usage claude-statusline
 herdr usage cursor-login
+herdr usage cursor-login --browser Brave
+herdr usage cursor-login --paste
+herdr usage cursor-login --help
 herdr usage cursor-login --refresh
 herdr usage cursor-login --status
 herdr usage cursor-login --forget
 ```
 
-Allowance readings run locally without a running server. The status line command reads Claude's JSON on stdin. On macOS, `cursor-login` asks once before reading browser cookies; `--refresh` never prompts. `--status` reports consent and Keychain presence, and `--forget` removes the saved login. Exit codes: 0 success or declined consent, 1 error, 3 missing consent or unsupported platform, 4 signed out. Plain and JSON readings never import a login. See [configuration](./configuration/#pane-header) for usage settings.
+Allowance readings run locally without a running server. The status line command reads Claude's JSON on stdin. On macOS, `cursor-login` asks once before reading browser cookies; `--refresh` never prompts. On macOS and Linux, `--paste` accepts a Cookie header at a hidden interactive prompt, checks it, and saves the login. Open your signed-in cursor.com page, open DevTools → Network, select a cursor.com request, and copy only its **Cookie header value**. Do not pass the value as an argument or a full cURL command. Input is limited to 16 KiB; piped input is rejected. `--help` includes these steps.
+
+Pasted logins cannot refresh themselves. On expiry, sign in and run `herdr usage cursor-login --paste` again. `--status` reports the source and storage state; `--forget` removes only Herdr's login and consent. Linux uses `secret-tool`/Secret Service; if unavailable, a separate `[y/N]` prompt offers a plaintext 0600 file in a 0700 state folder. Declining saves nothing. Locked or denied keyring access is an error. Linux automatic cookie import is deferred; bare `cursor-login` reports the default browser and points to `--paste`. Windows runtime is not supported by this build.
+
+Exit codes: 0 success or declined consent, 1 error, 3 missing consent or unsupported automatic import, 4 signed out or a pasted login needing another paste. Plain and JSON readings never import a login. See [configuration](./configuration/#pane-header) for usage settings.
 
 ## Server
 

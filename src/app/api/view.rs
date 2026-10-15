@@ -14,6 +14,15 @@ impl App {
     /// several parts at once, such as every minimap, toggles them together:
     /// all are hidden when any is shown, and all are shown otherwise.
     pub(super) fn handle_view_set(&mut self, id: String, params: ViewSetParams) -> String {
+        let marker = (!self.no_session).then(crate::usage::statusline::visibility_file);
+        self.handle_view_set_with_usage_marker(id, params, marker.as_deref())
+    }
+    fn handle_view_set_with_usage_marker(
+        &mut self,
+        id: String,
+        params: ViewSetParams,
+        marker: Option<&std::path::Path>,
+    ) -> String {
         let folds = match self.view_folds(&params) {
             Ok(folds) => folds,
             Err((code, message)) => return encode_error(id, code, message),
@@ -23,6 +32,13 @@ impl App {
             ViewChange::Hide => false,
             ViewChange::Toggle => !folds.iter().any(|(fold, _, _)| self.state.is_shown(fold)),
         };
+        if matches!(params.part, ViewPart::Usage) {
+            if let Some(marker) = marker {
+                if let Err(error) = crate::usage::statusline::save_visibility(marker, !shown) {
+                    return encode_error(id, "usage_visibility_save_failed", error.to_string());
+                }
+            }
+        }
         let mut parts = Vec::with_capacity(folds.len());
         for (fold, workspace_id, tab_id) in folds {
             self.state.set_shown(&fold, shown);
@@ -222,5 +238,57 @@ mod tests {
         let reply = set(&mut app, ViewPart::Usage, ViewChange::Hide, Some("1"));
         assert!(reply.contains("invalid_request"), "{reply}");
         assert!(!app.state.usage_hidden);
+    }
+    #[test]
+    fn usage_view_writes_tiny_marker_before_reporting_success() {
+        let mut app = app();
+        let root = std::env::temp_dir().join(format!(
+            "herdr-visibility-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let marker = root.join("visibility.json");
+        for (change, hidden) in [
+            (ViewChange::Hide, true),
+            (ViewChange::Hide, true),
+            (ViewChange::Show, false),
+            (ViewChange::Toggle, true),
+            (ViewChange::Toggle, false),
+        ] {
+            let reply = app.handle_view_set_with_usage_marker(
+                "synthetic".into(),
+                ViewSetParams {
+                    part: ViewPart::Usage,
+                    change,
+                    workspace_id: None,
+                    tab_id: None,
+                },
+                Some(&marker),
+            );
+            assert!(!reply.contains("error"), "{reply}");
+            assert_eq!(crate::usage::read_json::<bool>(&marker).unwrap(), hidden);
+            assert_eq!(app.state.usage_hidden, hidden);
+            assert!(std::fs::metadata(&marker).unwrap().len() <= 5);
+        }
+        let failed = root.join("directory");
+        std::fs::create_dir_all(&failed).unwrap();
+        let reply = app.handle_view_set_with_usage_marker(
+            "synthetic".into(),
+            ViewSetParams {
+                part: ViewPart::Usage,
+                change: ViewChange::Hide,
+                workspace_id: None,
+                tab_id: None,
+            },
+            Some(&failed),
+        );
+        assert!(reply.contains("usage_visibility_save_failed"));
+        assert!(
+            !app.state.usage_hidden,
+            "a failed write must not hide only part of the UI"
+        );
     }
 }

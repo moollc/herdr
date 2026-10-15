@@ -275,6 +275,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # alerts = false
 # alert_command = "" # macOS say by default; whitespace-separated program and arguments
 # cursor_login = false # enable with herdr usage cursor-login
+# claude_statusline = true # display only; usage is recorded even when off
 # codex_home = "~/.codex" # CODEX_HOME by default, then ~/.codex
 
 # Agent panel scope: "current" or "all". Toggling it in the sidebar saves this setting.
@@ -498,7 +499,7 @@ fn main() -> io::Result<()> {
         println!("       herdr session <subcommand> ...");
         println!("       herdr shell-init <shell>");
         println!("       herdr integration <subcommand> ...");
-        println!("       herdr usage [--json | claude-statusline | cursor-login [--refresh | --status | --forget]]");
+        println!("       herdr usage [--json | claude-statusline | cursor-login [--paste | --refresh | --status | --forget] [--browser <name>]]");
         println!();
         println!("Common commands:");
         for (command, description) in [
@@ -508,7 +509,7 @@ fn main() -> io::Result<()> {
                 "Show local client and running server status",
             ),
             ("herdr update", "Download and install the latest version"),
-            ("herdr usage", "Read provider allowances; cursor-login manages browser login on macOS"),
+            ("herdr usage", "Read provider allowances; cursor-login imports on macOS or accepts a pasted login"),
             (
                 "herdr server stop",
                 "Stop the running server via the API socket",

@@ -1,10 +1,11 @@
 //! Scoped macOS browser import. Secrets stay in memory and enter security over stdin.
 use super::CursorLoginResult;
+#[cfg(test)]
+use std::process::Command;
 use std::{
     fs,
-    io::{self, BufRead, Read, Write},
+    io::{self, BufRead, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 const SERVICE: &str = "herdr-cursor-usage";
@@ -140,76 +141,7 @@ fn uri(path: &Path, immutable: bool) -> String {
     });
     uri
 }
-struct Output {
-    code: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-/// Every helper shares an overall deadline. Drain pipes concurrently to avoid blocking
-/// on a large database response; a timeout kills and reaps the helper before returning.
-fn execute(
-    program: &str,
-    args: &[&str],
-    input: Option<&[u8]>,
-    deadline: Instant,
-) -> Result<Output, ()> {
-    if Instant::now() >= deadline {
-        return Err(());
-    }
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| ())?;
-    let stdout = child.stdout.take().ok_or(())?;
-    let stderr = child.stderr.take().ok_or(())?;
-    let read = |mut pipe: Box<dyn Read + Send>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.by_ref().take(8 * 1024 * 1024).read_to_end(&mut buf);
-            buf
-        })
-    };
-    let out = read(Box::new(stdout));
-    let err = read(Box::new(stderr));
-    let writer = input.map(|input| {
-        let input = input.to_vec();
-        let stdin = child.stdin.take();
-        std::thread::spawn(move || {
-            stdin
-                .ok_or(())
-                .and_then(|mut stdin| stdin.write_all(&input).map_err(|_| ()))
-        })
-    });
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-        }
-    };
-    let stdout = out.join().map_err(|_| ())?;
-    let stderr = err.join().map_err(|_| ())?;
-    if let Some(writer) = writer {
-        writer.join().map_err(|_| ())??;
-    }
-    let status = status.ok_or(())?;
-    Ok(Output {
-        code: status.code(),
-        stdout,
-        stderr,
-    })
-}
+use super::command::{execute, Output};
 fn database(path: &Path, deadline: Instant) -> Result<(u32, String), ()> {
     database_with(path, |uri, sql| {
         execute(
@@ -249,6 +181,45 @@ fn database_with(
                 if String::from_utf8_lossy(&output.stderr)
                     .contains("unable to open database file") => {}
             Err(_) => return Err(()),
+        }
+    }
+    Err(())
+}
+/// Selection returns a single existence bit; ciphertext is fetched only during import.
+fn live_cookie_sql(now: u64) -> String {
+    // Rust's importer parses an unsigned microsecond count, floors to seconds,
+    // then requires expiry > now. Decimal-string comparisons avoid SQLite's
+    // signed-integer overflow and reject malformed values exactly as that parser does.
+    let live = now.checked_add(11_644_473_600).and_then(|seconds| seconds.checked_add(1))
+        .and_then(|seconds| seconds.checked_mul(1_000_000)).map_or_else(|| "0".to_string(), |minimum| {
+            let width = minimum.to_string().len();
+            format!("(length(digits) > {width} OR (length(digits) = {width} AND digits >= '{minimum}'))")
+        });
+    format!("WITH scoped AS (SELECT COALESCE(CAST(has_expires AS TEXT),'') <> '1' AS is_session, CASE WHEN substr(CAST(expires_utc AS TEXT),1,1) = '+' THEN substr(CAST(expires_utc AS TEXT),2) ELSE CAST(expires_utc AS TEXT) END AS expiry FROM cookies WHERE host_key IN ('cursor.com','.cursor.com')), normalized AS (SELECT is_session, expiry, ltrim(expiry,'0') AS digits FROM scoped) SELECT EXISTS(SELECT 1 FROM normalized WHERE is_session OR (expiry <> '' AND expiry NOT GLOB '*[^0-9]*' AND (length(digits) < 20 OR (length(digits) = 20 AND digits <= '18446744073709551615')) AND {live}));")
+}
+fn has_live_cookie(path: &Path, now: u64, deadline: Instant) -> bool {
+    live_cookie_with(path, now, |uri, sql| {
+        execute("/usr/bin/sqlite3", &["-readonly", uri, sql], None, deadline)
+    })
+    .unwrap_or(false)
+}
+fn live_cookie_with(
+    path: &Path,
+    now: u64,
+    mut run: impl FnMut(&str, &str) -> Result<Output, ()>,
+) -> Result<bool, ()> {
+    let sql = live_cookie_sql(now);
+    for immutable in [false, true] {
+        let output = run(&uri(path, immutable), &sql)?;
+        if output.code == Some(0) {
+            return match String::from_utf8_lossy(&output.stdout).trim() {
+                "1" => Ok(true),
+                "0" => Ok(false),
+                _ => Err(()),
+            };
+        }
+        if !String::from_utf8_lossy(&output.stderr).contains("unable to open database file") {
+            return Err(());
         }
     }
     Err(())
@@ -298,14 +269,13 @@ fn header(
 #[derive(Clone)]
 struct Browser {
     name: &'static str,
+    service: &'static str,
+    reason: &'static str,
     path: PathBuf,
 }
 fn browsers(home: &Path) -> Vec<Browser> {
     let mut found = Vec::new();
-    for (name, dir) in [
-        ("Chrome", "Google/Chrome"),
-        ("Brave", "BraveSoftware/Brave-Browser"),
-    ] {
+    for &(name, dir, service, _) in BROWSER_SPECS {
         let root = home.join("Library/Application Support").join(dir);
         let mut profiles = vec![root.join("Default")];
         let mut other = fs::read_dir(&root)
@@ -323,13 +293,138 @@ fn browsers(home: &Path) -> Vec<Browser> {
         for profile in profiles {
             for path in [profile.join("Cookies"), profile.join("Network/Cookies")] {
                 if path.is_file() {
-                    found.push(Browser { name, path });
+                    found.push(Browser {
+                        name,
+                        service,
+                        reason: "first available",
+                        path,
+                    });
                 }
             }
         }
     }
     found
 }
+// Cookie roots and Safe Storage services verified against browser_cookie3's
+// Chromium adapters; bundle IDs are verified by app metadata/upstream packaging.
+const BROWSER_SPECS: &[(&str, &str, &str, &str)] = &[
+    (
+        "Chrome",
+        "Google/Chrome",
+        "Chrome Safe Storage",
+        "com.google.Chrome",
+    ),
+    (
+        "Brave",
+        "BraveSoftware/Brave-Browser",
+        "Brave Safe Storage",
+        "com.brave.Browser",
+    ),
+    (
+        "Edge",
+        "Microsoft Edge",
+        "Microsoft Edge Safe Storage",
+        "com.microsoft.edgemac",
+    ),
+    (
+        "Arc",
+        "Arc/User Data",
+        "Arc Safe Storage",
+        "company.thebrowser.Browser",
+    ),
+    (
+        "Vivaldi",
+        "Vivaldi",
+        "Vivaldi Safe Storage",
+        "com.vivaldi.Vivaldi",
+    ),
+    (
+        "Chromium",
+        "Chromium",
+        "Chromium Safe Storage",
+        "org.chromium.Chromium",
+    ),
+];
+fn unsupported_browser(value: &str) -> Option<&'static str> {
+    if value.eq_ignore_ascii_case("Safari") || value.eq_ignore_ascii_case("com.apple.Safari") {
+        Some("Safari")
+    } else if value.eq_ignore_ascii_case("Firefox")
+        || value.eq_ignore_ascii_case("org.mozilla.firefox")
+    {
+        Some("Firefox")
+    } else {
+        None
+    }
+}
+fn unsupported_default_message(bundle: &str) -> Option<String> {
+    if BROWSER_SPECS
+        .iter()
+        .any(|spec| spec.3.eq_ignore_ascii_case(bundle))
+    {
+        return None;
+    }
+    let browser = unsupported_browser(bundle)
+        .map_or_else(|| bundle.to_string(), |name| format!("{name} ({bundle})"));
+    Some(format!(
+        "Default browser {browser} is not supported yet. Trying supported Chromium browsers."
+    ))
+}
+fn select_browser(
+    home: &Path,
+    default: Option<&str>,
+    forced: Option<&str>,
+    deadline: Instant,
+) -> Result<Browser, String> {
+    if let Some(name) = forced {
+        if let Some(name) = unsupported_browser(name) {
+            return Err(format!("{name} is not supported yet."));
+        }
+        if !BROWSER_SPECS
+            .iter()
+            .any(|spec| spec.0.eq_ignore_ascii_case(name))
+        {
+            return Err(
+                "Unknown browser. Use Chrome, Brave, Edge, Arc, Vivaldi, or Chromium.".into(),
+            );
+        }
+    }
+    let default_name = default.and_then(|bundle| {
+        BROWSER_SPECS
+            .iter()
+            .find(|spec| spec.3.eq_ignore_ascii_case(bundle))
+            .map(|spec| spec.0)
+    });
+    let mut all = browsers(home);
+    if let Some(forced) = forced {
+        all.retain(|b| b.name.eq_ignore_ascii_case(forced));
+    }
+    all.sort_by_key(|b| default_name != Some(b.name));
+    let selected = all
+        .iter()
+        .find(|b| has_live_cookie(&b.path, crate::usage::now(), deadline));
+    let signed_in = selected.is_some();
+    let mut browser = selected
+        .cloned()
+        .or_else(|| all.into_iter().next())
+        .ok_or_else(|| "No supported browser cookie store found.".to_string())?;
+    browser.reason = if forced.is_some() {
+        "explicit --browser"
+    } else if default_name == Some(browser.name) {
+        "default"
+    } else if signed_in {
+        "first signed in"
+    } else {
+        "first available"
+    };
+    Ok(browser)
+}
+#[cfg(test)]
+fn signed_in_browser(home: &Path, deadline: Instant) -> Option<Browser> {
+    select_browser(home, None, None, deadline).ok()
+}
+use super::arguments::parse_args;
+#[cfg(test)]
+use super::arguments::LoginArgs;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Presence {
     Present,
@@ -355,7 +450,7 @@ fn keychain_presence(deadline: Instant) -> Presence {
         .and_then(|o| o.code),
     )
 }
-fn security_input(secret: &str) -> Result<String, ()> {
+pub(super) fn security_input(secret: &str) -> Result<String, ()> {
     if secret.is_empty() || secret.contains(['\r', '\n', '\0']) {
         return Err(());
     }
@@ -368,13 +463,19 @@ fn security_input(secret: &str) -> Result<String, ()> {
 struct LoginStatus {
     browser: String,
     result: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    kind: String,
 }
 fn status_file() -> PathBuf {
     crate::config::state_dir().join("usage/cursor-login-status.json")
 }
-fn record(browser: &str, code: i32) {
+fn record(browser: &Browser, code: i32) {
     let status = LoginStatus {
-        browser: browser.into(),
+        kind: "browser".into(),
+        browser: browser.name.into(),
+        reason: browser.reason.into(),
         result: match code {
             0 => "saved",
             4 => "signed_out",
@@ -384,23 +485,7 @@ fn record(browser: &str, code: i32) {
     };
     let _ = crate::usage::atomic_json(&status_file(), &status);
 }
-fn consent() -> bool {
-    crate::config::Config::load().config.ui.usage.cursor_login
-}
-fn save_consent(path: &Path, enabled: bool) -> io::Result<()> {
-    let content = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e),
-    };
-    // Refuse to overwrite a broken config with defaults.
-    toml::from_str::<crate::config::Config>(&content).map_err(io::Error::other)?;
-    let content = crate::config::upsert_section_bool(&content, "ui.usage", "cursor_login", enabled);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, content)
-}
+use super::consent::{consent, save_consent};
 fn forget(
     clear: impl FnOnce() -> io::Result<()>,
     delete: Option<i32>,
@@ -423,57 +508,9 @@ fn forget(
         1
     }
 }
-fn check_usage(secret: &str, deadline: Instant) -> i32 {
-    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-        return 1;
-    };
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(remaining.min(Duration::from_secs(5))))
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .build()
-        .into();
-    let Ok(mut response) = agent
-        .get("https://cursor.com/api/usage-summary")
-        .header("Cookie", secret)
-        .call()
-    else {
-        return 1;
-    };
-    let status = response.status().as_u16();
-    let location = response
-        .headers()
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if status != 200 {
-        return validation(status, location, None);
-    }
-    let body = response
-        .body_mut()
-        .with_config()
-        .limit(1024 * 1024)
-        .read_json::<serde_json::Value>()
-        .ok();
-    validation(status, "", body.as_ref())
-}
-fn validation(status: u16, location: &str, body: Option<&serde_json::Value>) -> i32 {
-    if status == 401
-        || ((300..400).contains(&status) && location.starts_with("https://api.workos.com/"))
-    {
-        return 4;
-    }
-    if status == 200
-        && body
-            .and_then(|v| v.get("billingCycleEnd"))
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| !s.is_empty())
-    {
-        0
-    } else {
-        1
-    }
-}
+use super::validation::check_usage;
+#[cfg(test)]
+use super::validation::validation;
 
 fn finish_import(
     import: impl FnOnce() -> Result<String, ()>,
@@ -504,10 +541,10 @@ fn import(browser: &Browser, deadline: Instant) -> i32 {
     let code = finish_import(
         || {
             let (version, rows) = database(&browser.path, deadline)?;
-            let service = format!("{} Safe Storage", browser.name);
+            let service = browser.service;
             let output = execute(
                 "/usr/bin/security",
-                &["find-generic-password", "-w", "-s", &service],
+                &["find-generic-password", "-w", "-s", service],
                 None,
                 deadline,
             )?;
@@ -545,7 +582,7 @@ fn import(browser: &Browser, deadline: Instant) -> i32 {
             }
         },
     );
-    record(browser.name, code);
+    record(browser, code);
     code
 }
 fn authorized(
@@ -567,16 +604,18 @@ fn authorized(
     Ok(true)
 }
 pub(crate) fn cursor_login_cli(args: &[String]) -> i32 {
-    let flag = args.first().map(String::as_str).unwrap_or("");
-    if args.len() > 1 || !["", "--refresh", "--status", "--forget"].contains(&flag) {
-        eprintln!("usage: herdr usage cursor-login [--refresh | --status | --forget]");
+    let Ok(parsed) = parse_args(args) else {
+        eprintln!(
+            "usage: herdr usage cursor-login [--refresh | --status | --forget] [--browser <name>]"
+        );
         return 1;
-    }
+    };
+    let flag = parsed.flag.as_str();
     let deadline = Instant::now() + Duration::from_secs(20);
     if flag == "--status" {
         let status: LoginStatus = crate::usage::read_json(&status_file()).unwrap_or_default();
         println!(
-            "browser: {}\nlast: {}",
+            "browser: {}\nlast: {}\nselection: {}",
             if status.browser.is_empty() {
                 "none"
             } else {
@@ -586,6 +625,11 @@ pub(crate) fn cursor_login_cli(args: &[String]) -> i32 {
                 "none"
             } else {
                 &status.result
+            },
+            if status.reason.is_empty() {
+                "unknown (saved before browser selection reporting)"
+            } else {
+                &status.reason
             }
         );
         println!(
@@ -614,8 +658,10 @@ pub(crate) fn cursor_login_cli(args: &[String]) -> i32 {
                 crate::usage::atomic_json(
                     &status_file(),
                     &LoginStatus {
+                        kind: String::new(),
                         browser: String::new(),
                         result: "forgotten".into(),
+                        reason: String::new(),
                     },
                 )
             },
@@ -629,9 +675,23 @@ pub(crate) fn cursor_login_cli(args: &[String]) -> i32 {
         return 3;
     }
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    let Some(browser) = browsers(&home).into_iter().next() else {
-        eprintln!("No Chrome or Brave cookie store found.");
-        return 1;
+    let default = super::browser::default_browser().identity;
+    if parsed.browser.is_none() {
+        if let Some(message) = default.as_deref().and_then(unsupported_default_message) {
+            eprintln!("{message}");
+        }
+    }
+    let browser = match select_browser(
+        &home,
+        default.as_deref(),
+        parsed.browser.as_deref(),
+        deadline,
+    ) {
+        Ok(browser) => browser,
+        Err(message) => {
+            eprintln!("{message}");
+            return 1;
+        }
     };
     let granted = authorized(
         flag == "--refresh",
@@ -667,10 +727,11 @@ pub(crate) fn refresh_cursor_login(timeout: Duration) -> CursorLoginResult {
         return CursorLoginResult::Exited(3);
     }
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-    let Some(browser) = browsers(&home).into_iter().next() else {
+    let deadline = Instant::now() + timeout;
+    let default = super::browser::default_browser().identity;
+    let Ok(browser) = select_browser(&home, default.as_deref(), None, deadline) else {
         return CursorLoginResult::Exited(1);
     };
-    let deadline = Instant::now() + timeout;
     let code = import(&browser, deadline);
     if Instant::now() >= deadline {
         CursorLoginResult::TimedOut
@@ -999,5 +1060,243 @@ mod tests {
         assert_eq!(found[0].name, "Chrome");
         assert!(found[1].path.ends_with("Profile 2/Cookies"));
         assert_eq!(found[2].name, "Brave");
+    }
+    #[test]
+    fn usage_signed_in_brave_wins_over_signed_out_chrome() {
+        let home = directory();
+        let store = |dir: &str, host: &str| {
+            let profile = home.join("Library/Application Support").join(dir);
+            fs::create_dir_all(&profile).unwrap();
+            let sql = format!("CREATE TABLE meta(key TEXT,value TEXT); INSERT INTO meta VALUES('version','24'); CREATE TABLE cookies(host_key TEXT,name TEXT,encrypted_value BLOB,expires_utc INTEGER,has_expires INTEGER); INSERT INTO cookies VALUES('{host}','synthetic',X'00',0,0);");
+            assert!(Command::new("/usr/bin/sqlite3")
+                .arg(profile.join("Cookies"))
+                .arg(sql)
+                .status()
+                .unwrap()
+                .success());
+        };
+        store("Google/Chrome/Default", "other.example");
+        store("BraveSoftware/Brave-Browser/Default", ".cursor.com");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(signed_in_browser(&home, deadline).unwrap().name, "Brave");
+        let fallback = select_browser(&home, Some("com.google.Chrome"), None, deadline).unwrap();
+        assert_eq!(fallback.name, "Brave");
+        assert_eq!(fallback.reason, "first signed in");
+        let forced =
+            select_browser(&home, Some("com.brave.Browser"), Some("Chrome"), deadline).unwrap();
+        assert_eq!(forced.name, "Chrome");
+        assert_eq!(forced.reason, "explicit --browser");
+
+        // Nobody signed in: fall back to the first store, which then reports signed out.
+        let empty = directory();
+        let profile = empty.join("Library/Application Support/Google/Chrome/Default");
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(profile.join("Cookies"), b"synthetic").unwrap();
+        assert_eq!(signed_in_browser(&empty, deadline).unwrap().name, "Chrome");
+    }
+    #[test]
+    fn usage_default_browser_and_explicit_browser_selection_are_synthetic() {
+        let home = directory();
+        for &(name, root, service, bundle) in BROWSER_SPECS {
+            let dir = home
+                .join("Library/Application Support")
+                .join(root)
+                .join("Default");
+            fs::create_dir_all(&dir).unwrap();
+            assert!(Command::new("/usr/bin/sqlite3").arg(dir.join("Cookies")).arg("CREATE TABLE meta(key TEXT,value TEXT); INSERT INTO meta VALUES('version','24'); CREATE TABLE cookies(host_key TEXT,name TEXT,encrypted_value BLOB,expires_utc INTEGER,has_expires INTEGER); INSERT INTO cookies VALUES('.cursor.com','synthetic',X'00',0,0);").status().unwrap().success());
+            let selected = select_browser(
+                &home,
+                Some(bundle),
+                None,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+            assert_eq!(selected.name, name);
+            assert_eq!(selected.service, service);
+            assert_eq!(selected.reason, "default");
+        }
+        let chosen = select_browser(
+            &home,
+            Some("com.brave.Browser"),
+            Some("edge"),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(chosen.name, "Edge");
+        assert_eq!(chosen.reason, "explicit --browser");
+        for browser in ["Safari", "Firefox"] {
+            let error = select_browser(&home, None, Some(browser), Instant::now())
+                .err()
+                .unwrap();
+            assert!(error.contains(browser) && error.contains("not supported yet"));
+        }
+        assert_eq!(unsupported_browser("com.apple.Safari"), Some("Safari"));
+        assert_eq!(unsupported_browser("org.mozilla.firefox"), Some("Firefox"));
+        let fallback = select_browser(
+            &home,
+            Some("com.apple.Safari"),
+            None,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(fallback.reason, "first signed in");
+    }
+    #[test]
+    fn usage_browser_arguments_are_validated_without_external_reads() {
+        let args = |words: &[&str]| words.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for words in [
+            vec!["--browser"],
+            vec!["--browser", "Safari", "--status"],
+            vec!["--refresh", "--forget"],
+            vec!["--browser", "Brave", "--browser", "Chrome"],
+        ] {
+            assert!(parse_args(&args(&words)).is_err());
+        }
+        for words in [
+            vec!["--browser", "Brave", "--refresh"],
+            vec!["--refresh", "--browser", "Brave"],
+        ] {
+            assert_eq!(
+                parse_args(&args(&words)).unwrap(),
+                LoginArgs {
+                    flag: "--refresh".into(),
+                    browser: Some("Brave".into())
+                }
+            );
+        }
+        let old: LoginStatus =
+            serde_json::from_str(r#"{"browser":"Brave","result":"saved"}"#).unwrap();
+        assert!(old.reason.is_empty());
+    }
+    #[test]
+    fn usage_selection_uses_only_live_metadata_without_ciphertext_or_meta_columns() {
+        let home = directory();
+        for (root, expiry) in [
+            ("Google/Chrome", 0),
+            ("BraveSoftware/Brave-Browser", 11644474601000000_u64),
+        ] {
+            let dir = home
+                .join("Library/Application Support")
+                .join(root)
+                .join("Default");
+            fs::create_dir_all(&dir).unwrap();
+            let sql = format!("CREATE TABLE cookies(host_key TEXT,expires_utc INTEGER,has_expires INTEGER); INSERT INTO cookies VALUES('.cursor.com',{expiry},1);");
+            assert!(Command::new("/usr/bin/sqlite3")
+                .arg(dir.join("Cookies"))
+                .arg(sql)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let chrome = home.join("Library/Application Support/Google/Chrome/Default/Cookies");
+        let brave =
+            home.join("Library/Application Support/BraveSoftware/Brave-Browser/Default/Cookies");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        assert!(!has_live_cookie(&chrome, 1000, deadline));
+        assert!(has_live_cookie(&brave, 1000, deadline));
+        assert!(
+            !has_live_cookie(&brave, 1001, deadline),
+            "expiry at now is expired"
+        );
+        // A session cookie remains live regardless of its expires_utc field.
+        assert!(Command::new("/usr/bin/sqlite3")
+            .arg(&brave)
+            .arg("UPDATE cookies SET has_expires=0, expires_utc=0")
+            .status()
+            .unwrap()
+            .success());
+        let chosen = select_browser(&home, Some("com.google.Chrome"), None, deadline).unwrap();
+        assert_eq!(chosen.name, "Brave");
+        assert_eq!(chosen.reason, "first signed in");
+        let sql = live_cookie_sql(1000);
+        assert!(!sql.contains("encrypted_value"));
+        assert!(!sql.contains("hex("));
+        assert!(sql.contains("SELECT EXISTS(SELECT 1"));
+        assert!(sql.contains("host_key IN ('cursor.com','.cursor.com')"));
+    }
+    #[test]
+    fn usage_live_row_probe_matches_expiry_rules_and_scopes_hosts() {
+        let path = directory().join("metadata.sqlite");
+        assert!(Command::new("/usr/bin/sqlite3")
+            .arg(&path)
+            .arg("CREATE TABLE cookies(host_key TEXT,expires_utc TEXT,has_expires TEXT)")
+            .status()
+            .unwrap()
+            .success());
+        for (host, expires, has_expires, expected) in [
+            ("cursor.com", "11644474600999999", 1, false),
+            (".cursor.com", "11644474601000000", 1, true),
+            ("cursor.com", "0", 1, false),
+            ("cursor.com", "0", 0, true),
+            ("other.example", "11644474601000000", 1, false),
+            ("cursor.com", "'bad'", 1, false),
+            ("cursor.com", "-1", 1, false),
+            ("cursor.com", "'+11644474601000000'", 1, true),
+            ("cursor.com", "'++11644474601000000'", 1, false),
+            ("cursor.com", "'+-11644474601000000'", 1, false),
+            ("cursor.com", "'00011644474601000000'", 1, true),
+            ("cursor.com", "'18446744073709551615'", 1, true),
+            ("cursor.com", "'18446744073709551616'", 1, false),
+        ] {
+            // UPDATE the single row between cases; no data or fixture files are deleted.
+            let sql = format!("UPDATE cookies SET host_key='{host}',expires_utc={expires},has_expires={has_expires}; INSERT INTO cookies SELECT '{host}',{expires},{has_expires} WHERE NOT EXISTS(SELECT 1 FROM cookies);");
+            assert!(Command::new("/usr/bin/sqlite3")
+                .arg(&path)
+                .arg(sql)
+                .status()
+                .unwrap()
+                .success());
+            let rows = format!(
+                "{}\t{}\t{}\t{}\t{}\n",
+                hex(host.as_bytes()),
+                hex(b"token"),
+                hex(b"synthetic"),
+                expires.trim_matches('\''),
+                has_expires
+            );
+            let imported = !header(&rows, 23, 1000, |_, _, _| Ok("synthetic".into()))
+                .unwrap()
+                .is_empty();
+            assert_eq!(imported, expected, "import {expires}");
+            assert_eq!(
+                has_live_cookie(&path, 1000, Instant::now() + Duration::from_secs(2)),
+                expected,
+                "{host} {expires} {has_expires}"
+            );
+        }
+        let mut calls = 0;
+        assert!(live_cookie_with(&path, 1000, |uri, sql| {
+            calls += 1;
+            assert!(!sql.contains("encrypted_value"));
+            if calls == 1 {
+                assert!(uri.ends_with("?mode=ro"));
+                Ok(Output {
+                    code: Some(1),
+                    stdout: vec![],
+                    stderr: b"unable to open database file".to_vec(),
+                })
+            } else {
+                assert!(uri.ends_with("?mode=ro&immutable=1"));
+                Ok(Output {
+                    code: Some(0),
+                    stdout: b"1\n".to_vec(),
+                    stderr: vec![],
+                })
+            }
+        })
+        .unwrap());
+        assert_eq!(calls, 2);
+    }
+    #[test]
+    fn usage_any_unsupported_default_is_named_by_bundle_id() {
+        for bundle in [
+            "org.example.UnsupportedBrowser",
+            "com.apple.Safari",
+            "org.mozilla.firefox",
+        ] {
+            let message = unsupported_default_message(bundle).unwrap();
+            assert!(message.contains(bundle) && message.contains("not supported yet"));
+        }
+        assert!(unsupported_default_message("com.brave.Browser").is_none());
     }
 }
