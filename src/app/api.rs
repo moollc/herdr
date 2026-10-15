@@ -91,6 +91,21 @@ impl App {
             return;
         }
 
+        if let AppEvent::UsageRefreshed { snapshot, finished } = ev {
+            if finished {
+                self.usage_refresh_landed(Instant::now());
+            }
+            if let Some(snapshot) = snapshot {
+                if self.state.usage_snapshot.as_ref() != Some(&snapshot) {
+                    self.state.usage_snapshot = Some(snapshot);
+                    self.render_dirty.store(true, Ordering::Release);
+                    self.render_notify.notify_one();
+                }
+            }
+            self.sync_usage_redraw_deadline();
+            return;
+        }
+
         if let AppEvent::AgentModelRefreshed { results } = ev {
             self.agent_model_refresh_in_flight = false;
             self.last_agent_model_refresh = Instant::now();

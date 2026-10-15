@@ -196,13 +196,14 @@ pub enum Tool {
 }
 
 /// Every part of the interface that folds.
-const VIEW_PARTS: [ViewPart; 6] = [
+const VIEW_PARTS: [ViewPart; 7] = [
     ViewPart::Sidebar,
     ViewPart::Spaces,
     ViewPart::AgentTable,
     ViewPart::SpaceAgents,
     ViewPart::SpaceGroup,
     ViewPart::Minimap,
+    ViewPart::Usage,
 ];
 
 /// How a part of the interface is changed, as the API names it.
@@ -351,6 +352,9 @@ impl Tool {
             }
             Tool::View(ViewPart::Minimap) => {
                 "hide or show the minimaps, the small layout previews under tabs in the sidebar"
+            }
+            Tool::View(ViewPart::Usage) => {
+                "hide or show the allowance meters (usage left, five hour and weekly) in the agent table, the pane headers and the sidebar, all at once"
             }
         }
     }

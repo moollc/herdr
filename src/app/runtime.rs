@@ -6,11 +6,78 @@ use super::{
     auto_updates_enabled, repeat_key_identity, App, Mode, AGENT_MODEL_REFRESH_INTERVAL,
     ANIMATION_INTERVAL, AUTO_UPDATE_CHECK_INTERVAL, GIT_REMOTE_STATUS_REFRESH_INTERVAL,
     MIN_RENDER_INTERVAL, PLAYER_POLL_INTERVAL, RESIZE_POLL_INTERVAL, SELECTION_AUTOSCROLL_INTERVAL,
+    USAGE_REFRESH_INTERVAL,
 };
 use crate::detect::AgentState;
 use crate::events::AppEvent;
 use crate::workspace::{GitStatusCacheEntry, Workspace, WorkspaceGitStatus};
 use std::collections::HashMap;
+
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// The newest time any agent finished a turn, across every terminal.
+fn latest_finish_stamp(state: &crate::app::AppState) -> Option<std::time::SystemTime> {
+    state
+        .terminals
+        .values()
+        .filter_map(|terminal| terminal.agent_last_finished_at)
+        .max()
+}
+
+/// A refresh is due when the newest finish moved to a later one. An agent
+/// going working to done sets a new stamp; done to done leaves it alone.
+pub(crate) fn usage_finish_triggers(
+    seen: Option<std::time::SystemTime>,
+    now: Option<std::time::SystemTime>,
+) -> bool {
+    now.is_some() && now != seen
+}
+
+/// Alerts speak unless the config turned them off or `SPEAK=0`.
+pub(crate) fn usage_alerts_enabled(configured: bool, speak_env: Option<&str>) -> bool {
+    configured && speak_env != Some("0")
+}
+
+/// Drops alerts the bar contradicts: a window already over (its reset is in
+/// the past, the bar says idle) or a provider whose login is gone (the bar
+/// says login). An alert with no reading to check is kept.
+pub(crate) fn alerts_worth_speaking(
+    alerts: Vec<(crate::usage::Provider, crate::usage::WindowKind)>,
+    snapshot: Option<&crate::usage::UsageSnapshot>,
+    now: u64,
+) -> Vec<(crate::usage::Provider, crate::usage::WindowKind)> {
+    use crate::usage::UsageProblem;
+    alerts
+        .into_iter()
+        .filter(|(provider, kind)| {
+            let Some(usage) =
+                snapshot.and_then(|s| s.providers.iter().find(|u| u.provider == *provider))
+            else {
+                return true;
+            };
+            if matches!(
+                usage.problem,
+                Some(UsageProblem::LoginExpired | UsageProblem::NoLogin)
+            ) {
+                return false;
+            }
+            !usage
+                .windows
+                .iter()
+                .filter(|w| w.kind == *kind)
+                .any(|w| w.resets_at.is_some_and(|at| at <= now))
+        })
+        .collect()
+}
+
+/// Runs an optional alert program on the worker, with the phrase as its last argument.
+fn speak_usage_alert(command: &str, phrase: &str) {
+    crate::platform::usage::speak_alert(command, phrase);
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WorkspaceGitRefreshItem {
@@ -240,6 +307,8 @@ impl App {
         changed |= self.clear_due_selection_highlight(now);
 
         self.start_git_status_refresh_if_due(now);
+        self.start_usage_refresh_if_due(now);
+        changed |= self.usage_redraw_due(now);
         changed |= self.start_agent_model_refresh_if_due(now);
         changed |= self.poll_player_if_due(now);
 
@@ -495,6 +564,117 @@ impl App {
         });
     }
 
+    /// Reads allowances in the background when one is due: at start up, when
+    /// an agent finishes a turn, and every five minutes. One at a time.
+    pub(crate) fn start_usage_refresh_if_due(&mut self, now: Instant) {
+        let stamp = latest_finish_stamp(&self.state);
+        if usage_finish_triggers(self.usage_finish_stamp, stamp) {
+            self.mark_usage_refresh_due(now);
+        }
+        self.usage_finish_stamp = stamp;
+
+        let Some(deadline) = self.usage_refresh_deadline() else {
+            return;
+        };
+        if now < deadline {
+            return;
+        }
+        let want = crate::ui::usage_bar::providers_present(&self.state);
+        if want.is_empty() {
+            self.last_usage_refresh = now;
+            return;
+        }
+        self.usage_refresh_in_flight = true;
+        let event_tx = self.event_tx.clone();
+        let usage = std::sync::Arc::clone(&self.usage_state);
+        let alerts_on = self.state.usage_config.alerts;
+        let alert_command = self.state.usage_config.alert_command.clone();
+        std::thread::spawn(move || {
+            let epoch = epoch_secs();
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut usage = usage
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let snapshot = usage.refresh_worker(&want, epoch, |snapshot| {
+                    let _ = event_tx.blocking_send(AppEvent::UsageRefreshed {
+                        snapshot: Some(snapshot),
+                        finished: false,
+                    });
+                });
+                let alerts = usage.take_alerts(&snapshot);
+                (snapshot, alerts)
+            }));
+            let (snapshot, alerts) = match ran {
+                Ok((snapshot, alerts)) => (Some(snapshot), alerts),
+                Err(_) => (None, Vec::new()),
+            };
+            let snapshot_for_alerts = snapshot.clone();
+            // Neither snapshot publication can release the guard while login runs.
+            let _ = event_tx.blocking_send(AppEvent::UsageRefreshed {
+                snapshot: None,
+                finished: true,
+            });
+            if usage_alerts_enabled(alerts_on, std::env::var("SPEAK").ok().as_deref()) {
+                let snapshot = snapshot_for_alerts;
+                for (provider, kind) in alerts_worth_speaking(alerts, snapshot.as_ref(), epoch) {
+                    speak_usage_alert(
+                        &alert_command,
+                        &crate::ui::usage_bar::alert_phrase(provider, kind),
+                    );
+                }
+            }
+        });
+    }
+
+    /// Makes a refresh due now. While one is in flight its answer may predate
+    /// this request, so the request is remembered and survives the answer.
+    pub(crate) fn mark_usage_refresh_due(&mut self, now: Instant) {
+        if self.usage_refresh_in_flight {
+            self.usage_refresh_due_after_in_flight = true;
+            return;
+        }
+        self.last_usage_refresh = now.checked_sub(USAGE_REFRESH_INTERVAL).unwrap_or(now);
+        self.usage_refresh_due_after_in_flight = false;
+    }
+
+    /// A refresh answered: the next one is five minutes out, unless a turn
+    /// finished while it ran, in which case it is due again at once.
+    pub(crate) fn usage_refresh_landed(&mut self, now: Instant) {
+        self.usage_refresh_in_flight = false;
+        if self.usage_refresh_due_after_in_flight {
+            self.usage_refresh_due_after_in_flight = false;
+            self.mark_usage_refresh_due(now);
+        } else {
+            self.last_usage_refresh = now;
+        }
+    }
+
+    pub(crate) fn usage_refresh_deadline(&self) -> Option<Instant> {
+        (!self.usage_refresh_in_flight && !self.state.workspaces.is_empty())
+            .then_some(self.last_usage_refresh + USAGE_REFRESH_INTERVAL)
+    }
+
+    /// The moment a countdown or a stale mark next changes on screen.
+    pub(crate) fn sync_usage_redraw_deadline(&mut self) {
+        let present = crate::ui::usage_bar::providers_present(&self.state);
+        self.usage_redraw_deadline = self.state.usage_snapshot.as_ref().and_then(|snapshot| {
+            crate::ui::usage_bar::next_change_secs(snapshot, &present, epoch_secs())
+                .map(|secs| Instant::now() + Duration::from_secs(secs))
+        });
+    }
+
+    /// True when a countdown on screen has changed text, so a redraw is due.
+    pub(crate) fn usage_redraw_due(&mut self, now: Instant) -> bool {
+        if self
+            .usage_redraw_deadline
+            .is_none_or(|deadline| now < deadline)
+        {
+            return false;
+        }
+        self.sync_usage_redraw_deadline();
+        true
+    }
+
     pub(crate) fn mark_git_status_refresh_due(&mut self, now: Instant) {
         if self.git_refresh_in_flight {
             self.git_refresh_due_after_in_flight = true;
@@ -678,6 +858,12 @@ impl App {
                 .then(|| self.agent_model_refresh_deadline())
                 .flatten(),
             include_git_refresh.then_some(self.last_player_poll + PLAYER_POLL_INTERVAL),
+            include_git_refresh
+                .then(|| self.usage_refresh_deadline())
+                .flatten(),
+            include_git_refresh
+                .then_some(self.usage_redraw_deadline)
+                .flatten(),
             self.next_auto_update_check,
             self.agent_metadata_deadline,
             self.pending_agent_resume_deadline,
@@ -834,6 +1020,220 @@ pub(crate) fn refresh_workspace_git_statuses_with_cache(
 }
 
 #[cfg(test)]
+mod usage_refresh_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn a_new_finish_triggers_and_the_same_one_does_not() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let t1 = t0 + Duration::from_secs(60);
+        // Working to done sets a new finish time: refresh.
+        assert!(usage_finish_triggers(None, Some(t0)));
+        assert!(usage_finish_triggers(Some(t0), Some(t1)));
+        // Done to done leaves the stamp where it was: nothing to do.
+        assert!(!usage_finish_triggers(Some(t0), Some(t0)));
+        assert!(!usage_finish_triggers(None, None));
+    }
+
+    #[test]
+    fn working_to_done_fires_once_and_done_to_done_does_not() {
+        let mut state = crate::app::AppState::test_new();
+        let id = crate::terminal::TerminalId::alloc();
+        let terminal =
+            crate::terminal::TerminalState::new(id.clone(), std::path::PathBuf::from("/tmp"));
+        state.terminals.insert(id.clone(), terminal);
+        let agent = Some(crate::detect::Agent::Claude);
+
+        state
+            .terminals
+            .get_mut(&id)
+            .unwrap()
+            .set_detected_state(agent, AgentState::Working);
+        let working = latest_finish_stamp(&state);
+        assert_eq!(working, None);
+        assert!(!usage_finish_triggers(None, working));
+
+        // Working to done: a new finish time, so a refresh is due.
+        state
+            .terminals
+            .get_mut(&id)
+            .unwrap()
+            .set_detected_state(agent, AgentState::Idle);
+        let done = latest_finish_stamp(&state);
+        assert!(done.is_some());
+        assert!(usage_finish_triggers(working, done));
+
+        // Done to done: the stamp does not move, so nothing fires.
+        state
+            .terminals
+            .get_mut(&id)
+            .unwrap()
+            .set_detected_state(agent, AgentState::Idle);
+        let still_done = latest_finish_stamp(&state);
+        assert_eq!(still_done, done);
+        assert!(!usage_finish_triggers(done, still_done));
+    }
+
+    fn usage_test_app() -> crate::app::App {
+        crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    #[test]
+    fn a_turn_finished_during_a_refresh_leaves_the_next_one_due() {
+        let mut app = usage_test_app();
+        app.state.workspaces.push(Workspace::test_new("test"));
+        let now = Instant::now();
+        app.usage_refresh_in_flight = true;
+        app.last_usage_refresh = now;
+
+        // A turn finishes while the refresh is out.
+        app.mark_usage_refresh_due(now);
+        assert!(app.usage_refresh_due_after_in_flight);
+        assert_eq!(app.usage_refresh_deadline(), None, "in flight: no deadline");
+
+        // The answer lands: the request survives it.
+        app.handle_internal_event(crate::events::AppEvent::UsageRefreshed {
+            snapshot: None,
+            finished: true,
+        });
+        assert!(!app.usage_refresh_in_flight);
+        assert!(!app.usage_refresh_due_after_in_flight);
+        let deadline = app.usage_refresh_deadline().expect("due again");
+        assert!(deadline <= Instant::now());
+    }
+
+    #[test]
+    fn usage_partial_updates_keep_the_job_guard_until_completion() {
+        let mut app = usage_test_app();
+        app.state.workspaces.push(Workspace::test_new("test"));
+        app.usage_refresh_in_flight = true;
+        app.mark_usage_refresh_due(Instant::now());
+        for taken_at in [1000, 1001] {
+            app.handle_internal_event(AppEvent::UsageRefreshed {
+                snapshot: Some(crate::usage::UsageSnapshot {
+                    version: 1,
+                    taken_at,
+                    providers: Vec::new(),
+                }),
+                finished: false,
+            });
+            assert!(app.usage_refresh_in_flight);
+            assert!(app.usage_refresh_due_after_in_flight);
+            assert_eq!(app.usage_refresh_deadline(), None);
+            assert_eq!(
+                app.state
+                    .usage_snapshot
+                    .as_ref()
+                    .expect("snapshot applied")
+                    .taken_at,
+                taken_at
+            );
+        }
+        app.handle_internal_event(AppEvent::UsageRefreshed {
+            snapshot: None,
+            finished: true,
+        });
+        assert!(!app.usage_refresh_in_flight);
+        assert!(!app.usage_refresh_due_after_in_flight);
+        assert!(app.usage_refresh_deadline().expect("queued refresh due") <= Instant::now());
+    }
+
+    #[test]
+    fn a_refresh_with_no_finish_during_it_waits_the_full_interval() {
+        let mut app = usage_test_app();
+        app.state.workspaces.push(Workspace::test_new("test"));
+        app.usage_refresh_in_flight = true;
+        app.handle_internal_event(crate::events::AppEvent::UsageRefreshed {
+            snapshot: None,
+            finished: true,
+        });
+        let deadline = app.usage_refresh_deadline().expect("scheduled");
+        assert!(deadline > Instant::now() + USAGE_REFRESH_INTERVAL - Duration::from_secs(5));
+    }
+
+    #[test]
+    fn alerts_skip_windows_the_bar_calls_idle_or_login() {
+        use crate::usage::{
+            Provider, ProviderUsage, UsageProblem, UsageSnapshot, UsageWindow, WindowKind,
+        };
+        let win = |kind, resets_at| UsageWindow {
+            kind,
+            left_pct: Some(5),
+            resets_at,
+            note: None,
+        };
+        let usage = |provider, windows, problem| ProviderUsage {
+            provider,
+            windows,
+            seen_at: Some(1_000),
+            source: "test".into(),
+            problem,
+        };
+        let snapshot = UsageSnapshot {
+            version: 1,
+            taken_at: 1_000,
+            providers: vec![
+                usage(
+                    Provider::Claude,
+                    vec![
+                        win(WindowKind::FiveHour, Some(900)),
+                        win(WindowKind::Weekly, Some(5_000)),
+                    ],
+                    None,
+                ),
+                usage(
+                    Provider::Cursor,
+                    vec![win(WindowKind::Monthly, Some(5_000))],
+                    Some(UsageProblem::LoginExpired),
+                ),
+                usage(
+                    Provider::Codex,
+                    vec![win(WindowKind::FiveHour, None)],
+                    Some(UsageProblem::NoLogin),
+                ),
+            ],
+        };
+        let all = vec![
+            (Provider::Claude, WindowKind::FiveHour),
+            (Provider::Claude, WindowKind::Weekly),
+            (Provider::Cursor, WindowKind::Monthly),
+            (Provider::Codex, WindowKind::FiveHour),
+        ];
+        // Past reset, expired login and no login are dropped; the live weekly stays.
+        assert_eq!(
+            alerts_worth_speaking(all.clone(), Some(&snapshot), 1_000),
+            vec![(Provider::Claude, WindowKind::Weekly)]
+        );
+        // With no reading to check, nothing is dropped.
+        assert_eq!(alerts_worth_speaking(all.clone(), None, 1_000), all);
+        // A window whose reset has not come yet is spoken.
+        assert_eq!(
+            alerts_worth_speaking(
+                vec![(Provider::Claude, WindowKind::FiveHour)],
+                Some(&snapshot),
+                800
+            ),
+            vec![(Provider::Claude, WindowKind::FiveHour)]
+        );
+    }
+
+    #[test]
+    fn alerts_obey_the_config_and_speak_zero() {
+        assert!(usage_alerts_enabled(true, None));
+        assert!(usage_alerts_enabled(true, Some("1")));
+        assert!(!usage_alerts_enabled(true, Some("0")));
+        assert!(!usage_alerts_enabled(false, None));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::state;
@@ -949,6 +1349,8 @@ mod tests {
         let now = Instant::now();
         app.last_git_remote_status_refresh = now - super::super::GIT_REMOTE_STATUS_REFRESH_INTERVAL;
         app.last_player_poll = now;
+        // The allowance refresh is not due, so only the git timer is in play.
+        app.last_usage_refresh = now;
 
         assert_eq!(
             app.next_headless_loop_deadline_with_git_refresh(now, false, false),

@@ -20,7 +20,7 @@ pub use self::{
     model::{
         validated_sidebar_bounds, Config, ConfigReloadReport, ConfigReloadStatus, KeysConfig,
         NewTerminalCwdConfig, PaneHeaderConfig, ShellModeConfig, ToastConfig, ToastDelivery,
-        UpdateChannelConfig, DEFAULT_REFRESH_SUMMARY_PROMPT,
+        UpdateChannelConfig, UsageDisplayConfig, DEFAULT_REFRESH_SUMMARY_PROMPT,
     },
     sound::SoundConfig,
     theme::{parse_color, CustomThemeColors, ThemeConfig},
@@ -28,7 +28,7 @@ pub use self::{
 
 pub(crate) use self::io::upsert_top_level_bool;
 pub(crate) use self::keybinds::is_unmodified_printable;
-pub(crate) use self::model::PaneHeaderField;
+pub(crate) use self::model::{PaneHeaderField, UsageSwitch};
 
 pub const CONFIG_PATH_ENV_VAR: &str = "HERDR_CONFIG_PATH";
 pub const DEFAULT_SCROLLBACK_LIMIT_BYTES: usize = 10_000_000;

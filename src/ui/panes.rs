@@ -50,13 +50,29 @@ fn pane_title_chrome_layout(
         .saturating_sub(3) as usize;
     let title_text = truncate_to_width(&title.formatted_title(), text_available);
     let details_width = (title_prefix_width + title_text.chars().count() + 1) as u16;
+    let usage_width = title_usage_width(title, text_available, title_text.chars().count());
     let rule_width = title_width
         .saturating_sub(details_width)
+        .saturating_sub(usage_width)
         .saturating_sub(controls_width)
         .saturating_sub(1);
     PaneTitleChromeLayout {
         details_width,
         rule_width,
+    }
+}
+
+/// Columns the usage meters take after the title text, with the space that
+/// follows them. They only use what the title text leaves free, so a long
+/// title is never cut for them.
+fn title_usage_width(title: &PaneChromeTitle, text_available: usize, title_cols: usize) -> u16 {
+    let Some(usage) = &title.usage else {
+        return 0;
+    };
+    let free = text_available.saturating_sub(title_cols).saturating_sub(1);
+    match super::usage_bar::header_width(usage, free) {
+        0 => 0,
+        meters => (meters + 1) as u16,
     }
 }
 
@@ -490,6 +506,10 @@ fn pane_chrome_title_for_pane(
         name,
         folder,
         git: git_suffix(branch.as_deref(), status.as_deref()),
+        usage: super::usage_bar::header_usage_for(
+            app,
+            terminal.and_then(|terminal| terminal.effective_known_agent()),
+        ),
     }
 }
 
@@ -715,6 +735,8 @@ struct PaneChromeTitle {
     name: Option<String>,
     folder: Option<String>,
     git: Option<String>,
+    /// The allowance meters of this pane's provider, after git status.
+    usage: Option<super::usage_bar::HeaderUsage>,
 }
 
 /// The same mark the agent table draws in its margin, carried onto a pane's
@@ -735,6 +757,7 @@ impl PaneChromeTitle {
             name: Some(name.into()),
             folder: None,
             git: None,
+            usage: None,
         }
     }
 
@@ -901,6 +924,16 @@ fn render_code_ui_pane_chrome(
         rest_style,
     ));
     spans.push(Span::styled(" ".to_string(), edge_style));
+    if let Some(usage) = &title.usage {
+        let free = text_available
+            .saturating_sub(title_text.chars().count())
+            .saturating_sub(1);
+        let meters = super::usage_bar::header_spans(usage, free, app.palette.overlay0);
+        if !meters.is_empty() {
+            spans.extend(meters);
+            spans.push(Span::styled(" ".to_string(), edge_style));
+        }
+    }
     if !rule_text.is_empty() {
         spans.push(Span::styled(rule_text, edge_style));
     }
@@ -1887,6 +1920,7 @@ mod tests {
             name: Some("Olivia".into()),
             folder: Some("lab/herdr".into()),
             git: git_suffix(Some("main"), Some("✓")),
+            usage: None,
         };
         assert_eq!(title.formatted_title(), "Olivia lab/herdr (main ✓)");
         assert_eq!(
@@ -1895,6 +1929,7 @@ mod tests {
                 name: None,
                 folder: Some("herdr".into()),
                 git: git_suffix(Some("main"), None),
+                usage: None,
             }
             .formatted_title(),
             "herdr (main)"
@@ -1908,6 +1943,7 @@ mod tests {
             name: None,
             folder: None,
             git: None,
+            usage: None,
         }
         .formatted_title()
         .is_empty());
@@ -2010,6 +2046,145 @@ mod tests {
             pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id).formatted_title(),
             "Olivia@king"
         );
+    }
+
+    fn usage_app_with_agent(
+        agent: Option<crate::detect::Agent>,
+    ) -> (AppState, crate::layout::PaneId) {
+        use crate::usage::{Provider, ProviderUsage, UsageSnapshot, UsageWindow, WindowKind};
+        let mut app = AppState::test_new();
+        let workspace = Workspace::test_new("test");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.tabs[0]
+            .terminal_id(pane_id)
+            .expect("test workspace has a root terminal")
+            .clone();
+        let mut terminal = crate::terminal::TerminalState::new(
+            terminal_id.clone(),
+            std::path::PathBuf::from("/home/aaron/lab/herdr"),
+        );
+        terminal.set_manual_label("Olivia".into());
+        terminal.detected_agent = agent;
+        app.terminals.insert(terminal_id, terminal);
+        app.workspaces = vec![workspace];
+        app.usage_now = 1_000_000;
+        app.usage_snapshot = Some(UsageSnapshot {
+            version: 1,
+            taken_at: 1_000_000,
+            providers: vec![ProviderUsage {
+                provider: Provider::Claude,
+                windows: vec![
+                    UsageWindow {
+                        kind: WindowKind::FiveHour,
+                        left_pct: Some(70),
+                        resets_at: Some(1_000_000 + 3 * 3600 + 42 * 60),
+                        note: None,
+                    },
+                    UsageWindow {
+                        kind: WindowKind::Weekly,
+                        left_pct: Some(80),
+                        resets_at: Some(1_000_000 + 4 * 86400 + 5 * 3600),
+                        note: None,
+                    },
+                ],
+                seen_at: Some(1_000_000),
+                source: "test".into(),
+                problem: None,
+            }],
+        });
+        (app, pane_id)
+    }
+
+    #[test]
+    fn usage_follows_the_panes_agent_and_the_header_toggle() {
+        let (mut app, pane_id) = usage_app_with_agent(Some(crate::detect::Agent::Claude));
+        let title = pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id);
+        assert!(title.usage.is_some());
+        // The meters sit after the title text; the text itself is unchanged.
+        assert_eq!(title.formatted_title(), "Olivia");
+
+        app.pane_header.usage = false;
+        assert!(
+            pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id)
+                .usage
+                .is_none()
+        );
+
+        // An agent with no allowance reading, and a pane with no agent: no bars.
+        let (app, pane_id) = usage_app_with_agent(Some(crate::detect::Agent::Codex));
+        assert!(
+            pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id)
+                .usage
+                .is_none()
+        );
+        let (app, pane_id) = usage_app_with_agent(None);
+        assert!(
+            pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id)
+                .usage
+                .is_none()
+        );
+    }
+
+    fn header_row(app: &AppState, width: u16, title: PaneChromeTitle) -> String {
+        let area = Rect::new(0, 0, width, 3);
+        let backend = ratatui::backend::TestBackend::new(width, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_code_ui_pane_chrome(
+                    app,
+                    frame,
+                    area,
+                    title,
+                    PaneId::from_raw(1),
+                    true,
+                    false,
+                    PaneTitleMode::Normal,
+                    true,
+                    ExposedSides::all(),
+                    None,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..width)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn usage_draws_after_the_name_and_drops_pieces_as_the_pane_narrows() {
+        let (app, pane_id) = usage_app_with_agent(Some(crate::detect::Agent::Claude));
+        let make = || pane_chrome_title_for_pane(&app, &app.workspaces[0], pane_id);
+
+        let wide = header_row(&app, 80, make());
+        let name = wide.find("Olivia").expect("name");
+        let meters = wide
+            .find("5h ■■■■■■■■■■ 70% 3/h")
+            .expect("labelled five hour meter");
+        assert!(meters > name);
+        assert!(wide.contains("wk ■■■■■■■■■■ 80% 4/d"), "{wide}");
+
+        // Without room for both windows the weekly one goes first.
+        let mid = header_row(&app, 52, make());
+        assert!(mid.contains("Olivia"), "{mid}");
+        assert!(!mid.contains("5h"), "labels went first: {mid}");
+        assert!(mid.contains("70% 3/h"), "{mid}");
+        assert!(!mid.contains("80%"), "{mid}");
+
+        // Narrower: the squares go, the number and countdown stay.
+        let narrow = header_row(&app, 38, make());
+        assert!(narrow.contains("Olivia"), "{narrow}");
+        assert!(!narrow.contains('■'), "{narrow}");
+        assert!(narrow.contains("70% 3/h"), "{narrow}");
+
+        // With no room left the meters give way and the header is exactly
+        // what it was without them: the name is never cut for the meters.
+        let mut bare = make();
+        bare.usage = None;
+        let tiny = header_row(&app, 24, make());
+        assert_eq!(tiny, header_row(&app, 24, bare));
+        assert!(!tiny.contains('%'), "{tiny}");
     }
 
     #[test]

@@ -26,6 +26,7 @@ use ratatui::{
 };
 
 use super::panes::{focus_accent, mute_when_host_unfocused};
+use super::usage_bar;
 use crate::app::state::Palette;
 use crate::app::AppState;
 use crate::detect::AgentState;
@@ -39,7 +40,16 @@ use crate::terminal::TerminalRuntimeRegistry;
 /// State is not a column. The margin beside a row already says whether the
 /// agent is working, waiting on an answer, or finished, in one cell and in
 /// color, and a word repeating it would only take room from the summary.
-const HEADINGS: [&str; 7] = ["Name", "Dir", "Task", "Agent", "Run", "Idle", "Git Status"];
+const HEADINGS: [&str; 8] = [
+    "Name",
+    "Dir",
+    "Task",
+    "Agent",
+    "Run",
+    "Idle",
+    "Git Status",
+    "Allowance",
+];
 const COLUMNS: usize = HEADINGS.len();
 const COL_NAME: usize = 0;
 const COL_DIRECTORY: usize = 1;
@@ -48,6 +58,9 @@ const COL_AGENT: usize = 3;
 const COL_RUN: usize = 4;
 const COL_IDLE: usize = 5;
 const COL_GIT: usize = 6;
+/// The provider's allowance meters, after Git Status. Its text is drawn from
+/// meters rather than from `cell_texts`, and it is zero wide while switched off.
+const COL_ALLOWANCE: usize = 7;
 /// The air after a column's widest cell, before the next column starts.
 const COLUMN_GAP: usize = 3;
 /// The left margin, clear of the first column, where the animation goes.
@@ -520,10 +533,37 @@ fn column_widths(app: &AppState, held: &[AgentPanelEntry], group_width: u16) -> 
     // Each column takes what it wants or what is left, whichever is less. A
     // group squeezed thin therefore loses its rightmost columns rather than
     // spilling over the group beside it.
+    // Allowance is the last column, so Task would otherwise take everything
+    // and leave it nothing. Earlier columns leave it the least it can use.
+    let allowance_on = app.usage_table_on();
+    let mut allowance_wanted = 0;
+    if allowance_on {
+        allowance_wanted = held
+            .iter()
+            .map(|entry| {
+                usage_bar::full_width(&usage_bar::table_meters_for(app, &entry.terminal_id))
+            })
+            .max()
+            .unwrap_or(0);
+        wanted[COL_ALLOWANCE] = wanted[COL_ALLOWANCE].max(allowance_wanted);
+    }
+    let reserve = if allowance_wanted > 0 {
+        allowance_wanted.min(usage_bar::TABLE_MIN_WIDTH)
+    } else {
+        0
+    };
     let mut room = (group_width as usize).saturating_sub(GUTTER as usize);
     let mut widths = vec![0usize; COLUMNS];
     for (column, width) in widths.iter_mut().enumerate() {
-        *width = (wanted[column] + COLUMN_GAP).min(room);
+        if column == COL_ALLOWANCE {
+            if allowance_on {
+                // No gap after the last column: the meters may use it all.
+                *width = wanted[column].min(room);
+            }
+            continue;
+        }
+        let keep = if column < COL_ALLOWANCE { reserve } else { 0 };
+        *width = (wanted[column] + COLUMN_GAP).min(room.saturating_sub(keep));
         room -= *width;
     }
     widths
@@ -556,6 +596,8 @@ fn cell_texts(app: &AppState, entry: &AgentPanelEntry) -> [String; COLUMNS] {
             .map(compact_duration)
             .unwrap_or_default(),
         git_cell_text(entry.location.as_ref()),
+        // Drawn from meters, see `COL_ALLOWANCE`.
+        String::new(),
     ]
 }
 
@@ -801,7 +843,9 @@ pub(crate) fn sync_agent_order(app: &mut AppState) {
 /// Rewrite the table's durable order from one column. Text columns go
 /// A–Z, empty last. Run and Idle go longest first, missing last.
 pub(crate) fn sort_agent_table_by_column(app: &mut AppState, column: usize) {
-    if column >= COLUMNS {
+    // Allowance has no order of its own: it is the same text for every agent
+    // of a provider, so a click on its heading changes nothing.
+    if column >= COLUMNS || column == COL_ALLOWANCE {
         return;
     }
     let mut entries = agent_panel_entries(app);
@@ -1009,6 +1053,9 @@ pub(crate) fn render_agent_table(
             let Some(rect) = group.columns.get(column) else {
                 continue;
             };
+            if rect.width == 0 {
+                continue;
+            }
             render_line(
                 frame,
                 cell(*rect, layout.area.y),
@@ -1033,6 +1080,13 @@ pub(crate) fn render_agent_table(
 
     let focused = focused_agent_row(app);
     let folders = folder_colors(&app.palette, entries);
+    // With the column off or hidden there is nothing to fit or draw.
+    let allowance_on = app.usage_table_on();
+    let allowance_fits = if allowance_on {
+        allowance_fits(app, layout, entries)
+    } else {
+        Vec::new()
+    };
     for (offset, row) in layout.rows.iter().enumerate() {
         let Some(entry) = entries.get(layout.scroll + offset) else {
             continue;
@@ -1051,6 +1105,14 @@ pub(crate) fn render_agent_table(
                 continue;
             };
             let area = cell(*rect, row.rect.y);
+            if column == COL_ALLOWANCE {
+                if !allowance_on {
+                    continue;
+                }
+                let fit = allowance_fits.get(row.group).copied().flatten();
+                render_allowance_cell(app, frame, entry, area, selected, fit);
+                continue;
+            }
             render_line(
                 frame,
                 area,
@@ -1067,6 +1129,64 @@ pub(crate) fn render_agent_table(
         }
     }
     render_agent_drop_indicator(app, frame, layout);
+}
+
+/// What each group's Allowance column keeps, decided once from its widest row
+/// so the rows of a group drop labels, the second meter and squares together
+/// instead of each row choosing for itself.
+fn allowance_fits(
+    app: &AppState,
+    layout: &AgentTableLayout,
+    entries: &[AgentPanelEntry],
+) -> Vec<Option<usage_bar::Fit>> {
+    layout
+        .groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| {
+            let width = group.columns.get(COL_ALLOWANCE)?.width as usize;
+            let rows: Vec<_> = layout
+                .rows
+                .iter()
+                .filter(|row| row.group == index)
+                .filter_map(|row| entries.get(row.entry_idx))
+                .map(|entry| usage_bar::table_meters_for(app, &entry.terminal_id))
+                .collect();
+            usage_bar::fit_rows(&rows, width, true)
+        })
+        .collect()
+}
+
+/// One agent's allowance meters in the Allowance column, fitted by the same
+/// rules as a pane header: labels go first, then the second window, then the
+/// squares. An agent with no known provider shows nothing.
+fn render_allowance_cell(
+    app: &AppState,
+    frame: &mut Frame,
+    entry: &AgentPanelEntry,
+    area: Rect,
+    selected: bool,
+    group_fit: Option<usage_bar::Fit>,
+) {
+    let meters = usage_bar::table_meters_for(app, &entry.terminal_id);
+    let width = area.width as usize;
+    // The group's fit, capped to this agent's own windows. It was chosen so
+    // that every row fits, so there is no fallback to a fit of its own.
+    let Some(fit) = group_fit.map(|fit| usage_bar::fit_for(&meters, fit)) else {
+        return;
+    };
+    if meters.is_empty() || usage_bar::row_width(&meters, fit) > width {
+        return;
+    }
+    let dim = mute_when_host_unfocused(app, app.palette.overlay0);
+    let mut spans = usage_bar::row_spans(&meters, fit, dim);
+    if selected {
+        // The meters write their own background; keep the selected row's band.
+        for span in &mut spans {
+            span.style.bg = Some(app.palette.surface_dim);
+        }
+    }
+    render_line(frame, area, Line::from(spans));
 }
 
 /// The rule down the right of every group but the last, from the heading row to
@@ -2164,5 +2284,317 @@ mod tests {
         let landed_fg = landed_cell.style().fg.expect("a Landed color");
         assert_eq!(branch_fg, Palette::catppuccin().green);
         assert_eq!(landed_fg, Palette::catppuccin().overlay0);
+    }
+    const USAGE_NOW: u64 = 1_000_000;
+
+    /// Two agents, a Claude with both windows and a Cursor with its month, and
+    /// a snapshot to match.
+    fn state_with_usage() -> AppState {
+        use crate::usage::{Provider, ProviderUsage, UsageSnapshot, UsageWindow, WindowKind};
+        let mut state = state_with_agents(3);
+        let agents = [
+            crate::detect::Agent::Claude,
+            crate::detect::Agent::Cursor,
+            crate::detect::Agent::Pi,
+        ];
+        let mut ids: Vec<_> = state.terminals.keys().cloned().collect();
+        ids.sort_by_key(|id| format!("{id:?}"));
+        for (id, agent) in ids.iter().zip(agents) {
+            if let Some(terminal) = state.terminals.get_mut(id) {
+                terminal.set_detected_state(Some(agent), AgentState::Idle);
+            }
+        }
+        let window = |kind, left, secs| UsageWindow {
+            kind,
+            left_pct: Some(left),
+            resets_at: Some(USAGE_NOW + secs),
+            note: None,
+        };
+        let usage = |provider, windows| ProviderUsage {
+            provider,
+            windows,
+            seen_at: Some(USAGE_NOW),
+            source: "test".into(),
+            problem: None,
+        };
+        state.usage_now = USAGE_NOW;
+        state.usage_snapshot = Some(UsageSnapshot {
+            version: 1,
+            taken_at: USAGE_NOW,
+            providers: vec![
+                usage(
+                    Provider::Claude,
+                    vec![
+                        window(WindowKind::FiveHour, 70, 3 * 3600 + 10),
+                        window(WindowKind::Weekly, 80, 4 * 86_400),
+                    ],
+                ),
+                usage(
+                    Provider::Cursor,
+                    vec![window(WindowKind::Monthly, 50, 2 * 7 * 86_400)],
+                ),
+            ],
+        });
+        state
+    }
+
+    fn painted_rows(state: &mut AppState, width: u16) -> (AgentTableLayout, Vec<String>) {
+        let area = Rect::new(0, 0, width, 20);
+        let (layout, _) = split_agent_table(state, area);
+        let entries = agent_panel_entries(state);
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_agent_table(state, frame, &layout, &entries))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let lines = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer.cell((x, y)).map_or(" ", |cell| cell.symbol()))
+                    .collect::<String>()
+            })
+            .collect();
+        (layout, lines)
+    }
+
+    #[test]
+    fn the_allowance_column_follows_git_status_and_shows_each_agents_provider() {
+        let mut state = state_with_usage();
+        let (layout, lines) = painted_rows(&mut state, 230);
+        assert_eq!(HEADINGS[COL_ALLOWANCE], "Allowance");
+        assert_eq!(COL_ALLOWANCE, COL_GIT + 1);
+        let columns = &layout.groups[0].columns;
+        assert_eq!(
+            columns[COL_ALLOWANCE].x,
+            columns[COL_GIT].x + columns[COL_GIT].width
+        );
+        assert!(lines[0].contains("Allowance"), "{}", lines[0]);
+        let joined = lines.join("\n");
+        // Claude shows both windows with labels, Cursor its month.
+        assert!(joined.contains("5h ■■■■■■■■■■"), "{joined}");
+        assert!(joined.contains("70% 3/h"), "{joined}");
+        assert!(joined.contains("wk"), "{joined}");
+        assert!(joined.contains("80% 4/d"), "{joined}");
+        assert!(joined.contains("mo"), "{joined}");
+        assert!(joined.contains("50% 2/w"), "{joined}");
+        // The agent with no known provider shows nothing in the column.
+        let rows: Vec<_> = lines.iter().skip(1).take(3).collect();
+        assert_eq!(
+            rows.iter().filter(|line| line.contains('%')).count(),
+            2,
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_allowance_column_drops_labels_then_the_second_meter_then_squares() {
+        let mut state = state_with_usage();
+        let widest = |lines: &[String]| -> String { lines[1].clone() };
+        let (_, wide) = painted_rows(&mut state, 230);
+        assert!(widest(&wide).contains("5h "), "{}", widest(&wide));
+        assert!(widest(&wide).contains("wk "), "{}", widest(&wide));
+        // Narrower: the room left shrinks, so the same row loses parts in order.
+        let mut seen_no_labels = false;
+        let mut seen_one_meter = false;
+        let mut seen_no_squares = false;
+        for width in (30..=230).rev() {
+            let (_, lines) = painted_rows(&mut state, width);
+            let row = &lines[1];
+            let has_labels = row.contains("5h ");
+            let squares = row.contains('■');
+            let both = row.contains("70%") && row.contains("80%");
+            if !has_labels && squares && both {
+                seen_no_labels = true;
+            }
+            if !has_labels && squares && row.contains("70%") && !row.contains("80%") {
+                seen_one_meter = true;
+            }
+            if !squares && row.contains("70%") {
+                seen_no_squares = true;
+            }
+            // Never spills past the table.
+            assert!(row.chars().count() <= width as usize);
+        }
+        assert!(seen_no_labels, "labels should go first");
+        assert!(seen_one_meter, "then the second meter");
+        assert!(seen_no_squares, "then the squares");
+    }
+
+    #[test]
+    fn the_allowance_column_is_gone_when_switched_off_or_hidden() {
+        let mut state = state_with_usage();
+        state.usage_config.table = false;
+        let (layout, lines) = painted_rows(&mut state, 230);
+        assert_eq!(layout.groups[0].columns[COL_ALLOWANCE].width, 0);
+        assert!(!lines[0].contains("Allowance"));
+        assert!(!lines.join("\n").contains('%'));
+
+        let mut state = state_with_usage();
+        state.usage_hidden = true;
+        let (layout, lines) = painted_rows(&mut state, 230);
+        assert_eq!(layout.groups[0].columns[COL_ALLOWANCE].width, 0);
+        assert!(!lines.join("\n").contains("Allowance"));
+        assert!(!lines.join("\n").contains('%'));
+    }
+
+    #[test]
+    fn a_long_task_does_not_push_the_allowance_column_out() {
+        let mut state = state_with_usage();
+        let id = state.terminals.keys().next().cloned().expect("a terminal");
+        if let Some(terminal) = state.terminals.get_mut(&id) {
+            terminal.session_title = Some("x".repeat(300));
+        }
+        let (layout, _) = split_agent_table(&mut state, Rect::new(0, 0, 120, 20));
+        let allowance = layout.groups[0].columns[COL_ALLOWANCE];
+        assert!(
+            allowance.width as usize >= usage_bar::TABLE_MIN_WIDTH,
+            "width {}",
+            allowance.width
+        );
+        assert!(allowance.x + allowance.width <= 119);
+    }
+
+    #[test]
+    fn a_click_on_the_allowance_heading_changes_no_order() {
+        let mut state = state_with_usage();
+        let before: Vec<_> = agent_panel_entries(&state)
+            .into_iter()
+            .map(|entry| entry.terminal_id)
+            .collect();
+        sort_agent_table_by_column(&mut state, COL_ALLOWANCE);
+        let after: Vec<_> = agent_panel_entries(&state)
+            .into_iter()
+            .map(|entry| entry.terminal_id)
+            .collect();
+        assert_eq!(before, after);
+    }
+    #[test]
+    fn rows_of_a_group_drop_labels_together_not_one_by_one() {
+        let mut state = state_with_usage();
+        // Find a width where the Claude row (two meters) has lost its labels
+        // but the Cursor row (one meter) would still have room for its own.
+        let mut checked = 0;
+        for width in 60..=230 {
+            let (_, lines) = painted_rows(&mut state, width);
+            let (Some(claude), Some(cursor)) = (
+                lines.iter().find(|line| line.contains("70%")),
+                lines.iter().find(|line| line.contains("50%")),
+            ) else {
+                continue;
+            };
+            if !claude.contains("5h ") {
+                assert!(
+                    !cursor.contains("mo "),
+                    "width {width}: labels on one row but not the other\n{claude}\n{cursor}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no width dropped labels on the Claude row");
+    }
+    #[test]
+    fn a_healthy_and_a_login_expired_row_share_one_fit_at_20_columns() {
+        use crate::usage::{Provider, ProviderUsage, UsageProblem};
+        let mut state = state_with_usage();
+        if let Some(snapshot) = state.usage_snapshot.as_mut() {
+            for usage in &mut snapshot.providers {
+                if usage.provider == Provider::Cursor {
+                    *usage = ProviderUsage {
+                        problem: Some(UsageProblem::LoginExpired),
+                        ..usage.clone()
+                    };
+                }
+            }
+        }
+        let rows: Vec<Vec<usage_bar::Meter>> = agent_panel_entries(&state)
+            .iter()
+            .map(|entry| usage_bar::table_meters_for(&state, &entry.terminal_id))
+            .collect();
+        assert!(
+            rows.iter().any(|meters| meters.len() == 2),
+            "healthy Claude"
+        );
+        assert!(
+            rows.iter()
+                .any(|meters| meters.iter().any(|m| m.number == "login expired")),
+            "expired Cursor"
+        );
+        let fit = usage_bar::fit_rows(&rows, 20, true).expect("a fit at 20 columns");
+        // Every row fits with the common fit, each with its own window count.
+        for meters in rows.iter().filter(|m| !m.is_empty()) {
+            let own = usage_bar::fit_for(meters, fit);
+            assert!(usage_bar::row_width(meters, own) <= 20, "{own:?}");
+        }
+        // The healthy row alone would keep its squares at 20 columns (19 wide),
+        // but the expired row cannot (28 wide with them), so the whole group
+        // drops them together and keeps the number and the countdown.
+        assert_eq!(
+            fit,
+            usage_bar::Fit {
+                labels: false,
+                windows: 1,
+                squares: false,
+                number: true,
+                countdown: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_two_row_group_fit_is_decided_by_the_row_that_is_widest_at_each_step() {
+        // Row A: two windows, narrow number text. Row B: one window with a
+        // long login text. Once A drops its second window B can be wider.
+        let meter = |label, number: &str| usage_bar::Meter {
+            label,
+            lit: 5,
+            rgb: (1, 2, 3),
+            number: number.to_string(),
+            countdown: "3/h".to_string(),
+            stale: false,
+        };
+        let a = vec![meter("5h", "70%"), meter("wk", "80%")];
+        let b = vec![meter("mo", "login expired")];
+        // Squares 10 + number 13 + countdown 3 + two spaces = 28 for B alone.
+        assert_eq!(
+            usage_bar::row_width(
+                &b,
+                usage_bar::fit_for(
+                    &b,
+                    usage_bar::Fit {
+                        labels: false,
+                        windows: 1,
+                        squares: true,
+                        number: true,
+                        countdown: true,
+                    }
+                )
+            ),
+            28
+        );
+        let fit = usage_bar::fit_rows(&[a.clone(), b.clone()], 28, true).unwrap();
+        assert!(fit.squares && !fit.labels && fit.windows == 1, "{fit:?}");
+        let fit = usage_bar::fit_rows(&[a, b], 20, true).unwrap();
+        assert!(!fit.squares, "{fit:?}");
+    }
+
+    #[test]
+    fn with_the_column_off_nothing_is_fitted_or_drawn_for_it() {
+        for hide in [false, true] {
+            let mut state = state_with_usage();
+            if hide {
+                state.usage_hidden = true;
+            } else {
+                state.usage_config.table = false;
+            }
+            let (layout, lines) = painted_rows(&mut state, 230);
+            let entries = agent_panel_entries(&state);
+            assert_eq!(layout.groups[0].columns[COL_ALLOWANCE].width, 0);
+            // The fitting pass is not reached: the meters are not even built.
+            assert!(entries
+                .iter()
+                .all(|e| usage_bar::table_meters_for(&state, &e.terminal_id).is_empty()));
+            assert!(!lines.join("\n").contains('%'));
+        }
     }
 }

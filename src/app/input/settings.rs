@@ -6,7 +6,7 @@ use crate::{
         state::{AppState, DoneSoundChoice, ExperimentSetting, SettingsSection, THEME_NAMES},
         App, Mode,
     },
-    config::{PaneHeaderField, ToastDelivery},
+    config::{PaneHeaderField, ToastDelivery, UsageSwitch},
 };
 
 /// Rows of the Sound section: the two alert toggle rows, then one row per
@@ -60,6 +60,7 @@ pub(super) enum SettingsAction {
     SaveDoneSound(DoneSoundChoice),
     SaveToastDelivery(ToastDelivery),
     SavePaneHeaderField(PaneHeaderField, bool),
+    SaveUsageSwitch(UsageSwitch, bool),
     SavePaneHistory(bool),
     SaveSwitchAsciiInputSourceInPrefix(bool),
     SaveRefreshSummaryWithGrok(bool),
@@ -73,6 +74,16 @@ pub(super) enum SettingsAction {
 
 /// Map a pane-header row index to the toggle action that flips it.
 fn pane_header_toggle_action(state: &AppState, idx: usize) -> Option<SettingsAction> {
+    // The usage switches are listed under the header fields.
+    if let Some(switch) = idx
+        .checked_sub(PaneHeaderField::ALL.len())
+        .and_then(|row| UsageSwitch::ALL.get(row).copied())
+    {
+        return Some(SettingsAction::SaveUsageSwitch(
+            switch,
+            !switch.enabled(&state.usage_config),
+        ));
+    }
     let field = *PaneHeaderField::ALL.get(idx)?;
     Some(SettingsAction::SavePaneHeaderField(
         field,
@@ -138,6 +149,9 @@ impl App {
                 SettingsAction::SaveToastDelivery(delivery) => self.save_toast_delivery(delivery),
                 SettingsAction::SavePaneHeaderField(field, enabled) => {
                     self.save_pane_header_field(field, enabled)
+                }
+                SettingsAction::SaveUsageSwitch(switch, enabled) => {
+                    self.save_usage_switch(switch, enabled)
                 }
                 SettingsAction::SavePaneHistory(enabled) => {
                     self.save_pane_history_persistence(enabled)
@@ -342,9 +356,10 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
         },
         SettingsSection::PaneLabels => match key.code {
             KeyCode::Up | KeyCode::Char('k') => state.settings.list.move_prev(),
-            KeyCode::Down | KeyCode::Char('j') => {
-                state.settings.list.move_next(PaneHeaderField::ALL.len())
-            }
+            KeyCode::Down | KeyCode::Char('j') => state
+                .settings
+                .list
+                .move_next(PaneHeaderField::ALL.len() + UsageSwitch::ALL.len()),
             KeyCode::Enter | KeyCode::Char(' ') => {
                 return pane_header_toggle_action(state, state.settings.list.selected);
             }
@@ -631,9 +646,11 @@ impl AppState {
                 }
             }
             SettingsSection::PaneLabels => {
-                let list_y = area.y + 3;
-                if row >= list_y && row < list_y + PaneHeaderField::ALL.len() as u16 {
-                    Some((row - list_y) as usize)
+                let list_y = area.y + crate::ui::PANE_LABELS_LIST_OFFSET;
+                let (visible, scroll) =
+                    crate::ui::pane_labels_window(area.height, self.settings.list.selected);
+                if row >= list_y && row < list_y + visible as u16 {
+                    Some(scroll + (row - list_y) as usize)
                 } else {
                     None
                 }
@@ -1463,5 +1480,150 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/herdr-test-integration"),
             state,
         }
+    }
+    #[test]
+    fn settings_usage_rows_toggle_table_sidebar_and_alerts() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::PaneLabels);
+        let first = PaneHeaderField::ALL.len();
+        for (offset, switch) in UsageSwitch::ALL.iter().copied().enumerate() {
+            state.settings.list.selected = first + offset;
+            let action = update_settings_state(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            );
+            assert_eq!(
+                action,
+                Some(SettingsAction::SaveUsageSwitch(
+                    switch,
+                    !switch.enabled(&state.usage_config)
+                )),
+                "{switch:?}"
+            );
+        }
+        // The list stops after the last usage row.
+        state.settings.list.selected = first + UsageSwitch::ALL.len() - 1;
+        update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            state.settings.list.selected,
+            first + UsageSwitch::ALL.len() - 1
+        );
+        // With the table off, Enter turns it back on.
+        state.usage_config.table = false;
+        state.settings.list.selected = first;
+        let action = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(
+            action,
+            Some(SettingsAction::SaveUsageSwitch(UsageSwitch::Table, true))
+        );
+    }
+
+    #[test]
+    fn settings_mouse_click_toggles_a_usage_row() {
+        let mut app = app_for_mouse_test();
+        app.state.view.terminal_area = Rect::new(0, 1, 106, 29);
+        open_settings_at(&mut app.state, SettingsSection::PaneLabels);
+        let row = (PaneHeaderField::ALL.len() + 1) as u16;
+        let area = app.state.settings_content_rect();
+        let action = app.state.handle_settings_mouse(mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            area.x + 2,
+            area.y + 3 + row,
+        ));
+        assert_eq!(
+            action,
+            Some(SettingsAction::SaveUsageSwitch(UsageSwitch::Sidebar, false))
+        );
+    }
+    /// A tester app whose screen is `width` x `height`, with settings open on
+    /// the pane labels section.
+    fn small_screen_settings(width: u16, height: u16) -> App {
+        let mut app = app_for_mouse_test();
+        // The screen is the union of the bands, so leave only one.
+        app.state.view.terminal_area = Rect::new(0, 0, width, height);
+        app.state.view.sidebar_rect = Rect::default();
+        app.state.view.composer.area = Rect::default();
+        app.state.view.agent_table.area = Rect::default();
+        app.state.view.mobile_header_rect = Rect::default();
+        open_settings_at(&mut app.state, SettingsSection::PaneLabels);
+        app
+    }
+
+    #[test]
+    fn every_pane_label_row_is_visible_reachable_and_clickable_on_small_screens() {
+        let total = PaneHeaderField::ALL.len() + UsageSwitch::ALL.len();
+        for (width, height) in [(80u16, 24u16), (80, 20), (80, 16)] {
+            let mut app = small_screen_settings(width, height);
+            let area = app.state.settings_content_rect();
+            assert!(area.height > crate::ui::PANE_LABELS_LIST_OFFSET, "{height}");
+            let mut seen = vec![false; total];
+            for selected in 0..total {
+                app.state.settings.list.selected = selected;
+                let area = app.state.settings_content_rect();
+                let (visible, scroll) = crate::ui::pane_labels_window(area.height, selected);
+                // The selected row is one of the rows drawn.
+                assert!(
+                    (scroll..scroll + visible).contains(&selected),
+                    "{width}x{height}: row {selected} not in {scroll}..{}",
+                    scroll + visible
+                );
+                // The drawn rows end inside the content, above the footer.
+                assert!(
+                    area.y + crate::ui::PANE_LABELS_LIST_OFFSET + visible as u16
+                        <= area.y + area.height
+                );
+                // Every drawn row answers a click with its own index.
+                for slot in 0..visible {
+                    let y = area.y + crate::ui::PANE_LABELS_LIST_OFFSET + slot as u16;
+                    assert_eq!(
+                        app.state.settings_list_index_at(area.x + 2, y),
+                        Some(scroll + slot),
+                        "{width}x{height}, selected {selected}, slot {slot}"
+                    );
+                    seen[scroll + slot] = true;
+                }
+                // Nothing below the list is a row.
+                let below = area.y + crate::ui::PANE_LABELS_LIST_OFFSET + visible as u16;
+                if below < area.y + area.height {
+                    assert_eq!(app.state.settings_list_index_at(area.x + 2, below), None);
+                }
+            }
+            assert!(seen.iter().all(|s| *s), "{width}x{height}: {seen:?}");
+        }
+    }
+
+    #[test]
+    fn keyboard_reaches_the_last_usage_row_at_80_by_24_and_a_click_toggles_it() {
+        let mut app = small_screen_settings(80, 24);
+        let total = PaneHeaderField::ALL.len() + UsageSwitch::ALL.len();
+        for _ in 0..total + 3 {
+            update_settings_state(
+                &mut app.state,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            );
+        }
+        assert_eq!(app.state.settings.list.selected, total - 1);
+        let area = app.state.settings_content_rect();
+        let (visible, scroll) = crate::ui::pane_labels_window(area.height, total - 1);
+        assert_eq!(scroll + visible, total, "the last row is drawn");
+        let y = area.y + crate::ui::PANE_LABELS_LIST_OFFSET + (visible - 1) as u16;
+        let action = app.state.handle_settings_mouse(mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            area.x + 2,
+            y,
+        ));
+        assert_eq!(
+            action,
+            Some(SettingsAction::SaveUsageSwitch(
+                UsageSwitch::CursorLogin,
+                true
+            ))
+        );
     }
 }

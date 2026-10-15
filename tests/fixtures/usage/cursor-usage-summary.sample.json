@@ -1,0 +1,1 @@
+{"billingCycleStart":"2026-01-01T00:00:00Z","billingCycleEnd":"2026-02-01T00:00:00Z","isUnlimited":false,"individualUsage":{"plan":{"autoPercentUsed":19.25,"apiPercentUsed":0.25,"totalPercentUsed":17.5,"breakdown":{"included":1000,"bonus":500,"total":1500}},"onDemand":{"enabled":false}}}

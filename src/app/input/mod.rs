@@ -411,6 +411,9 @@ impl App {
                     SettingsAction::SavePaneHeaderField(field, enabled) => {
                         self.save_pane_header_field(field, enabled)
                     }
+                    SettingsAction::SaveUsageSwitch(switch, enabled) => {
+                        self.save_usage_switch(switch, enabled)
+                    }
                     SettingsAction::SavePaneHistory(enabled) => {
                         self.save_pane_history_persistence(enabled)
                     }

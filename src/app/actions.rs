@@ -3147,6 +3147,7 @@ impl AppState {
                 let _ = cache_updates;
                 Vec::new()
             }
+            AppEvent::UsageRefreshed { .. } => Vec::new(),
             AppEvent::AgentModelRefreshed { .. } => Vec::new(),
             AppEvent::SummaryRefreshed { .. } => Vec::new(),
             AppEvent::CommanderRead { .. } => Vec::new(),

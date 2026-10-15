@@ -62,6 +62,7 @@ mod terminal_notify;
 mod terminal_theme;
 mod ui;
 mod update;
+pub mod usage;
 mod workspace;
 mod worktree;
 mod wsl;
@@ -260,6 +261,21 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # parent_directory = false
 # git_branch = false
 # git_status = false
+# usage = true
+
+# Allowance meters (five hour and weekly) for Claude, GPT and Cursor.
+# Each pane's header shows its own provider (usage in [ui.pane_header]); the
+# agent table has an Allowance column (table); the sidebar lists the providers
+# of the agents that are open. alerts speaks once per window at 10% left;
+# SPEAK=0 in the environment silences it. `herdr view usage hide` turns the
+# table, the headers and the sidebar off together for the session.
+# [ui.usage]
+# table = true
+# sidebar = true
+# alerts = false
+# alert_command = "" # macOS say by default; whitespace-separated program and arguments
+# cursor_login = false # enable with herdr usage cursor-login
+# codex_home = "~/.codex" # CODEX_HOME by default, then ~/.codex
 
 # Agent panel scope: "current" or "all". Toggling it in the sidebar saves this setting.
 # agent_panel_scope = "all"
@@ -409,6 +425,10 @@ fn main() -> io::Result<()> {
         std::process::exit(2);
     }
 
+    if args.get(1).map(String::as_str) == Some("usage") {
+        return usage::cli::run(&args[2..]);
+    }
+
     if let cli::CommandOutcome::Handled(code) = cli::maybe_run(&args)? {
         std::process::exit(code);
     }
@@ -478,6 +498,7 @@ fn main() -> io::Result<()> {
         println!("       herdr session <subcommand> ...");
         println!("       herdr shell-init <shell>");
         println!("       herdr integration <subcommand> ...");
+        println!("       herdr usage [--json | claude-statusline | cursor-login [--refresh | --status | --forget]]");
         println!();
         println!("Common commands:");
         for (command, description) in [
@@ -487,6 +508,7 @@ fn main() -> io::Result<()> {
                 "Show local client and running server status",
             ),
             ("herdr update", "Download and install the latest version"),
+            ("herdr usage", "Read provider allowances; cursor-login manages browser login on macOS"),
             (
                 "herdr server stop",
                 "Stop the running server via the API socket",
@@ -518,7 +540,7 @@ fn main() -> io::Result<()> {
             ("herdr tab <subcommand>", "Tab helpers over the socket API"),
             (
                 "herdr view <part> [show|hide|toggle]",
-                "Fold or show the sidebar, spaces, agent table, a space's agents or group, or minimaps",
+                "Fold or show the sidebar, spaces, agent table, a space's agents or group, minimaps, or the usage meters",
             ),
             (
                 "herdr agent <subcommand>",

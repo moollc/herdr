@@ -64,6 +64,7 @@ fn parse_part(raw: &str) -> Option<ViewPart> {
         "agents" | "space-agents" => ViewPart::SpaceAgents,
         "group" | "space-group" => ViewPart::SpaceGroup,
         "minimap" | "minimaps" => ViewPart::Minimap,
+        "usage" | "allowance" => ViewPart::Usage,
         _ => return None,
     })
 }
@@ -83,6 +84,7 @@ fn print_view_help() {
     );
     eprintln!("  group         the worktree spaces under their repository's card (--workspace, or the space on screen)");
     eprintln!("  minimap       the layout previews under tab names (--tab, --workspace for its tabs, or every tab)");
+    eprintln!("  usage         the allowance meters in the agent table, pane headers and sidebar, all at once");
     eprintln!();
     eprintln!("Without show or hide, the part is toggled.");
 }
@@ -97,6 +99,7 @@ mod tests {
         assert_eq!(parse_part("agent_table"), Some(ViewPart::AgentTable));
         assert_eq!(parse_part("agents"), Some(ViewPart::SpaceAgents));
         assert_eq!(parse_part("minimaps"), Some(ViewPart::Minimap));
+        assert_eq!(parse_part("usage"), Some(ViewPart::Usage));
         assert_eq!(parse_part("panes"), None);
     }
 }

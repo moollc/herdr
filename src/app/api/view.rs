@@ -64,6 +64,7 @@ impl App {
             ViewPart::Sidebar => global(Fold::Sidebar),
             ViewPart::Spaces => global(Fold::Spaces),
             ViewPart::AgentTable => global(Fold::AgentTable),
+            ViewPart::Usage => global(Fold::Usage),
             ViewPart::SpaceAgents => {
                 let ws = space()?;
                 Ok(vec![(
@@ -182,5 +183,44 @@ mod tests {
         let mut app = app();
         let reply = set(&mut app, ViewPart::SpaceGroup, ViewChange::Hide, None);
         assert!(reply.contains("invalid_request"), "{reply}");
+    }
+    #[test]
+    fn usage_hides_and_shows_the_table_the_headers_and_the_sidebar_together() {
+        let mut app = app();
+        let all_on = |app: &App| {
+            app.state.usage_table_on()
+                && app.state.usage_headers_on()
+                && app.state.usage_sidebar_on()
+        };
+        let all_off = |app: &App| {
+            !app.state.usage_table_on()
+                && !app.state.usage_headers_on()
+                && !app.state.usage_sidebar_on()
+        };
+        assert!(all_on(&app));
+        let reply = set(&mut app, ViewPart::Usage, ViewChange::Hide, None);
+        assert!(reply.contains("\"shown\":false"), "{reply}");
+        assert!(all_off(&app));
+        // The config switches are untouched: showing brings back what they say.
+        assert!(app.state.usage_config.table && app.state.pane_header().usage);
+        let reply = set(&mut app, ViewPart::Usage, ViewChange::Show, None);
+        assert!(reply.contains("\"shown\":true"), "{reply}");
+        assert!(all_on(&app));
+        set(&mut app, ViewPart::Usage, ViewChange::Toggle, None);
+        assert!(all_off(&app));
+        set(&mut app, ViewPart::Usage, ViewChange::Toggle, None);
+        assert!(all_on(&app));
+        // A switch that is off in the config stays off after show.
+        app.state.usage_config.sidebar = false;
+        set(&mut app, ViewPart::Usage, ViewChange::Show, None);
+        assert!(app.state.usage_table_on() && !app.state.usage_sidebar_on());
+    }
+
+    #[test]
+    fn usage_is_not_per_space() {
+        let mut app = app();
+        let reply = set(&mut app, ViewPart::Usage, ViewChange::Hide, Some("1"));
+        assert!(reply.contains("invalid_request"), "{reply}");
+        assert!(!app.state.usage_hidden);
     }
 }

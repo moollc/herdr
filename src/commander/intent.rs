@@ -391,6 +391,7 @@ impl Command {
                     ViewPart::SpaceAgents => of("the agents"),
                     ViewPart::SpaceGroup => of("the worktree group"),
                     ViewPart::Minimap => "the minimaps".to_string(),
+                    ViewPart::Usage => "the usage meters".to_string(),
                 };
                 format!("{verb} {what}")
             }

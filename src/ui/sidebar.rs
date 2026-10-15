@@ -19,9 +19,13 @@ use crate::terminal::TerminalRuntimeRegistry;
 
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 1;
 const WORKSPACE_SECTION_FOOTER_ROWS: u16 = 3;
+/// The same two counts, for the allowance block's fit check.
+pub(super) const SECTION_HEADER_ROWS: u16 = WORKSPACE_SECTION_HEADER_ROWS;
+pub(super) const SECTION_FOOTER_ROWS: u16 = WORKSPACE_SECTION_FOOTER_ROWS;
 
 fn reserved_bottom_rows(app: &AppState, sidebar_h: u16) -> u16 {
-    let player = player_rows_for_sidebar(app, sidebar_h);
+    let player =
+        player_rows_for_sidebar(app, sidebar_h) + super::usage_bar::sidebar_rows(app, sidebar_h);
     if spaces_section_collapsed(app) {
         player
     } else {
@@ -944,7 +948,8 @@ fn new_workspace_button_rect_below(
     list_bottom: u16,
     list_scrolls: bool,
 ) -> Rect {
-    let player = player_rows_for_sidebar(app, ws_area.height);
+    let player = player_rows_for_sidebar(app, ws_area.height)
+        + super::usage_bar::sidebar_rows(app, ws_area.height);
     if spaces_section_collapsed(app) || ws_area.height < WORKSPACE_SECTION_FOOTER_ROWS + player {
         return Rect::default();
     }
@@ -1211,6 +1216,7 @@ pub(crate) fn render_sidebar(
     );
 
     render_workspace_rows(app, terminal_runtimes, frame, area);
+    super::usage_bar::render_sidebar_block(app, frame, area);
 }
 
 fn fill_sidebar_background(app: &AppState, frame: &mut Frame, area: Rect) {

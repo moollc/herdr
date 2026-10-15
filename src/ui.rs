@@ -25,6 +25,7 @@ mod settings;
 mod sidebar;
 mod status;
 mod tabs;
+pub(crate) mod usage_bar;
 mod widgets;
 
 use self::agent_table::render_global_launcher;
@@ -107,10 +108,10 @@ pub(crate) use self::{
         remove_worktree_button_rects, remove_worktree_popup_rect, rename_button_rects,
     },
     settings::{
-        experiments_prompt_rect, settings_button_rects, settings_show_primary_action,
-        COMMANDER_JEV_ROW_OFFSET, COMMANDER_KEY_ROW_OFFSET, EXPERIMENTS_CHECKBOX_ROWS_OFFSET,
-        SETTINGS_POPUP_HEIGHT, SETTINGS_POPUP_WIDTH, SOUND_ALERT_ROWS_OFFSET,
-        SOUND_CHOICE_ROWS_OFFSET,
+        experiments_prompt_rect, pane_labels_window, settings_button_rects,
+        settings_show_primary_action, COMMANDER_JEV_ROW_OFFSET, COMMANDER_KEY_ROW_OFFSET,
+        EXPERIMENTS_CHECKBOX_ROWS_OFFSET, PANE_LABELS_LIST_OFFSET, SETTINGS_POPUP_HEIGHT,
+        SETTINGS_POPUP_WIDTH, SOUND_ALERT_ROWS_OFFSET, SOUND_CHOICE_ROWS_OFFSET,
     },
 };
 use crate::app::state::ViewLayout;
@@ -208,6 +209,11 @@ fn compute_view_internal(
     // either desktop or mobile computes rows so later pane rearrangement can
     // never feed back into the list.
     agent_table::sync_agent_order(app);
+
+    // The one clock read for allowance countdowns; drawing only reads this.
+    app.usage_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
 
     // The purpose area wraps at its own width, which depends on the frame.
     if let Some(dialog) = app.describe_dialog.as_mut() {

@@ -112,6 +112,19 @@ impl App {
         }
     }
 
+    pub(super) fn save_usage_switch(&mut self, switch: crate::config::UsageSwitch, enabled: bool) {
+        if switch == crate::config::UsageSwitch::CursorLogin && enabled {
+            self.state.config_diagnostic =
+                Some("Run herdr usage cursor-login to allow browser login.".into());
+            return;
+        }
+        if self.update_config_file("usage display", |content| {
+            crate::config::upsert_section_bool(content, "ui.usage", switch.config_key(), enabled)
+        }) {
+            self.apply_config_from_disk(false);
+        }
+    }
+
     pub(super) fn save_pane_history_persistence(&mut self, enabled: bool) {
         if self.update_config_file("pane screen history", |content| {
             crate::config::upsert_section_bool(content, "experimental", "pane_history", enabled)

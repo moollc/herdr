@@ -397,6 +397,8 @@ pub struct UiConfig {
     pub show_agent_labels_on_pane_borders: bool,
     /// Which fields a pane's top edge writes besides the chrome itself.
     pub pane_header: PaneHeaderConfig,
+    /// Allowance block in the sidebar and the 10% left alert.
+    pub usage: UsageDisplayConfig,
     /// Accent color for highlights, borders, and navigation UI.
     /// Accepts hex (#89b4fa), named colors (cyan, blue), or RGB (rgb(137,180,250)).
     pub accent: String,
@@ -642,6 +644,7 @@ impl Default for UiConfig {
             nerd_font: false,
             show_agent_labels_on_pane_borders: true,
             pane_header: PaneHeaderConfig::default(),
+            usage: UsageDisplayConfig::default(),
             accent: "cyan".into(),
             notify_active_tab: false,
             toast: ToastConfig::default(),
@@ -667,6 +670,8 @@ pub struct PaneHeaderConfig {
     pub parent_directory: bool,
     pub git_branch: bool,
     pub git_status: bool,
+    /// Allowance meters for the provider of the pane's agent, after git status.
+    pub usage: bool,
 }
 
 impl Default for PaneHeaderConfig {
@@ -679,6 +684,78 @@ impl Default for PaneHeaderConfig {
             parent_directory: false,
             git_branch: false,
             git_status: false,
+            usage: true,
+        }
+    }
+}
+
+/// Where the allowance meters show, and the voice alert at 10% left. The pane
+/// header's own switch is `[ui.pane_header] usage`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct UsageDisplayConfig {
+    /// Show the Allowance column in the agent table. Default: true.
+    pub table: bool,
+    /// Show the allowance block under the sidebar's lists. Default: true.
+    pub sidebar: bool,
+    /// Speak once per window when it reaches 10% left. Default: false.
+    pub alerts: bool,
+    /// Permit importing cursor.com browser cookies. Enable with `herdr usage cursor-login`.
+    pub cursor_login: bool,
+    pub codex_home: Option<String>,
+    /// Program and arguments; the spoken phrase is appended as the final argument.
+    pub alert_command: String,
+}
+
+impl Default for UsageDisplayConfig {
+    fn default() -> Self {
+        Self {
+            table: true,
+            sidebar: true,
+            alerts: false,
+            cursor_login: false,
+            codex_home: None,
+            alert_command: String::new(),
+        }
+    }
+}
+
+/// The `[ui.usage]` switches Settings lists under the pane header fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsageSwitch {
+    Table,
+    Sidebar,
+    Alerts,
+    CursorLogin,
+}
+
+impl UsageSwitch {
+    pub(crate) const ALL: [Self; 4] = [Self::Table, Self::Sidebar, Self::Alerts, Self::CursorLogin];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Table => "usage in the agent table",
+            Self::Sidebar => "usage in the sidebar",
+            Self::Alerts => "usage alert, spoken at 10% left",
+            Self::CursorLogin => "Cursor browser login (run herdr usage cursor-login)",
+        }
+    }
+
+    pub(crate) fn config_key(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Sidebar => "sidebar",
+            Self::Alerts => "alerts",
+            Self::CursorLogin => "cursor_login",
+        }
+    }
+
+    pub(crate) fn enabled(self, config: &UsageDisplayConfig) -> bool {
+        match self {
+            Self::Table => config.table,
+            Self::Sidebar => config.sidebar,
+            Self::Alerts => config.alerts,
+            Self::CursorLogin => config.cursor_login,
         }
     }
 }
@@ -692,10 +769,11 @@ pub(crate) enum PaneHeaderField {
     ParentDirectory,
     GitBranch,
     GitStatus,
+    Usage,
 }
 
 impl PaneHeaderField {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Status,
         Self::AgentName,
         Self::Hostname,
@@ -703,6 +781,7 @@ impl PaneHeaderField {
         Self::ParentDirectory,
         Self::GitBranch,
         Self::GitStatus,
+        Self::Usage,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -714,6 +793,7 @@ impl PaneHeaderField {
             Self::ParentDirectory => "parent directory",
             Self::GitBranch => "git branch",
             Self::GitStatus => "git status",
+            Self::Usage => "usage",
         }
     }
 
@@ -726,6 +806,7 @@ impl PaneHeaderField {
             Self::ParentDirectory => "parent_directory",
             Self::GitBranch => "git_branch",
             Self::GitStatus => "git_status",
+            Self::Usage => "usage",
         }
     }
 
@@ -738,6 +819,7 @@ impl PaneHeaderField {
             Self::ParentDirectory => header.parent_directory,
             Self::GitBranch => header.git_branch,
             Self::GitStatus => header.git_status,
+            Self::Usage => header.usage,
         }
     }
 }
@@ -882,6 +964,50 @@ show_agent_labels_on_pane_borders = false
     }
 
     #[test]
+    fn usage_field_has_a_label_and_the_config_key_usage() {
+        assert_eq!(PaneHeaderField::Usage.label(), "usage");
+        assert_eq!(PaneHeaderField::Usage.config_key(), "usage");
+        let mut header = PaneHeaderConfig::default();
+        assert!(PaneHeaderField::Usage.enabled(header));
+        header.usage = false;
+        assert!(!PaneHeaderField::Usage.enabled(header));
+        let config: Config = toml::from_str("[ui.pane_header]\nusage = false\n").unwrap();
+        assert!(!config.ui.pane_header.usage);
+        // Shown last, after git status.
+        assert_eq!(PaneHeaderField::ALL.last(), Some(&PaneHeaderField::Usage));
+    }
+
+    #[test]
+    fn usage_switches_name_their_config_keys() {
+        let mut config = UsageDisplayConfig::default();
+        for switch in UsageSwitch::ALL {
+            assert_eq!(
+                switch.enabled(&config),
+                matches!(switch, UsageSwitch::Table | UsageSwitch::Sidebar)
+            );
+        }
+        config.table = false;
+        assert!(!UsageSwitch::Table.enabled(&config));
+        assert_eq!(UsageSwitch::Table.config_key(), "table");
+        assert_eq!(UsageSwitch::Sidebar.config_key(), "sidebar");
+        assert_eq!(UsageSwitch::Alerts.config_key(), "alerts");
+    }
+
+    #[test]
+    fn usage_display_defaults_on_and_parses() {
+        let default_config = Config::default();
+        assert!(default_config.ui.usage.table);
+        assert!(default_config.ui.usage.sidebar);
+        assert!(!default_config.ui.usage.alerts);
+        assert!(!default_config.ui.usage.cursor_login);
+        let config: Config =
+            toml::from_str("[ui.usage]\ntable = false\nsidebar = false\nalerts = false\n").unwrap();
+        assert!(!config.ui.usage.table);
+        assert!(!config.ui.usage.sidebar);
+        assert!(!config.ui.usage.alerts);
+    }
+
+    #[test]
     fn pane_header_defaults_to_status_and_name_and_parses() {
         let default_config = Config::default();
         assert!(default_config.ui.pane_header.status);
@@ -890,6 +1016,7 @@ show_agent_labels_on_pane_borders = false
         assert!(!default_config.ui.pane_header.parent_directory);
         assert!(!default_config.ui.pane_header.git_branch);
         assert!(!default_config.ui.pane_header.git_status);
+        assert!(default_config.ui.pane_header.usage);
 
         let toml = r#"
 [ui.pane_header]

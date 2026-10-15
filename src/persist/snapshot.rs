@@ -53,6 +53,10 @@ pub struct SessionSnapshot {
     pub agent_table_collapsed: bool,
     #[serde(default)]
     pub spaces_collapsed: bool,
+    /// `herdr view usage hide`: the allowance meters are off in the table, the
+    /// pane headers and the sidebar for this session.
+    #[serde(default)]
+    pub usage_hidden: bool,
 }
 
 impl Default for SessionSnapshot {
@@ -73,6 +77,7 @@ impl Default for SessionSnapshot {
             sidebar_collapsed: false,
             agent_table_collapsed: false,
             spaces_collapsed: false,
+            usage_hidden: false,
         }
     }
 }
@@ -346,6 +351,8 @@ struct RawSessionSnapshot {
     agent_table_collapsed: bool,
     #[serde(default)]
     spaces_collapsed: bool,
+    #[serde(default)]
+    usage_hidden: bool,
 }
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
@@ -369,6 +376,7 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         sidebar_collapsed: raw.sidebar_collapsed,
         agent_table_collapsed: raw.agent_table_collapsed,
         spaces_collapsed: raw.spaces_collapsed,
+        usage_hidden: raw.usage_hidden,
     })
 }
 
@@ -447,6 +455,7 @@ pub fn capture(
         sidebar_collapsed: state.sidebar_collapsed,
         agent_table_collapsed: state.agent_table_collapsed,
         spaces_collapsed: state.spaces_collapsed,
+        usage_hidden: state.usage_hidden,
         detached_agents: state
             .detached_agents
             .iter()
@@ -1511,5 +1520,24 @@ mod tests {
             restored.workspaces[0].tabs[0].panes[&0].cwd,
             PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test")
         );
+    }
+    #[test]
+    fn usage_hidden_round_trips_and_defaults_to_shown() {
+        let snap = SessionSnapshot {
+            usage_hidden: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(parse_snapshot(&json).unwrap().usage_hidden);
+        let mut state = AppState::test_new();
+        state.usage_hidden = true;
+        assert!(capture_from_state(&state).usage_hidden);
+        // A session saved before the switch existed shows usage.
+        let old = serde_json::to_string(&SessionSnapshot::default())
+            .unwrap()
+            .replace("\"usage_hidden\":false,", "")
+            .replace(",\"usage_hidden\":false", "");
+        assert!(!old.contains("usage_hidden"));
+        assert!(!parse_snapshot(&old).unwrap().usage_hidden);
     }
 }

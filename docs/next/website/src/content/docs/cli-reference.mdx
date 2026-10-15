@@ -33,6 +33,20 @@ herdr status server
 herdr status client
 ```
 
+## Account allowances
+
+```bash
+herdr usage
+herdr usage --json
+herdr usage claude-statusline
+herdr usage cursor-login
+herdr usage cursor-login --refresh
+herdr usage cursor-login --status
+herdr usage cursor-login --forget
+```
+
+Allowance readings run locally without a running server. The status line command reads Claude's JSON on stdin. On macOS, `cursor-login` asks once before reading browser cookies; `--refresh` never prompts. `--status` reports consent and Keychain presence, and `--forget` removes the saved login. Exit codes: 0 success or declined consent, 1 error, 3 missing consent or unsupported platform, 4 signed out. Plain and JSON readings never import a login. See [configuration](./configuration/#pane-header) for usage settings.
+
 ## Server
 
 ```bash
@@ -114,6 +128,7 @@ Folds a part of the interface away or shows it again. Without `show` or `hide`, 
 | `agents` | the agent and pane rows under a space's card | `--workspace`, or the space on screen |
 | `group` | the worktree spaces under their repository's card | `--workspace`, or the space on screen |
 | `minimap` | the layout previews under tab names | `--tab`, or `--workspace` for its tabs, or every tab |
+| `usage` | the allowance meters in the agent table, the pane headers and the sidebar, together | nothing |
 
 When one call covers several minimaps, a toggle hides them all if any is shown and shows them all otherwise. A part that takes nothing refuses `--workspace` and `--tab`, and `group` refuses a space that heads no worktree group. Every fold is saved with the session, the same as when it is clicked.
 

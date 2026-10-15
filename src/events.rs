@@ -114,6 +114,13 @@ pub enum AppEvent {
         results: Vec<WorkspaceGitStatus>,
         cache_updates: Vec<(std::path::PathBuf, GitStatusCacheEntry)>,
     },
+    /// Background allowance snapshot or completion of the whole refresh job.
+    UsageRefreshed {
+        /// Snapshot updates carry data; the final completion event carries `None`.
+        snapshot: Option<crate::usage::UsageSnapshot>,
+        /// Only the final event releases the guard, after login/refetch.
+        finished: bool,
+    },
     /// Background agent model info refresh completed for terminals.
     AgentModelRefreshed {
         results: Vec<crate::agent_model::AgentModelRefreshResult>,

@@ -3011,6 +3011,8 @@ impl HeadlessServer {
 
         if self.has_app_client() {
             self.app.start_git_status_refresh_if_due(now);
+            self.app.start_usage_refresh_if_due(now);
+            changed |= self.app.usage_redraw_due(now);
             changed |= self.app.start_agent_model_refresh_if_due(now);
             changed |= self.app.poll_player_if_due(now);
         }

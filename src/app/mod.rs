@@ -43,6 +43,8 @@ pub(crate) const HEADLESS_ANIMATION_TICK_STEP: u32 = ANIMATION_TICKS_PER_FRAME;
 pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(30);
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
+/// How often allowances are read besides when an agent finishes a turn.
+const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub(crate) const PLAYER_POLL_INTERVAL: Duration = Duration::from_millis(750);
 pub(crate) const AGENT_MODEL_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -149,6 +151,16 @@ pub struct App {
     pub(crate) last_player_density: crate::ui::player::PlayerDensity,
     pub(crate) git_refresh_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
+    /// Allowance readings: owned here, run on a background thread.
+    pub(crate) usage_state: std::sync::Arc<std::sync::Mutex<crate::usage::UsageState>>,
+    pub(crate) usage_refresh_in_flight: bool,
+    /// A turn finished while a refresh ran; refresh again when it lands.
+    pub(crate) usage_refresh_due_after_in_flight: bool,
+    pub(crate) last_usage_refresh: Instant,
+    /// The newest "an agent finished" stamp seen, to spot the next finish.
+    pub(crate) usage_finish_stamp: Option<std::time::SystemTime>,
+    /// When the countdowns on screen next change text.
+    pub(crate) usage_redraw_deadline: Option<Instant>,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
     pub(crate) last_agent_model_refresh: Instant,
     pub(crate) agent_model_refresh_in_flight: bool,
@@ -334,6 +346,7 @@ impl App {
         let mut restored_sidebar_collapsed = false;
         let mut restored_agent_table_collapsed = false;
         let mut restored_spaces_collapsed = false;
+        let mut restored_usage_hidden = false;
         let (workspaces, active, selected) = if no_session {
             (Vec::new(), None, 0)
         } else if let Some(snap) = crate::persist::load() {
@@ -347,6 +360,7 @@ impl App {
             restored_sidebar_collapsed = snap.sidebar_collapsed;
             restored_agent_table_collapsed = snap.agent_table_collapsed;
             restored_spaces_collapsed = snap.spaces_collapsed;
+            restored_usage_hidden = snap.usage_hidden;
             let history = config
                 .experimental
                 .pane_history
@@ -508,6 +522,7 @@ impl App {
             sidebar_collapsed: restored_sidebar_collapsed,
             agent_table_collapsed: restored_agent_table_collapsed,
             spaces_collapsed: restored_spaces_collapsed,
+            usage_hidden: restored_usage_hidden,
             player_expanded: false,
             player_link: crate::composer::TextField::default(),
             player_save_name: crate::composer::TextField::default(),
@@ -557,6 +572,9 @@ impl App {
             nerd_font: config.ui.nerd_font,
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
             pane_header: config.ui.pane_header,
+            usage_config: config.ui.usage.clone(),
+            usage_snapshot: None,
+            usage_now: 0,
             pane_history_persistence: config.experimental.pane_history,
             refresh_summary_with_grok: config.ui.refresh_summary_with_grok,
             hide_attached_agents: config.ui.hide_attached_agents,
@@ -648,6 +666,14 @@ impl App {
             last_player_density: crate::ui::player::PlayerDensity::default(),
             git_refresh_in_flight: false,
             git_refresh_due_after_in_flight: false,
+            usage_state: std::sync::Arc::new(std::sync::Mutex::new(crate::usage::UsageState::new(
+                crate::usage::UsageConfig::configured(),
+            ))),
+            usage_refresh_in_flight: false,
+            usage_refresh_due_after_in_flight: false,
+            last_usage_refresh: Instant::now() - USAGE_REFRESH_INTERVAL,
+            usage_finish_stamp: None,
+            usage_redraw_deadline: None,
             git_status_cache: HashMap::new(),
             last_agent_model_refresh: Instant::now() - AGENT_MODEL_REFRESH_INTERVAL,
             agent_model_refresh_in_flight: false,
@@ -749,6 +775,7 @@ impl App {
         app.state.sidebar_collapsed = snapshot.sidebar_collapsed;
         app.state.agent_table_collapsed = snapshot.agent_table_collapsed;
         app.state.spaces_collapsed = snapshot.spaces_collapsed;
+        app.state.usage_hidden = snapshot.usage_hidden;
         app.state.mode = if app.state.active.is_some() {
             state::Mode::Terminal
         } else {
@@ -1304,6 +1331,7 @@ impl App {
             self.state.show_agent_labels_on_pane_borders =
                 config.ui.show_agent_labels_on_pane_borders;
             self.state.pane_header = config.ui.pane_header;
+            self.state.usage_config = config.ui.usage.clone();
             self.state.accent = crate::config::parse_color(&config.ui.accent);
             if !self.state.local_sound_playback && self.state.sound != config.ui.sound {
                 self.state.request_client_config_reload = true;
@@ -2960,6 +2988,13 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("[ui.pane_header]"));
         assert!(content.contains("git_branch = true"));
+
+        // The usage field round trips through the same file.
+        assert!(app.state.pane_header.usage);
+        app.save_pane_header_field(crate::config::PaneHeaderField::Usage, false);
+        assert!(!app.state.pane_header.usage);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("usage = false"));
         assert!(app.state.config_diagnostic.is_none());
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
@@ -4449,5 +4484,36 @@ last_pane = "prefix+tab"
             &input[events[1].start..events[1].start + events[1].len],
             b"a"
         );
+    }
+    #[test]
+    fn settings_save_usage_switches_persist_then_apply_live_config() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("settings-save-usage-switch");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "onboarding = false\n").unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        assert!(app.state.usage_config.table);
+        for switch in crate::config::UsageSwitch::ALL {
+            app.save_usage_switch(switch, false);
+        }
+        assert!(!app.state.usage_config.table);
+        assert!(!app.state.usage_config.sidebar);
+        assert!(!app.state.usage_config.alerts);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[ui.usage]"));
+        assert!(content.contains("table = false"));
+        assert!(content.contains("sidebar = false"));
+        assert!(content.contains("alerts = false"));
+
+        // And back on, through the same file.
+        app.save_usage_switch(crate::config::UsageSwitch::Table, true);
+        assert!(app.state.usage_config.table);
+        assert!(!app.state.usage_config.sidebar);
+        assert!(app.state.usage_table_on());
+        assert!(app.state.config_diagnostic.is_none());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
     }
 }

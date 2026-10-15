@@ -24,6 +24,9 @@ pub(crate) enum Fold {
     SpaceGroup(String),
     /// A tab's layout preview under its name in the sidebar.
     Minimap { ws: usize, tab: usize },
+    /// The allowance meters, in the agent table, the pane headers and the
+    /// sidebar together.
+    Usage,
 }
 
 impl AppState {
@@ -34,6 +37,7 @@ impl AppState {
             Fold::AgentTable => !self.agent_table_collapsed,
             Fold::SpaceAgents(ws) => crate::ui::workspace_agents_expanded(self, *ws),
             Fold::SpaceGroup(key) => !self.collapsed_space_keys.contains(key),
+            Fold::Usage => !self.usage_hidden,
             Fold::Minimap { ws, tab } => self
                 .workspaces
                 .get(*ws)
@@ -52,6 +56,7 @@ impl AppState {
             Fold::Sidebar => self.sidebar_collapsed = !shown,
             Fold::Spaces => self.spaces_collapsed = !shown,
             Fold::AgentTable => self.agent_table_collapsed = !shown,
+            Fold::Usage => self.usage_hidden = !shown,
             Fold::SpaceAgents(ws) => {
                 let Some(id) = self.workspaces.get(*ws).map(|w| w.id.clone()) else {
                     return;
@@ -88,6 +93,22 @@ impl AppState {
             self.view.sidebar_rect,
             self.workspace_scroll,
         );
+    }
+
+    /// The Allowance column in the agent table: its config switch, unless
+    /// `herdr view usage hide` has turned every usage display off.
+    pub(crate) fn usage_table_on(&self) -> bool {
+        self.usage_config.table && !self.usage_hidden
+    }
+
+    /// Meters in the pane headers: the header field, unless hidden as a whole.
+    pub(crate) fn usage_headers_on(&self) -> bool {
+        self.pane_header().usage && !self.usage_hidden
+    }
+
+    /// The sidebar block: its config switch, unless hidden as a whole.
+    pub(crate) fn usage_sidebar_on(&self) -> bool {
+        self.usage_config.sidebar && !self.usage_hidden
     }
 
     pub(crate) fn toggle_shown(&mut self, fold: &Fold) {

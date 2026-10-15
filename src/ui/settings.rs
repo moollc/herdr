@@ -12,7 +12,7 @@ use super::widgets::{
 };
 use crate::{
     app::{state::ExperimentSetting, AppState},
-    config::{PaneHeaderField, ToastDelivery},
+    config::{PaneHeaderField, ToastDelivery, UsageSwitch},
 };
 
 pub(crate) const SETTINGS_POPUP_WIDTH: u16 = 76;
@@ -359,16 +359,26 @@ fn render_settings_pane_header(app: &AppState, frame: &mut Frame, area: Rect) {
     super::widgets::render_modal_description(
         frame,
         desc_area,
-        "what each pane writes on its top edge",
+        "what each pane writes on its top edge, and where usage shows",
         Style::default().fg(p.overlay1),
     );
 
-    for (idx, field) in PaneHeaderField::ALL.iter().copied().enumerate() {
-        let marker = if field.enabled(app.pane_header()) {
-            "[✓]"
+    // One layout, shared with the mouse: only the rows that fit are drawn, and
+    // the list scrolls so the selected row is always one of them.
+    let (visible, scroll) = pane_labels_window(area.height, app.settings.list.selected);
+    let field_count = PaneHeaderField::ALL.len();
+    for slot in 0..visible {
+        let idx = scroll + slot;
+        let (label, enabled) = if idx < field_count {
+            let field = PaneHeaderField::ALL[idx];
+            (field.label(), field.enabled(app.pane_header()))
         } else {
-            "[ ]"
+            // The other usage displays; the pane header's own switch is the
+            // `usage` field above.
+            let switch = UsageSwitch::ALL[idx - field_count];
+            (switch.label(), switch.enabled(&app.usage_config))
         };
+        let marker = if enabled { "[✓]" } else { "[ ]" };
         let style = if app.settings.list.selected == idx {
             Style::default()
                 .bg(p.surface0)
@@ -377,12 +387,30 @@ fn render_settings_pane_header(app: &AppState, frame: &mut Frame, area: Rect) {
         } else {
             Style::default().fg(p.subtext0)
         };
-        let row = Rect::new(list_area.x, list_area.y + idx as u16, list_area.width, 1);
+        let row = Rect::new(list_area.x, list_area.y + slot as u16, list_area.width, 1);
         frame.render_widget(
-            Paragraph::new(format!(" {} {marker}", field.label())).style(style),
+            Paragraph::new(format!(" {label} {marker}")).style(style),
             row,
         );
     }
+}
+
+/// Rows above the pane labels list inside the section's content: the
+/// description (2) and a gap (1).
+pub(crate) const PANE_LABELS_LIST_OFFSET: u16 = 3;
+
+/// How many pane label rows fit under the description in a content area
+/// `content_height` rows tall, and the first one drawn when `selected` is the
+/// highlighted row. Drawing and clicking both read this.
+pub(crate) fn pane_labels_window(content_height: u16, selected: usize) -> (usize, usize) {
+    let total = PaneHeaderField::ALL.len() + UsageSwitch::ALL.len();
+    let visible = usize::from(content_height.saturating_sub(PANE_LABELS_LIST_OFFSET)).min(total);
+    let scroll = if visible == 0 {
+        0
+    } else {
+        (selected + 1).saturating_sub(visible).min(total - visible)
+    };
+    (visible, scroll)
 }
 
 /// The hotkey row and the Jev key row inside the Commander section's content
@@ -840,6 +868,7 @@ mod tests {
         assert!(rendered.contains("parent directory [ ]"));
         assert!(rendered.contains("git branch [ ]"));
         assert!(rendered.contains("git status [ ]"));
+        assert!(rendered.contains("usage [✓]"));
         assert!(rendered.contains("what each pane writes on its top edge"));
     }
 }

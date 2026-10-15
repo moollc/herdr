@@ -780,7 +780,7 @@ impl App {
             Command::View { part, space, .. } => {
                 use crate::api::schema::ViewPart as P;
                 match (part, space) {
-                    (P::AgentTable, _) => Some(Aim::AgentTable),
+                    (P::AgentTable | P::Usage, _) => Some(Aim::AgentTable),
                     (P::SpaceAgents | P::SpaceGroup, Some(space)) => Some(Aim::Space {
                         workspace_id: space_id(space.ws)?,
                     }),

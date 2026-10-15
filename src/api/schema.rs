@@ -135,6 +135,9 @@ pub enum ViewPart {
     SpaceGroup,
     /// The layout previews under tab names in the sidebar.
     Minimap,
+    /// The allowance meters in the agent table, the pane headers and the
+    /// sidebar, all at once.
+    Usage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
