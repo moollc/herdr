@@ -14,10 +14,12 @@ pub mod codex;
 pub mod countdown;
 pub mod cursor;
 mod login;
+mod login_refresh;
+pub(crate) use login_refresh::saved as cursor_login_saved;
 pub mod palette;
 pub mod statusline;
 
-const CURSOR_MIN_INTERVAL_SECS: u64 = 900;
+pub(crate) const CURSOR_MIN_INTERVAL_SECS: u64 = 900;
 
 fn cursor_fetch_file(config: &UsageConfig) -> PathBuf {
     config.snapshot_file.with_extension("cursor-fetch")
@@ -90,6 +92,9 @@ pub struct UsageConfig {
     pub cursor_min_interval_secs: u64,
     pub fixture: Option<PathBuf>,
     pub claude_statusline: bool,
+    /// Also read `$CODEX_HOME` and `~/.codex` besides the configured home.
+    #[serde(default)]
+    pub codex_scan_all: bool,
     pub visibility_file: Option<PathBuf>,
 }
 impl Default for UsageConfig {
@@ -105,12 +110,43 @@ impl Default for UsageConfig {
             cursor_keychain_service: "herdr-cursor-usage".into(),
             cursor_min_interval_secs: CURSOR_MIN_INTERVAL_SECS,
             claude_statusline: true,
+            // Unit tests stay hermetic: no real homes, no `ps`.
+            codex_scan_all: !cfg!(test),
             visibility_file: None,
             fixture: std::env::var_os("HERDR_USAGE_FIXTURE").map(PathBuf::from),
         }
     }
 }
 impl UsageConfig {
+    /// The configured home first, then `$CODEX_HOME`, `~/.codex`, and the
+    /// homes of Codex processes running in panes (`active`).
+    pub fn codex_homes(&self, active: Vec<PathBuf>) -> Vec<codex::Home> {
+        let mut homes = vec![codex::Home {
+            path: self.codex_home.clone(),
+            active: false,
+        }];
+        let mut add = |path: PathBuf, active: bool| {
+            if let Some(known) = homes.iter_mut().find(|h| h.path == path) {
+                known.active |= active;
+            } else {
+                homes.push(codex::Home { path, active });
+            }
+        };
+        for path in active {
+            add(path, true);
+        }
+        if !self.codex_scan_all {
+            return homes;
+        }
+        if let Some(env) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
+            add(PathBuf::from(env), false);
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            add(PathBuf::from(home).join(".codex"), false);
+        }
+        homes
+    }
+
     pub fn configured() -> Self {
         let mut config = Self::default();
         let display = crate::config::Config::load().config.ui.usage;
@@ -130,13 +166,74 @@ impl UsageConfig {
 pub struct UsageState {
     config: UsageConfig,
     last_cursor_fetch: Option<u64>,
+    #[serde(default)]
+    cursor_login_revision: Option<String>,
     cursor_result: Option<ProviderUsage>,
     cursor_good: Option<ProviderUsage>,
     cursor_login: login::RefreshState,
     alerts: HashMap<(Provider, WindowKind), Option<u64>>,
+    /// Shell pids of panes showing a Codex agent, set by the app worker.
+    #[serde(skip)]
+    codex_pane_pids: Vec<u32>,
+    /// `CODEX_HOME` of each Codex process already looked at, by its pid.
+    #[serde(skip)]
+    codex_pid_homes: HashMap<u32, PathBuf>,
+}
+impl UsageState {
+    /// The shell pids of the panes that run Codex. The worker resolves each to
+    /// its Codex process and reads that process's `CODEX_HOME`.
+    pub(crate) fn set_codex_panes(&mut self, shell_pids: Vec<u32>) {
+        self.codex_pane_pids = shell_pids;
+    }
+    /// Homes of Codex processes running in panes. The environment is read once
+    /// per Codex pid (one sysctl on macOS, one file read on Linux).
+    fn codex_pane_homes(&mut self) -> Vec<PathBuf> {
+        let user = std::env::var_os("HOME").map(PathBuf::from);
+        let mut live = Vec::new();
+        let mut homes = Vec::new();
+        for shell in &self.codex_pane_pids {
+            let Some(job) = crate::detect::foreground_job(*shell) else {
+                continue;
+            };
+            if !matches!(
+                crate::detect::identify_agent_in_job(&job),
+                Some((crate::detect::Agent::Codex, _))
+            ) {
+                continue;
+            }
+            // The codex process itself: a `codex-gpt` wrapper execs it, so it
+            // carries the variable. A node launcher is matched by its argv.
+            let names_codex = |s: &str| s.rsplit('/').next() == Some("codex");
+            let Some(process) = job.processes.iter().find(|p| {
+                names_codex(&p.name)
+                    || p.argv0.as_deref().is_some_and(names_codex)
+                    || p.argv
+                        .as_ref()
+                        .is_some_and(|argv| argv.iter().any(|a| names_codex(a)))
+            }) else {
+                continue;
+            };
+            live.push(process.pid);
+            let home = self.codex_pid_homes.entry(process.pid).or_insert_with(|| {
+                crate::platform::process_env_var(process.pid, "CODEX_HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+                    // No CODEX_HOME means the default home.
+                    .or_else(|| user.as_ref().map(|u| u.join(".codex")))
+                    .unwrap_or_default()
+            });
+            if !home.as_os_str().is_empty() && !homes.contains(&*home) {
+                homes.push(home.clone());
+            }
+        }
+        self.codex_pid_homes.retain(|pid, _| live.contains(pid));
+        homes
+    }
 }
 impl UsageState {
     pub fn new(config: UsageConfig) -> Self {
+        // Read the revision first so a concurrent login is noticed on refresh.
+        let cursor_login_revision = login_refresh::revision(&config);
         let cached = read_json::<UsageSnapshot>(&config.snapshot_file).ok();
         let cursor_result = cached
             .as_ref()
@@ -152,9 +249,12 @@ impl UsageState {
             config,
             cursor_login,
             last_cursor_fetch,
+            cursor_login_revision,
             cursor_result,
             cursor_good,
             alerts: HashMap::new(),
+            codex_pane_pids: Vec::new(),
+            codex_pid_homes: HashMap::new(),
         }
     }
     /// Fetch readings without importing a login or spending its hourly attempt.
@@ -240,6 +340,7 @@ impl UsageState {
             publish(snapshot.clone());
             return snapshot;
         }
+        self.sync_saved_cursor_login();
         let cursor_was_due = want.contains(&Provider::Cursor)
             && cursor_due(&self.config, self.last_cursor_fetch, now);
         let mut providers = Vec::new();
@@ -252,7 +353,10 @@ impl UsageState {
             }
             let usage = match provider {
                 Provider::Claude => claude::read(&self.config.claude_state_file, now),
-                Provider::Codex => codex::read(&self.config.codex_home, now),
+                Provider::Codex => {
+                    let active = self.codex_pane_homes();
+                    codex::read_homes(&self.config.codex_homes(active), now)
+                }
                 Provider::Cursor => self.refresh_cursor_reading(now, &mut fetch),
             };
             providers.push(usage);
@@ -285,7 +389,36 @@ impl UsageState {
         }
         snapshot
     }
+    fn sync_saved_cursor_login(&mut self) {
+        let revision = login_refresh::revision(&self.config);
+        if revision.is_none() || revision == self.cursor_login_revision {
+            return;
+        }
+        self.cursor_login_revision = revision;
+        self.last_cursor_fetch = None;
+        self.cursor_good = None;
+        if let Some(cursor) = &mut self.cursor_result {
+            if matches!(
+                cursor.problem,
+                Some(UsageProblem::LoginExpired | UsageProblem::NoLogin)
+            ) {
+                *cursor = unknown(Provider::Cursor, UsageProblem::NoData);
+            }
+        }
+    }
     fn save_snapshot(&self, snapshot: &mut UsageSnapshot) {
+        let _lock = match crate::platform::usage::lock_statusline(&self.config.snapshot_file) {
+            Ok(lock) => lock,
+            Err(error) => {
+                tracing::warn!(%error, "could not lock usage snapshot");
+                return;
+            }
+        };
+        // An old request may finish after the login command has cleared the cache.
+        // Do not publish its obsolete auth error over the pending fresh reading.
+        if login_refresh::revision(&self.config) != self.cursor_login_revision {
+            login_refresh::clear_auth_problem(snapshot);
+        }
         for usage in &mut snapshot.providers {
             for window in &mut usage.windows {
                 if window.left_pct.is_some()
@@ -358,7 +491,11 @@ impl UsageState {
         } else {
             match self.cursor_login.attempt(&self.config, now, command) {
                 Some(login::CursorLoginResult::Exited(0)) => {
-                    fetch(&self.config.cursor_keychain_service)
+                    // The in-process importer also publishes a login revision. Its
+                    // immediate fetch consumes that reset and restores the poll timer.
+                    self.sync_saved_cursor_login();
+                    self.last_cursor_fetch = None;
+                    self.refresh_cursor_reading(now, &mut fetch)
                 }
                 Some(login::CursorLoginResult::Exited(3)) => {
                     unknown(Provider::Cursor, UsageProblem::NoLogin)

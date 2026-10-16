@@ -1050,3 +1050,80 @@ fn worker_no_consent_preserves_hour_and_grant_imports_on_next_refresh() {
         None
     );
 }
+
+#[test]
+fn saved_login_invalidates_disk_and_running_worker_without_spending_import_hour() {
+    for problem in [UsageProblem::LoginExpired, UsageProblem::NoLogin] {
+        let c = config();
+        let mut state = UsageState::new(c.clone());
+        state.refresh_with_cursor_fetch(&[Provider::Cursor], 1000, |_| {
+            unknown(Provider::Cursor, problem.clone())
+        });
+        let lease = c.snapshot_file.with_extension("cursor-login");
+        atomic_json(&lease, &1000_u64).expect("lease");
+        let lease_before = fs::read(&lease).expect("lease bytes");
+        cursor_login_saved(&c).expect("saved login");
+        assert!(cursor_fetch_due(&c, 1300));
+        let cached: UsageSnapshot = read_json(&c.snapshot_file).expect("pending snapshot");
+        assert_eq!(cached.providers[0].problem, Some(UsageProblem::NoData));
+        assert!(cached.providers[0]
+            .windows
+            .iter()
+            .all(|w| w.left_pct.is_none()));
+        assert_eq!(fs::read(&lease).expect("lease unchanged"), lease_before);
+        let good = cursor::http_result(200, "", &sample("cursor-usage-summary.sample.json"), 1300);
+        let next = state.refresh_with_cursor_fetch(&[Provider::Cursor], 1300, |_| good.clone());
+        assert_eq!(next.providers[0], good);
+        assert_eq!(cursor_fetch_time(&c), Some(1300));
+        state.refresh_with_cursor_fetch(&[Provider::Cursor], 1301, |_| panic!("still throttled"));
+        UsageState::new(c).refresh_with_cursor_fetch(&[Provider::Cursor], 1301, |_| {
+            panic!("disk throttle restored")
+        });
+    }
+}
+
+#[test]
+fn stale_worker_cannot_republish_expired_login_after_saved_login() {
+    let c = config();
+    let mut state = UsageState::new(c.clone());
+    let mut stale = state.refresh_with_cursor_fetch(&[Provider::Cursor], 1000, |_| {
+        unknown(Provider::Cursor, UsageProblem::LoginExpired)
+    });
+    cursor_login_saved(&c).expect("saved login");
+    state.save_snapshot(&mut stale);
+    assert_eq!(stale.providers[0].problem, Some(UsageProblem::NoData));
+    let next = state.refresh_with_cursor_fetch(&[Provider::Cursor], 1300, |_| {
+        unknown(Provider::Cursor, UsageProblem::Offline)
+    });
+    assert_eq!(next.providers[0].problem, Some(UsageProblem::Offline));
+}
+
+#[test]
+fn automatic_saved_login_consumes_revision_and_restores_fetch_throttle() {
+    let c = config();
+    let mut state = UsageState::new(c.clone());
+    let mut reads = 0;
+    let good = cursor::http_result(200, "", &sample("cursor-usage-summary.sample.json"), 1000);
+    let next = state.refresh_worker_with_sources(
+        &[Provider::Cursor],
+        1000,
+        true,
+        |_| {
+            reads += 1;
+            if reads == 1 {
+                unknown(Provider::Cursor, UsageProblem::LoginExpired)
+            } else {
+                good.clone()
+            }
+        },
+        |_| {
+            cursor_login_saved(&c).expect("import saved");
+            login::CursorLoginResult::Exited(0)
+        },
+        |_| {},
+    );
+    assert_eq!(reads, 2);
+    assert_eq!(next.providers[0], good);
+    assert_eq!(cursor_fetch_time(&c), Some(1000));
+    state.refresh_with_cursor_fetch(&[Provider::Cursor], 1001, |_| panic!("no duplicate fetch"));
+}

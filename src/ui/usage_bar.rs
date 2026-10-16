@@ -18,8 +18,25 @@ use crate::usage::{
     Provider, ProviderUsage, UsageProblem, UsageSnapshot, WindowKind,
 };
 
-/// A reading older than this is drawn dimmed.
+/// A Claude or Codex reading older than this is drawn dimmed. Both update on
+/// every agent turn, so dim honestly means "not used lately".
 pub(crate) const STALE_AFTER_SECS: u64 = 15 * 60;
+
+/// Cursor is fetched at most every `CURSOR_MIN_INTERVAL_SECS` and only when a
+/// worker refresh comes round, so its readings are legitimately that old.
+const CURSOR_STALE_MARGIN_SECS: u64 = 60;
+
+/// How old a provider's reading may get before it is drawn dimmed.
+pub(crate) fn stale_after_secs(provider: Provider) -> u64 {
+    match provider {
+        Provider::Claude | Provider::Codex => STALE_AFTER_SECS,
+        Provider::Cursor => {
+            crate::usage::CURSOR_MIN_INTERVAL_SECS
+                + crate::app::USAGE_REFRESH_INTERVAL.as_secs()
+                + CURSOR_STALE_MARGIN_SECS
+        }
+    }
+}
 
 /// Rows of the spaces list the block never takes away: a space and a few agents.
 const SIDEBAR_LIST_MIN_ROWS: u16 = 5;
@@ -100,7 +117,7 @@ fn default_kinds(provider: Provider) -> &'static [WindowKind] {
 fn is_stale(usage: &ProviderUsage, now: u64) -> bool {
     usage
         .seen_at
-        .is_some_and(|seen| now.saturating_sub(seen) > STALE_AFTER_SECS)
+        .is_some_and(|seen| now.saturating_sub(seen) > stale_after_secs(usage.provider))
 }
 
 /// Ten squares, each 10%: `left` rounded up to the next ten, so 1% still lights one.
@@ -451,7 +468,7 @@ pub(crate) fn next_change_secs(
             }
         }
         if let Some(seen) = usage.seen_at {
-            let stale_at = seen + STALE_AFTER_SECS + 1;
+            let stale_at = seen + stale_after_secs(usage.provider) + 1;
             if stale_at > now {
                 take(stale_at - now);
             }
@@ -665,6 +682,25 @@ mod tests {
         );
         let fresh_fg = Style::default().fg(rgb_color(one(Some(50)).rgb)).fg;
         assert_ne!(spans[0].style.fg, fresh_fg);
+    }
+
+    #[test]
+    fn a_cursor_reading_is_stale_only_after_its_fetch_gap() {
+        let mut u = usage(
+            Provider::Cursor,
+            vec![window(WindowKind::Monthly, Some(50), Some(100_000))],
+        );
+        let at = |mins: u64| meters_for(&u, NOW + mins * 60)[0].stale;
+        assert!(!at(16));
+        assert!(!at(20));
+        assert!(!at(21));
+        assert!(at(22));
+        // Claude and Codex keep 15 minutes.
+        for provider in [Provider::Claude, Provider::Codex] {
+            u.provider = provider;
+            assert!(!meters_for(&u, NOW + 15 * 60)[0].stale);
+            assert!(meters_for(&u, NOW + 16 * 60)[0].stale);
+        }
     }
 
     #[test]

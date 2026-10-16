@@ -6,6 +6,11 @@ use super::{ClipboardImage, ForegroundJob, Signal};
 pub fn raise_server_nofile_limit() {}
 
 /// Unsupported platform stub.
+pub fn process_env_var(_pid: u32, _name: &str) -> Option<String> {
+    None
+}
+
+/// Unsupported platform stub.
 pub fn foreground_job(_child_pid: u32) -> Option<ForegroundJob> {
     None
 }

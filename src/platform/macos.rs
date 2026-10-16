@@ -740,6 +740,31 @@ fn comm_from_bsdinfo(info: &libc::proc_bsdinfo) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// One variable of a same-user process's environment, from `KERN_PROCARGS2`.
+pub fn process_env_var(pid: u32, name: &str) -> Option<String> {
+    procargs2_env_var(&kern_procargs2(pid)?, name)
+}
+
+fn procargs2_env_var(buf: &[u8], name: &str) -> Option<String> {
+    if buf.len() < 4 {
+        return None;
+    }
+    let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let rest = &buf[4..];
+    // exec path, its NUL padding, then argc argv strings, then the environment.
+    let mut parts = rest.split(|&b| b == 0);
+    parts.next()?;
+    let mut parts = parts.skip_while(|p| p.is_empty());
+    for _ in 0..argc.max(0) {
+        parts.next()?;
+    }
+    let prefix = format!("{name}=");
+    parts
+        .take_while(|entry| !entry.is_empty())
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .find_map(|entry| entry.strip_prefix(prefix.as_str()).map(str::to_string))
+}
+
 fn process_argv(pid: u32) -> Option<Vec<String>> {
     let buf = kern_procargs2(pid)?;
     procargs2_argv(&buf)
@@ -976,6 +1001,23 @@ mod tests {
             buf.push(0);
         }
         buf
+    }
+
+    #[test]
+    fn procargs2_env_var_reads_the_environment_after_argv() {
+        let mut buf = 2i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(
+            b"/bin/codex\0\0\0codex\0--yolo\0PATH=/bin\0CODEX_HOME=/h/.codex-gpt\0\0",
+        );
+        assert_eq!(
+            procargs2_env_var(&buf, "CODEX_HOME").as_deref(),
+            Some("/h/.codex-gpt")
+        );
+        assert_eq!(procargs2_env_var(&buf, "NOPE"), None);
+        // A value only seen in argv is not an environment variable.
+        let mut buf = 2i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/bin/codex\0\0codex\0CODEX_HOME=/argv\0PATH=/bin\0\0");
+        assert_eq!(procargs2_env_var(&buf, "CODEX_HOME"), None);
     }
 
     #[test]

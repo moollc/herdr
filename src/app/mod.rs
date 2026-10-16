@@ -44,7 +44,7 @@ pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 /// How often allowances are read besides when an agent finishes a turn.
-const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+pub(crate) const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub(crate) const PLAYER_POLL_INTERVAL: Duration = Duration::from_millis(750);
 pub(crate) const AGENT_MODEL_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);

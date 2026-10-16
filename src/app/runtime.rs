@@ -587,6 +587,18 @@ impl App {
         self.usage_refresh_in_flight = true;
         let event_tx = self.event_tx.clone();
         let usage = std::sync::Arc::clone(&self.usage_state);
+        let codex_panes: Vec<u32> = if want.contains(&crate::usage::Provider::Codex) {
+            self.state
+                .terminals
+                .iter()
+                .filter(|(_, t)| t.effective_known_agent() == Some(crate::detect::Agent::Codex))
+                .filter_map(|(id, _)| self.terminal_runtimes.get(id))
+                .map(|runtime| runtime.child_pid())
+                .filter(|pid| *pid > 0)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let alerts_on = self.state.usage_config.alerts;
         let alert_command = self.state.usage_config.alert_command.clone();
         std::thread::spawn(move || {
@@ -595,6 +607,7 @@ impl App {
                 let mut usage = usage
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                usage.set_codex_panes(codex_panes);
                 let snapshot = usage.refresh_worker(&want, epoch, |snapshot| {
                     let _ = event_tx.blocking_send(AppEvent::UsageRefreshed {
                         snapshot: Some(snapshot),

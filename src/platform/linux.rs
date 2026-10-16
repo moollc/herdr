@@ -102,6 +102,16 @@ fn process_pgrp_and_comm(pid: u32) -> Option<(i32, String)> {
     Some((pgrp, comm))
 }
 
+/// One variable of a same-user process's environment, from `/proc/<pid>/environ`.
+pub fn process_env_var(pid: u32, name: &str) -> Option<String> {
+    let bytes = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let prefix = format!("{name}=");
+    bytes
+        .split(|&b| b == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .find_map(|entry| entry.strip_prefix(prefix.as_str()).map(str::to_string))
+}
+
 fn process_argv(pid: u32) -> Option<Vec<String>> {
     let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     if bytes.is_empty() {

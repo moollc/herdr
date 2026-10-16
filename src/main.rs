@@ -276,7 +276,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # alert_command = "" # macOS say by default; whitespace-separated program and arguments
 # cursor_login = false # enable with herdr usage cursor-login
 # claude_statusline = true # display only; usage is recorded even when off
-# codex_home = "~/.codex" # CODEX_HOME by default, then ~/.codex
+# codex_home = "~/.codex" # read first; $CODEX_HOME, ~/.codex and pane Codex homes are read too
 
 # Agent panel scope: "current" or "all". Toggling it in the sidebar saves this setting.
 # agent_panel_scope = "all"

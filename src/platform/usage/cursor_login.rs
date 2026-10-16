@@ -195,7 +195,9 @@ fn live_cookie_sql(now: u64) -> String {
             let width = minimum.to_string().len();
             format!("(length(digits) > {width} OR (length(digits) = {width} AND digits >= '{minimum}'))")
         });
-    format!("WITH scoped AS (SELECT COALESCE(CAST(has_expires AS TEXT),'') <> '1' AS is_session, CASE WHEN substr(CAST(expires_utc AS TEXT),1,1) = '+' THEN substr(CAST(expires_utc AS TEXT),2) ELSE CAST(expires_utc AS TEXT) END AS expiry FROM cookies WHERE host_key IN ('cursor.com','.cursor.com')), normalized AS (SELECT is_session, expiry, ltrim(expiry,'0') AS digits FROM scoped) SELECT EXISTS(SELECT 1 FROM normalized WHERE is_session OR (expiry <> '' AND expiry NOT GLOB '*[^0-9]*' AND (length(digits) < 20 OR (length(digits) = 20 AND digits <= '18446744073709551615')) AND {live}));")
+    format!(
+        "WITH scoped AS (SELECT COALESCE(CAST(has_expires AS TEXT),'') <> '1' AS is_session, CASE WHEN substr(CAST(expires_utc AS TEXT),1,1) = '+' THEN substr(CAST(expires_utc AS TEXT),2) ELSE CAST(expires_utc AS TEXT) END AS expiry FROM cookies WHERE host_key IN ('cursor.com','.cursor.com')), normalized AS (SELECT is_session, expiry, ltrim(expiry,'0') AS digits FROM scoped) SELECT EXISTS(SELECT 1 FROM normalized WHERE is_session OR (expiry <> '' AND expiry NOT GLOB '*[^0-9]*' AND (length(digits) < 20 OR (length(digits) = 20 AND digits <= '18446744073709551615')) AND {live}));"
+    )
 }
 fn has_live_cookie(path: &Path, now: u64, deadline: Instant) -> bool {
     live_cookie_with(path, now, |uri, sql| {
@@ -516,6 +518,7 @@ fn finish_import(
     import: impl FnOnce() -> Result<String, ()>,
     check: impl FnOnce(&str) -> i32,
     save: impl FnOnce(&str) -> Result<(), ()>,
+    saved: impl FnOnce() -> std::io::Result<()>,
 ) -> i32 {
     let Ok(secret) = import() else {
         eprintln!("Could not read cursor.com cookies from the browser.");
@@ -532,6 +535,10 @@ fn finish_import(
     }
     if save(&secret).is_err() {
         eprintln!("Could not store the login in the Keychain.");
+        return 1;
+    }
+    if saved().is_err() {
+        eprintln!("Login saved, but could not schedule a fresh Cursor reading.");
         return 1;
     }
     println!("Saved the cursor.com login to the Keychain.");
@@ -581,6 +588,7 @@ fn import(browser: &Browser, deadline: Instant) -> i32 {
                 Err(())
             }
         },
+        || crate::usage::cursor_login_saved(&crate::usage::UsageConfig::configured()),
     );
     record(browser, code);
     code
@@ -826,7 +834,11 @@ mod tests {
         for version in [23, 24] {
             let path = root.join(format!("synthetic-{version}.sqlite"));
             let valid = encrypted("synthetic-value", "cursor.com", version, &key);
-            let sql=format!("CREATE TABLE meta(key TEXT,value TEXT); INSERT INTO meta VALUES('version','{version}'); CREATE TABLE cookies(host_key TEXT,name TEXT,encrypted_value BLOB,expires_utc INTEGER,has_expires INTEGER); INSERT INTO cookies VALUES('cursor.com','token',X'{}',0,0),('.cursor.com','expired',X'{}',11644473601000000,1),('other.example','private',X'00',0,0);",hex(&valid),hex(&valid));
+            let sql = format!(
+                "CREATE TABLE meta(key TEXT,value TEXT); INSERT INTO meta VALUES('version','{version}'); CREATE TABLE cookies(host_key TEXT,name TEXT,encrypted_value BLOB,expires_utc INTEGER,has_expires INTEGER); INSERT INTO cookies VALUES('cursor.com','token',X'{}',0,0),('.cursor.com','expired',X'{}',11644473601000000,1),('other.example','private',X'00',0,0);",
+                hex(&valid),
+                hex(&valid)
+            );
             assert!(Command::new("/usr/bin/sqlite3")
                 .arg(&path)
                 .arg(sql)
@@ -932,14 +944,20 @@ mod tests {
             Ok(true)
         );
         assert_eq!(
-            finish_import(|| Err(()), |_| panic!("check"), |_| panic!("save")),
+            finish_import(
+                || Err(()),
+                |_| panic!("check"),
+                |_| panic!("save"),
+                || Ok(())
+            ),
             1
         );
         assert_eq!(
             finish_import(
                 || Ok(String::new()),
                 |_| panic!("check"),
-                |_| panic!("save")
+                |_| panic!("save"),
+                || Ok(())
             ),
             4
         );
@@ -948,17 +966,28 @@ mod tests {
                 finish_import(
                     || Ok("token=synthetic".into()),
                     |_| code,
-                    |_| panic!("save failed validation")
+                    |_| panic!("save failed validation"),
+                    || Ok(())
                 ),
                 code
             );
         }
         assert_eq!(
-            finish_import(|| Ok("token=synthetic".into()), |_| 0, |_| Err(())),
+            finish_import(
+                || Ok("token=synthetic".into()),
+                |_| 0,
+                |_| Err(()),
+                || Ok(())
+            ),
             1
         );
         assert_eq!(
-            finish_import(|| Ok("token=synthetic".into()), |_| 0, |_| Ok(())),
+            finish_import(
+                || Ok("token=synthetic".into()),
+                |_| 0,
+                |_| Ok(()),
+                || Ok(())
+            ),
             0
         );
         let path = directory().join("config.toml");
@@ -1030,7 +1059,10 @@ mod tests {
         )
         .is_err());
         assert!(start.elapsed() < Duration::from_secs(1));
-        assert_eq!(security_input("a=quote\"and\\slash").unwrap(),"add-generic-password -U -s \"herdr-cursor-usage\" -a \"herdr\" -w \"a=quote\\\"and\\\\slash\"\n");
+        assert_eq!(
+            security_input("a=quote\"and\\slash").unwrap(),
+            "add-generic-password -U -s \"herdr-cursor-usage\" -a \"herdr\" -w \"a=quote\\\"and\\\\slash\"\n"
+        );
         for secret in ["", "a\nb", "a\rb", "a\0b"] {
             assert!(security_input(secret).is_err());
         }
@@ -1067,7 +1099,9 @@ mod tests {
         let store = |dir: &str, host: &str| {
             let profile = home.join("Library/Application Support").join(dir);
             fs::create_dir_all(&profile).unwrap();
-            let sql = format!("CREATE TABLE meta(key TEXT,value TEXT); INSERT INTO meta VALUES('version','24'); CREATE TABLE cookies(host_key TEXT,name TEXT,encrypted_value BLOB,expires_utc INTEGER,has_expires INTEGER); INSERT INTO cookies VALUES('{host}','synthetic',X'00',0,0);");
+            let sql = format!(
+                "CREATE TABLE meta(key TEXT,value TEXT); INSERT INTO meta VALUES('version','24'); CREATE TABLE cookies(host_key TEXT,name TEXT,encrypted_value BLOB,expires_utc INTEGER,has_expires INTEGER); INSERT INTO cookies VALUES('{host}','synthetic',X'00',0,0);"
+            );
             assert!(Command::new("/usr/bin/sqlite3")
                 .arg(profile.join("Cookies"))
                 .arg(sql)
@@ -1180,7 +1214,9 @@ mod tests {
                 .join(root)
                 .join("Default");
             fs::create_dir_all(&dir).unwrap();
-            let sql = format!("CREATE TABLE cookies(host_key TEXT,expires_utc INTEGER,has_expires INTEGER); INSERT INTO cookies VALUES('.cursor.com',{expiry},1);");
+            let sql = format!(
+                "CREATE TABLE cookies(host_key TEXT,expires_utc INTEGER,has_expires INTEGER); INSERT INTO cookies VALUES('.cursor.com',{expiry},1);"
+            );
             assert!(Command::new("/usr/bin/sqlite3")
                 .arg(dir.join("Cookies"))
                 .arg(sql)
@@ -1239,7 +1275,9 @@ mod tests {
             ("cursor.com", "'18446744073709551616'", 1, false),
         ] {
             // UPDATE the single row between cases; no data or fixture files are deleted.
-            let sql = format!("UPDATE cookies SET host_key='{host}',expires_utc={expires},has_expires={has_expires}; INSERT INTO cookies SELECT '{host}',{expires},{has_expires} WHERE NOT EXISTS(SELECT 1 FROM cookies);");
+            let sql = format!(
+                "UPDATE cookies SET host_key='{host}',expires_utc={expires},has_expires={has_expires}; INSERT INTO cookies SELECT '{host}',{expires},{has_expires} WHERE NOT EXISTS(SELECT 1 FROM cookies);"
+            );
             assert!(Command::new("/usr/bin/sqlite3")
                 .arg(&path)
                 .arg(sql)
@@ -1298,5 +1336,60 @@ mod tests {
             assert!(message.contains(bundle) && message.contains("not supported yet"));
         }
         assert!(unsupported_default_message("com.brave.Browser").is_none());
+    }
+    #[test]
+    fn only_saved_login_requests_a_fresh_reading() {
+        let config = crate::usage::UsageConfig {
+            snapshot_file: std::env::temp_dir()
+                .join(format!(
+                    "herdr-saved-login-{}-{}-{}",
+                    module_path!(),
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ))
+                .join("usage.json"),
+            ..crate::usage::UsageConfig::default()
+        };
+        let timer = config.snapshot_file.with_extension("cursor-fetch");
+        crate::usage::atomic_json(&timer, &1000_u64).expect("timer");
+        let requested = std::cell::Cell::new(0);
+        let saved = || {
+            requested.set(requested.get() + 1);
+            crate::usage::cursor_login_saved(&config)
+        };
+        assert_eq!(
+            finish_import(
+                || Ok("token=synthetic".into()),
+                |_| 4,
+                |_| panic!("validation failed"),
+                saved
+            ),
+            4
+        );
+        assert_eq!(
+            finish_import(|| Ok("token=synthetic".into()), |_| 0, |_| Err(()), saved),
+            1
+        );
+        assert_eq!(requested.get(), 0);
+        assert_eq!(
+            crate::usage::read_json::<u64>(&timer).expect("unchanged timer"),
+            1000
+        );
+        assert!(
+            !config.snapshot_file.exists(),
+            "failed or declined login leaves cache alone"
+        );
+        assert_eq!(
+            finish_import(|| Ok("token=synthetic".into()), |_| 0, |_| Ok(()), saved),
+            0
+        );
+        assert_eq!(requested.get(), 1);
+        assert_eq!(
+            crate::usage::read_json::<Option<u64>>(&timer).expect("reset timer"),
+            None
+        );
     }
 }

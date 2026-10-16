@@ -58,7 +58,7 @@ fn read_hidden(mut input: impl Read) -> io::Result<String> {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "paste cancelled",
-                ))
+                ));
             }
             8 | 127 => {
                 value.pop();
@@ -106,7 +106,9 @@ impl Drop for TerminalMode {
 }
 fn prompt() -> io::Result<String> {
     if !io::stdin().is_terminal() {
-        return Err(io::Error::other("--paste requires an interactive terminal; secrets cannot be passed as arguments or piped"));
+        return Err(io::Error::other(
+            "--paste requires an interactive terminal; secrets cannot be passed as arguments or piped",
+        ));
     }
     eprintln!("Copy only the Cookie header value from a cursor.com request in DevTools > Network.");
     let terminal = TerminalMode::hidden(libc::STDIN_FILENO)?;
@@ -119,7 +121,9 @@ fn prompt() -> io::Result<String> {
 }
 #[cfg(any(target_os = "linux", test))]
 fn confirm_plaintext() -> bool {
-    eprint!("Secret Service is unavailable. Save this login as plaintext in Herdr's private state directory (0600 file, 0700 folder)? [y/N] ");
+    eprint!(
+        "Secret Service is unavailable. Save this login as plaintext in Herdr's private state directory (0600 file, 0700 folder)? [y/N] "
+    );
     let _ = io::stderr().flush();
     let mut input = String::new();
     io::BufRead::read_line(&mut io::stdin().lock().take(32), &mut input).is_ok()
@@ -129,9 +133,12 @@ fn finish_paste(
     secret: &str,
     check: impl FnOnce(&str) -> i32,
     save: impl FnOnce(&str) -> Result<bool, ()>,
+    saved: impl FnOnce() -> std::io::Result<()>,
 ) -> i32 {
     if !valid_header(secret) {
-        eprintln!("Invalid Cookie header value. Copy only the value from a cursor.com request and paste again.");
+        eprintln!(
+            "Invalid Cookie header value. Copy only the value from a cursor.com request and paste again."
+        );
         return 1;
     }
     let code = check(secret);
@@ -143,7 +150,13 @@ fn finish_paste(
     }
     match save(secret) {
         Ok(true) => {
-            println!("Saved the cursor.com login. When it expires, run herdr usage cursor-login --paste again.");
+            if saved().is_err() {
+                eprintln!("Login saved, but could not schedule a fresh Cursor reading.");
+                return 1;
+            }
+            println!(
+                "Saved the cursor.com login. When it expires, run herdr usage cursor-login --paste again."
+            );
             0
         }
         Ok(false) => {
@@ -233,6 +246,7 @@ fn paste() -> i32 {
             crate::usage::atomic_json(&status_file(), &serde_json::json!({"kind":"paste", "browser":"pasted", "reason":"explicit --paste", "result":"saved", "storage":storage_kind(), "keyring_may_exist": previous_keyring || storage_kind() == "secret-service"})).map_err(|_| ())?;
             Ok(true)
         },
+        || crate::usage::cursor_login_saved(&crate::usage::UsageConfig::configured()),
     )
 }
 pub(crate) fn cursor_login_cli(args: &[String]) -> i32 {
@@ -401,7 +415,12 @@ mod tests {
             "bad name=x",
         ] {
             assert_eq!(
-                finish_paste(secret, |_| panic!("validation"), |_| panic!("storage")),
+                finish_paste(
+                    secret,
+                    |_| panic!("validation"),
+                    |_| panic!("storage"),
+                    || Ok(())
+                ),
                 1
             );
         }
@@ -411,12 +430,21 @@ mod tests {
         assert!(read_hidden(&b"x=secret\x03"[..]).is_err());
         assert!(read_hidden(&vec![b'x'; MAX_HEADER + 1][..]).is_err());
         assert_eq!(
-            finish_paste("x=synthetic", |_| 4, |_| panic!("store expired")),
+            finish_paste("x=synthetic", |_| 4, |_| panic!("store expired"), || Ok(())),
             4
         );
-        assert_eq!(finish_paste("x=synthetic", |_| 0, |_| Ok(false)), 0);
-        assert_eq!(finish_paste("x=synthetic", |_| 0, |_| Err(())), 1);
-        assert_eq!(finish_paste("x=synthetic", |_| 0, |_| Ok(true)), 0);
+        assert_eq!(
+            finish_paste("x=synthetic", |_| 0, |_| Ok(false), || Ok(())),
+            0
+        );
+        assert_eq!(
+            finish_paste("x=synthetic", |_| 0, |_| Err(()), || Ok(())),
+            1
+        );
+        assert_eq!(
+            finish_paste("x=synthetic", |_| 0, |_| Ok(true), || Ok(())),
+            0
+        );
     }
     #[test]
     fn usage_plaintext_requires_one_explicit_confirmation_and_denial_keeps_nothing() {
@@ -465,5 +493,60 @@ mod tests {
         let _linux_cli: fn(&[String]) -> i32 = linux_cli;
         let _prompt: fn() -> bool = confirm_plaintext;
         let _consent: fn() -> bool = consent;
+    }
+    #[test]
+    fn only_saved_login_requests_a_fresh_reading() {
+        let config = crate::usage::UsageConfig {
+            snapshot_file: std::env::temp_dir()
+                .join(format!(
+                    "herdr-saved-login-{}-{}-{}",
+                    module_path!(),
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ))
+                .join("usage.json"),
+            ..crate::usage::UsageConfig::default()
+        };
+        let timer = config.snapshot_file.with_extension("cursor-fetch");
+        crate::usage::atomic_json(&timer, &1000_u64).expect("timer");
+        let requested = std::cell::Cell::new(0);
+        let saved = || {
+            requested.set(requested.get() + 1);
+            crate::usage::cursor_login_saved(&config)
+        };
+        assert_eq!(
+            finish_paste(
+                "token=synthetic",
+                |_| 4,
+                |_| panic!("validation failed"),
+                saved
+            ),
+            4
+        );
+        assert_eq!(
+            finish_paste("token=synthetic", |_| 0, |_| Ok(false), saved),
+            0
+        );
+        assert_eq!(requested.get(), 0);
+        assert_eq!(
+            crate::usage::read_json::<u64>(&timer).expect("unchanged timer"),
+            1000
+        );
+        assert!(
+            !config.snapshot_file.exists(),
+            "failed or declined login leaves cache alone"
+        );
+        assert_eq!(
+            finish_paste("token=synthetic", |_| 0, |_| Ok(true), saved),
+            0
+        );
+        assert_eq!(requested.get(), 1);
+        assert_eq!(
+            crate::usage::read_json::<Option<u64>>(&timer).expect("reset timer"),
+            None
+        );
     }
 }

@@ -95,6 +95,8 @@ struct Payload {
 struct Limits {
     limit_id: String,
     #[serde(default)]
+    plan_type: Option<String>,
+    #[serde(default)]
     primary: Value,
     #[serde(default)]
     secondary: Value,
@@ -163,7 +165,9 @@ fn latest(paths: &[PathBuf]) -> Option<Reading> {
         })
         .max_by_key(|reading| reading.key)
 }
-pub fn read(home: &Path, now: u64) -> ProviderUsage {
+/// The newest qualifying reading under one Codex home: five newest files of
+/// today, then of the most recent earlier day, tails only.
+fn reading_in(home: &Path, now: u64) -> Option<Reading> {
     let root = home.join("sessions");
     let today = root.join(local_time(now, c"%Y/%m/%d"));
     let paths = files(&today);
@@ -183,6 +187,69 @@ pub fn read(home: &Path, now: u64) -> ProviderUsage {
         let older = files(&folder);
         best = latest(&older[..older.len().min(5 - current_count)]);
     }
+    best
+}
+
+/// Where a candidate home came from. `active` homes belong to a Codex
+/// process that is running now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Home {
+    pub path: PathBuf,
+    pub active: bool,
+}
+
+/// Read every candidate home and show one account's newest reading. Readings
+/// that name different plans are never mixed: homes of running Codex
+/// processes decide, then the first (configured) home. With no plan named,
+/// newest wins.
+pub fn read_homes(homes: &[Home], now: u64) -> ProviderUsage {
+    let mut seen_paths: Vec<&Path> = Vec::new();
+    let mut found: Vec<(bool, Reading)> = Vec::new();
+    let mut configured_plan = None;
+    for (index, home) in homes.iter().enumerate() {
+        if seen_paths.contains(&home.path.as_path()) {
+            continue;
+        }
+        seen_paths.push(&home.path);
+        if let Some(reading) = reading_in(&home.path, now) {
+            // The first candidate is the configured home and keeps its say.
+            if index == 0 {
+                configured_plan = reading.limits.plan_type.clone();
+            }
+            found.push((home.active, reading));
+        }
+    }
+    let plans: std::collections::BTreeSet<_> = found
+        .iter()
+        .filter_map(|(_, r)| r.limits.plan_type.clone())
+        .collect();
+    let best = if plans.len() > 1 {
+        let any_active = found.iter().any(|(active, _)| *active);
+        let chosen_plan = if any_active {
+            found
+                .iter()
+                .filter(|(active, _)| *active)
+                .max_by_key(|(_, r)| r.key)
+                .and_then(|(_, r)| r.limits.plan_type.clone())
+        } else {
+            configured_plan
+        };
+        found
+            .into_iter()
+            .filter(|(_, r)| chosen_plan.is_none() || r.limits.plan_type == chosen_plan)
+            .map(|(_, r)| r)
+            .max_by_key(|r| r.key)
+    } else {
+        found.into_iter().map(|(_, r)| r).max_by_key(|r| r.key)
+    };
+    build(best, now)
+}
+
+pub fn read(home: &Path, now: u64) -> ProviderUsage {
+    build(reading_in(home, now), now)
+}
+
+fn build(best: Option<Reading>, now: u64) -> ProviderUsage {
     let Some(reading) = best else {
         return unknown(Provider::Codex, UsageProblem::NoData);
     };
@@ -203,4 +270,83 @@ pub fn read(home: &Path, now: u64) -> ProviderUsage {
         result.problem = None;
     }
     result
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::*;
+    use std::fs;
+
+    const NOW: u64 = 1_792_000_000;
+
+    fn write_home(dir: &Path, stamp: &str, plan: Option<&str>, used: u32) {
+        let day = dir.join("sessions").join(local_time(NOW, c"%Y/%m/%d"));
+        fs::create_dir_all(&day).unwrap();
+        let plan = plan.map_or(String::new(), |p| format!(r#""plan_type":"{p}","#));
+        let line = format!(
+            r#"{{"timestamp":"{stamp}","type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"limit_id":"codex",{plan}"primary":{{"used_percent":{used}.0,"window_minutes":300,"resets_at":{r}}},"secondary":{{"used_percent":1.0,"window_minutes":10080,"resets_at":{r2}}}}}}}}}"#,
+            r = NOW + 3600,
+            r2 = NOW + 86_400
+        );
+        fs::write(day.join("rollout-a.jsonl"), line + "\n").unwrap();
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("herdr-codex-homes-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn home(path: &Path, active: bool) -> Home {
+        Home {
+            path: path.to_path_buf(),
+            active,
+        }
+    }
+
+    fn used(usage: &ProviderUsage) -> f64 {
+        usage.windows[0].left_pct.map_or(-1.0, f64::from)
+    }
+
+    #[test]
+    fn two_homes_with_different_times_pick_the_newer() {
+        let (a, b) = (temp("newer-a"), temp("newer-b"));
+        write_home(&a, "2026-10-15T10:00:00.000Z", None, 20);
+        write_home(&b, "2026-10-15T11:00:00.000Z", None, 70);
+        let got = read_homes(&[home(&a, false), home(&b, false)], NOW);
+        let swapped = read_homes(&[home(&b, false), home(&a, false)], NOW);
+        assert_eq!(got.seen_at, swapped.seen_at);
+        assert_eq!(used(&got), 30.0);
+    }
+
+    #[test]
+    fn a_missing_home_is_skipped_and_the_configured_home_works_alone() {
+        let a = temp("alone");
+        write_home(&a, "2026-10-15T10:00:00.000Z", None, 20);
+        let missing = a.join("nope");
+        assert_eq!(
+            used(&read_homes(&[home(&missing, false), home(&a, false)], NOW)),
+            80.0
+        );
+        assert_eq!(used(&read_homes(&[home(&a, false)], NOW)), 80.0);
+        assert_eq!(
+            read_homes(&[home(&missing, false)], NOW).problem,
+            Some(UsageProblem::NoData)
+        );
+    }
+
+    #[test]
+    fn different_plans_are_never_mixed() {
+        let (cfg, other) = (temp("plan-cfg"), temp("plan-other"));
+        write_home(&cfg, "2026-10-15T10:00:00.000Z", Some("plus"), 20);
+        write_home(&other, "2026-10-15T11:00:00.000Z", Some("pro"), 70);
+        // No running process: the configured home's account wins though older.
+        let got = read_homes(&[home(&cfg, false), home(&other, false)], NOW);
+        assert_eq!(used(&got), 80.0);
+        // The home of a running Codex process decides when there is one.
+        let got = read_homes(&[home(&cfg, false), home(&other, true)], NOW);
+        assert_eq!(used(&got), 30.0);
+    }
 }
