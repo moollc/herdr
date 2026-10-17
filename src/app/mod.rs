@@ -2989,8 +2989,12 @@ mod tests {
         assert!(content.contains("[ui.pane_header]"));
         assert!(content.contains("git_branch = true"));
 
-        // The usage field round trips through the same file.
+        // The usage field is off by default and round trips both ways.
+        assert!(!app.state.pane_header.usage);
+        app.save_pane_header_field(crate::config::PaneHeaderField::Usage, true);
         assert!(app.state.pane_header.usage);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("usage = true"));
         app.save_pane_header_field(crate::config::PaneHeaderField::Usage, false);
         assert!(!app.state.pane_header.usage);
         let content = std::fs::read_to_string(&path).unwrap();
@@ -4494,7 +4498,8 @@ last_pane = "prefix+tab"
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
         let mut app = test_app();
-        assert!(app.state.usage_config.table);
+        assert!(!app.state.usage_config.table);
+        assert!(app.state.usage_config.sidebar);
         for switch in crate::config::UsageSwitch::ALL {
             app.save_usage_switch(switch, false);
         }

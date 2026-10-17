@@ -18,9 +18,9 @@ pub use self::{
         IndexedKeybind, Keybinds, LiveKeybindConfig,
     },
     model::{
-        validated_sidebar_bounds, Config, ConfigReloadReport, ConfigReloadStatus, KeysConfig,
-        NewTerminalCwdConfig, PaneHeaderConfig, ShellModeConfig, ToastConfig, ToastDelivery,
-        UpdateChannelConfig, UsageDisplayConfig, DEFAULT_REFRESH_SUMMARY_PROMPT,
+        validated_sidebar_bounds, Config, ConfigReloadReport, ConfigReloadStatus, CursorPools,
+        KeysConfig, NewTerminalCwdConfig, PaneHeaderConfig, ShellModeConfig, ToastConfig,
+        ToastDelivery, UpdateChannelConfig, UsageDisplayConfig, DEFAULT_REFRESH_SUMMARY_PROMPT,
     },
     sound::SoundConfig,
     theme::{parse_color, CustomThemeColors, ThemeConfig},

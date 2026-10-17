@@ -102,6 +102,7 @@ impl App {
                     self.render_notify.notify_one();
                 }
             }
+            self.announce_allowance_recoveries();
             self.sync_usage_redraw_deadline();
             return;
         }

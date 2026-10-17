@@ -203,6 +203,10 @@ mod tests {
     #[test]
     fn usage_hides_and_shows_the_table_the_headers_and_the_sidebar_together() {
         let mut app = app();
+        // Table and pane headers are opt-in. Turn them on so hide and show
+        // still cover all three surfaces.
+        app.state.usage_config.table = true;
+        app.state.pane_header.usage = true;
         let all_on = |app: &App| {
             app.state.usage_table_on()
                 && app.state.usage_headers_on()

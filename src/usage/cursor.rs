@@ -29,27 +29,18 @@ pub(super) fn parse(value: &Value, now: u64) -> ProviderUsage {
     let api = plan.get("apiPercentUsed").and_then(percent);
     let overall = plan.get("totalPercentUsed").and_then(percent);
     let unlimited = value.get("isUnlimited").and_then(Value::as_bool) == Some(true);
-    let (left, tighter) = match (auto, api) {
-        (Some(a), Some(b)) if a <= b => (Some(a), "auto"),
-        (Some(_), Some(b)) => (Some(b), "api"),
-        (Some(a), None) => (Some(a), "auto"),
-        (None, Some(b)) => (Some(b), "api"),
-        _ => (None, "unknown"),
-    };
-    result.seen_at = Some(now);
-    result.windows[0].resets_at = Some(reset);
-    result.windows[0].left_pct = if unlimited {
-        None
-    } else if reset <= now && left.is_some() {
-        Some(100)
-    } else {
-        left
+    let tighter = match (auto, api) {
+        (Some(a), Some(b)) if a <= b => "auto",
+        (Some(_), Some(_)) => "named",
+        (Some(_), None) => "auto",
+        (None, Some(_)) => "named",
+        _ => "unknown",
     };
     let show = |v: Option<u8>| v.map_or("?".into(), |n| format!("{n}%"));
     let on_demand = value
         .pointer("/individualUsage/onDemand")
         .filter(|v| v.get("enabled").and_then(Value::as_bool) == Some(true));
-    result.windows[0].note = Some(format!(
+    let note = format!(
         "overall {} left, auto {} left, named {} left, tighter {tighter}{}, breakdown={}{}",
         show(overall),
         show(auto),
@@ -57,8 +48,26 @@ pub(super) fn parse(value: &Value, now: u64) -> ProviderUsage {
         if unlimited { ", unlimited" } else { "" },
         plan.get("breakdown").unwrap_or(&Value::Null),
         on_demand.map_or(String::new(), |v| format!(", on_demand={v}"))
-    ));
-    result.problem = if left.is_some() || unlimited {
+    );
+    let passed = reset <= now && !unlimited;
+    result.seen_at = Some(now);
+    result.windows = vec![
+        super::UsageWindow {
+            kind: super::WindowKind::Auto,
+            left_pct: if unlimited { None } else { auto },
+            resets_at: Some(reset),
+            note: Some(note),
+            reset: passed && auto.is_some(),
+        },
+        super::UsageWindow {
+            kind: super::WindowKind::Named,
+            left_pct: if unlimited { None } else { api },
+            resets_at: Some(reset),
+            note: None,
+            reset: passed && api.is_some(),
+        },
+    ];
+    result.problem = if auto.is_some() || api.is_some() || unlimited {
         None
     } else {
         Some(UsageProblem::FormatChanged)

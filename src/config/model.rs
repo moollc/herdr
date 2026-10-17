@@ -671,6 +671,7 @@ pub struct PaneHeaderConfig {
     pub git_branch: bool,
     pub git_status: bool,
     /// Allowance meters for the provider of the pane's agent, after git status.
+    /// Off by default. Turn it on here or in Settings, pane labels.
     pub usage: bool,
 }
 
@@ -684,7 +685,7 @@ impl Default for PaneHeaderConfig {
             parent_directory: false,
             git_branch: false,
             git_status: false,
-            usage: true,
+            usage: false,
         }
     }
 }
@@ -694,16 +695,27 @@ impl Default for PaneHeaderConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct UsageDisplayConfig {
-    /// Show the Allowance column in the agent table. Default: true.
+    /// Show the Allowance column in the agent table. Default: false.
+    /// Turn it on here or in Settings, pane labels.
     pub table: bool,
     /// Show the allowance block under the sidebar's lists. Default: true.
     pub sidebar: bool,
     /// Speak once per window when it reaches 10% left. Default: false.
     pub alerts: bool,
+    /// When alerts are on, also speak once when that window resets or climbs
+    /// back above 10% left. Default: true. Set false to keep only the low alert.
+    pub alert_on_recovery: bool,
+    /// Pane name that also receives the recovery line. Empty sends nothing.
+    pub alert_pane: String,
     /// Permit importing cursor.com browser cookies. Enable with `herdr usage cursor-login`.
     pub cursor_login: bool,
-    /// Show Claude status line meters while continuing to record usage. Default: true.
+    /// Show Claude status line meters while continuing to record usage. Default: false.
+    /// Turn it on here or in Settings, pane labels. Recording continues either way.
     pub claude_statusline: bool,
+    /// `both` draws both Cursor pools, labelled `cm` and `om`, in the table and sidebar.
+    /// `tighter` draws only the pool with less left. Default: both.
+    /// A pane header always draws the tighter pool, labelled `cm` or `om`.
+    pub cursor_pools: CursorPools,
     pub codex_home: Option<String>,
     /// Program and arguments; the spoken phrase is appended as the final argument.
     pub alert_command: String,
@@ -712,15 +724,28 @@ pub struct UsageDisplayConfig {
 impl Default for UsageDisplayConfig {
     fn default() -> Self {
         Self {
-            table: true,
+            table: false,
             sidebar: true,
             alerts: false,
+            alert_on_recovery: true,
+            alert_pane: String::new(),
             cursor_login: false,
-            claude_statusline: true,
+            claude_statusline: false,
+            cursor_pools: CursorPools::Both,
             codex_home: None,
             alert_command: String::new(),
         }
     }
+}
+
+/// Which Cursor pools the table and sidebar draw. The pane header always
+/// draws the tighter pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorPools {
+    #[default]
+    Both,
+    Tighter,
 }
 
 /// The `[ui.usage]` switches Settings lists under the pane header fields.
@@ -981,9 +1006,9 @@ show_agent_labels_on_pane_borders = false
         assert_eq!(PaneHeaderField::Usage.label(), "usage");
         assert_eq!(PaneHeaderField::Usage.config_key(), "usage");
         let mut header = PaneHeaderConfig::default();
-        assert!(PaneHeaderField::Usage.enabled(header));
-        header.usage = false;
         assert!(!PaneHeaderField::Usage.enabled(header));
+        header.usage = true;
+        assert!(PaneHeaderField::Usage.enabled(header));
         let config: Config = toml::from_str("[ui.pane_header]\nusage = false\n").unwrap();
         assert!(!config.ui.pane_header.usage);
         // Shown last, after git status.
@@ -996,10 +1021,7 @@ show_agent_labels_on_pane_borders = false
         for switch in UsageSwitch::ALL {
             assert_eq!(
                 switch.enabled(&config),
-                matches!(
-                    switch,
-                    UsageSwitch::Table | UsageSwitch::Sidebar | UsageSwitch::ClaudeStatusline
-                )
+                matches!(switch, UsageSwitch::Sidebar)
             );
         }
         config.table = false;
@@ -1012,15 +1034,36 @@ show_agent_labels_on_pane_borders = false
     #[test]
     fn usage_display_defaults_on_and_parses() {
         let default_config = Config::default();
-        assert!(default_config.ui.usage.table);
+        assert!(!default_config.ui.usage.table);
         assert!(default_config.ui.usage.sidebar);
         assert!(!default_config.ui.usage.alerts);
+        assert!(default_config.ui.usage.alert_on_recovery);
+        assert!(default_config.ui.usage.alert_pane.is_empty());
         assert!(!default_config.ui.usage.cursor_login);
+        assert!(!default_config.ui.usage.claude_statusline);
+        assert_eq!(default_config.ui.usage.cursor_pools, CursorPools::Both);
         let config: Config =
             toml::from_str("[ui.usage]\ntable = false\nsidebar = false\nalerts = false\n").unwrap();
         assert!(!config.ui.usage.table);
         assert!(!config.ui.usage.sidebar);
         assert!(!config.ui.usage.alerts);
+        let kept: Config = toml::from_str(
+            "[ui.usage]\ntable = true\nclaude_statusline = true\n[ui.pane_header]\nusage = true\n",
+        )
+        .unwrap();
+        assert!(kept.ui.usage.table);
+        assert!(kept.ui.usage.sidebar);
+        assert!(kept.ui.usage.claude_statusline);
+        assert!(kept.ui.pane_header.usage);
+        let recovery: Config =
+            toml::from_str("[ui.usage]\nalert_on_recovery = false\nalert_pane = \"Eleanor\"\n")
+                .unwrap();
+        assert!(!recovery.ui.usage.alert_on_recovery);
+        assert_eq!(recovery.ui.usage.alert_pane, "Eleanor");
+        assert!(recovery.ui.usage.sidebar);
+        assert_eq!(recovery.ui.usage.cursor_pools, CursorPools::Both);
+        let pools: Config = toml::from_str("[ui.usage]\ncursor_pools = \"tighter\"\n").unwrap();
+        assert_eq!(pools.ui.usage.cursor_pools, CursorPools::Tighter);
     }
 
     #[test]
@@ -1032,7 +1075,7 @@ show_agent_labels_on_pane_borders = false
         assert!(!default_config.ui.pane_header.parent_directory);
         assert!(!default_config.ui.pane_header.git_branch);
         assert!(!default_config.ui.pane_header.git_status);
-        assert!(default_config.ui.pane_header.usage);
+        assert!(!default_config.ui.pane_header.usage);
 
         let toml = r#"
 [ui.pane_header]

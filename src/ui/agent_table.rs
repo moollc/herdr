@@ -1132,8 +1132,8 @@ pub(crate) fn render_agent_table(
 }
 
 /// What each group's Allowance column keeps, decided once from its widest row
-/// so the rows of a group drop labels, the second meter and squares together
-/// instead of each row choosing for itself.
+/// so the rows of a group drop squares, then the second meter, and keep the
+/// two-letter labels together instead of each row choosing for itself.
 fn allowance_fits(
     app: &AppState,
     layout: &AgentTableLayout,
@@ -2309,6 +2309,7 @@ mod tests {
             left_pct: Some(left),
             resets_at: Some(USAGE_NOW + secs),
             note: None,
+            reset: false,
         };
         let usage = |provider, windows| ProviderUsage {
             provider,
@@ -2335,6 +2336,10 @@ mod tests {
                 ),
             ],
         });
+        // The Allowance column and header meters are off by default. These
+        // tests draw the column. Callers that switch it off do that next.
+        state.usage_config.table = true;
+        state.pane_header.usage = true;
         state
     }
 
@@ -2388,37 +2393,32 @@ mod tests {
     }
 
     #[test]
-    fn the_allowance_column_drops_labels_then_the_second_meter_then_squares() {
+    fn the_allowance_column_drops_squares_then_the_second_meter_and_keeps_labels() {
         let mut state = state_with_usage();
         let widest = |lines: &[String]| -> String { lines[1].clone() };
         let (_, wide) = painted_rows(&mut state, 230);
         assert!(widest(&wide).contains("5h "), "{}", widest(&wide));
         assert!(widest(&wide).contains("wk "), "{}", widest(&wide));
         // Narrower: the room left shrinks, so the same row loses parts in order.
-        let mut seen_no_labels = false;
-        let mut seen_one_meter = false;
         let mut seen_no_squares = false;
+        let mut seen_one_meter = false;
         for width in (30..=230).rev() {
             let (_, lines) = painted_rows(&mut state, width);
             let row = &lines[1];
             let has_labels = row.contains("5h ");
             let squares = row.contains('■');
             let both = row.contains("70%") && row.contains("80%");
-            if !has_labels && squares && both {
-                seen_no_labels = true;
-            }
-            if !has_labels && squares && row.contains("70%") && !row.contains("80%") {
-                seen_one_meter = true;
-            }
-            if !squares && row.contains("70%") {
+            if has_labels && !squares && both {
                 seen_no_squares = true;
+            }
+            if has_labels && !squares && row.contains("70%") && !row.contains("80%") {
+                seen_one_meter = true;
             }
             // Never spills past the table.
             assert!(row.chars().count() <= width as usize);
         }
-        assert!(seen_no_labels, "labels should go first");
-        assert!(seen_one_meter, "then the second meter");
-        assert!(seen_no_squares, "then the squares");
+        assert!(seen_no_squares, "squares should go first");
+        assert!(seen_one_meter, "then the second meter, with the label kept");
     }
 
     #[test]
@@ -2470,10 +2470,8 @@ mod tests {
         assert_eq!(before, after);
     }
     #[test]
-    fn rows_of_a_group_drop_labels_together_not_one_by_one() {
+    fn rows_of_a_group_keep_labels_together() {
         let mut state = state_with_usage();
-        // Find a width where the Claude row (two meters) has lost its labels
-        // but the Cursor row (one meter) would still have room for its own.
         let mut checked = 0;
         for width in 60..=230 {
             let (_, lines) = painted_rows(&mut state, width);
@@ -2483,15 +2481,16 @@ mod tests {
             ) else {
                 continue;
             };
-            if !claude.contains("5h ") {
-                assert!(
-                    !cursor.contains("mo "),
-                    "width {width}: labels on one row but not the other\n{claude}\n{cursor}"
-                );
+            assert_eq!(
+                claude.contains("5h "),
+                cursor.contains("mo "),
+                "width {width}: labels on one row but not the other\n{claude}\n{cursor}"
+            );
+            if claude.contains("5h ") {
                 checked += 1;
             }
         }
-        assert!(checked > 0, "no width dropped labels on the Claude row");
+        assert!(checked > 0, "labels never stayed on the Claude row");
     }
     #[test]
     fn a_healthy_and_a_login_expired_row_share_one_fit_at_20_columns() {
@@ -2526,13 +2525,12 @@ mod tests {
             let own = usage_bar::fit_for(meters, fit);
             assert!(usage_bar::row_width(meters, own) <= 20, "{own:?}");
         }
-        // The healthy row alone would keep its squares at 20 columns (19 wide),
-        // but the expired row cannot (28 wide with them), so the whole group
-        // drops them together and keeps the number and the countdown.
+        // Squares drop first. At 20 columns the group keeps the two-letter
+        // label, the number and the countdown, and only the first meter.
         assert_eq!(
             fit,
             usage_bar::Fit {
-                labels: false,
+                labels: true,
                 windows: 1,
                 squares: false,
                 number: true,
@@ -2573,7 +2571,7 @@ mod tests {
             28
         );
         let fit = usage_bar::fit_rows(&[a.clone(), b.clone()], 28, true).unwrap();
-        assert!(fit.squares && !fit.labels && fit.windows == 1, "{fit:?}");
+        assert!(fit.labels && !fit.squares && fit.windows == 2, "{fit:?}");
         let fit = usage_bar::fit_rows(&[a, b], 20, true).unwrap();
         assert!(!fit.squares, "{fit:?}");
     }

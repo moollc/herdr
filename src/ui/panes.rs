@@ -2079,12 +2079,14 @@ mod tests {
                         left_pct: Some(70),
                         resets_at: Some(1_000_000 + 3 * 3600 + 42 * 60),
                         note: None,
+                        reset: false,
                     },
                     UsageWindow {
                         kind: WindowKind::Weekly,
                         left_pct: Some(80),
                         resets_at: Some(1_000_000 + 4 * 86400 + 5 * 3600),
                         note: None,
+                        reset: false,
                     },
                 ],
                 seen_at: Some(1_000_000),
@@ -2092,6 +2094,10 @@ mod tests {
                 problem: None,
             }],
         });
+        // Header meters and the table column are off by default. These tests
+        // draw the meters, then one of them turns the header off again.
+        app.pane_header.usage = true;
+        app.usage_config.table = true;
         (app, pane_id)
     }
 
@@ -2165,18 +2171,19 @@ mod tests {
         assert!(meters > name);
         assert!(wide.contains("wk ■■■■■■■■■■ 80% 4/d"), "{wide}");
 
-        // Without room for both windows the weekly one goes first.
+        // Squares go first. Both two-letter labels stay.
         let mid = header_row(&app, 52, make());
         assert!(mid.contains("Olivia"), "{mid}");
-        assert!(!mid.contains("5h"), "labels went first: {mid}");
-        assert!(mid.contains("70% 3/h"), "{mid}");
-        assert!(!mid.contains("80%"), "{mid}");
+        assert!(mid.contains("5h 70% 3/h"), "{mid}");
+        assert!(mid.contains("wk 80% 4/d"), "{mid}");
+        assert!(!mid.contains('■'), "{mid}");
 
-        // Narrower: the squares go, the number and countdown stay.
+        // Narrower: the weekly meter goes, and the five hour label stays.
         let narrow = header_row(&app, 38, make());
         assert!(narrow.contains("Olivia"), "{narrow}");
+        assert!(narrow.contains("5h 70% 3/h"), "{narrow}");
+        assert!(!narrow.contains("80%"), "{narrow}");
         assert!(!narrow.contains('■'), "{narrow}");
-        assert!(narrow.contains("70% 3/h"), "{narrow}");
 
         // With no room left the meters give way and the header is exactly
         // what it was without them: the name is never cut for the meters.

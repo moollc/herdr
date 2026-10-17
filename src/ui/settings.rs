@@ -856,6 +856,10 @@ mod tests {
     #[test]
     fn pane_header_lists_each_field_with_a_checkbox() {
         let mut app = AppState::test_new();
+        // Header usage and the table column are off by default. This list still
+        // shows the header usage box checked.
+        app.pane_header.usage = true;
+        app.usage_config.table = true;
         app.pane_header.working_directory = true;
         app.settings.section = SettingsSection::PaneLabels;
         app.mode = Mode::Settings;

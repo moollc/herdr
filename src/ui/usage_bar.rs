@@ -87,6 +87,8 @@ pub(crate) fn window_label(kind: WindowKind) -> &'static str {
         WindowKind::FiveHour => "5h",
         WindowKind::Weekly => "wk",
         WindowKind::Monthly => "mo",
+        WindowKind::Auto => "cm",
+        WindowKind::Named => "om",
     }
 }
 
@@ -95,6 +97,8 @@ pub(crate) fn window_phrase(kind: WindowKind) -> &'static str {
         WindowKind::FiveHour => "five hour",
         WindowKind::Weekly => "weekly",
         WindowKind::Monthly => "monthly",
+        WindowKind::Auto => "models",
+        WindowKind::Named => "other models",
     }
 }
 
@@ -107,10 +111,26 @@ pub(crate) fn alert_phrase(provider: Provider, kind: WindowKind) -> String {
     )
 }
 
+/// Spoken when a low window resets or climbs back above 10% left.
+/// A reset does not name a percentage. A climb names the real remaining percent.
+pub(crate) fn recovery_phrase(
+    provider: Provider,
+    kind: WindowKind,
+    reset: bool,
+    left_pct: u8,
+) -> String {
+    let name = format!("{} {}", provider_name(provider), window_phrase(kind));
+    if reset {
+        format!("{name} allowance has reset")
+    } else {
+        format!("{name} allowance is back, {left_pct} percent left")
+    }
+}
+
 fn default_kinds(provider: Provider) -> &'static [WindowKind] {
     match provider {
         Provider::Claude | Provider::Codex => &[WindowKind::FiveHour, WindowKind::Weekly],
-        Provider::Cursor => &[WindowKind::Monthly],
+        Provider::Cursor => &[WindowKind::Auto, WindowKind::Named],
     }
 }
 
@@ -174,6 +194,32 @@ pub(crate) fn meters_for(usage: &ProviderUsage, now: u64) -> Vec<Meter> {
         .collect()
 }
 
+/// The pool with less left. A tie keeps the earlier window (Auto, when both
+/// are present). A window with no percentage is not tighter than one that has one.
+fn tighter_index(windows: &[crate::usage::UsageWindow]) -> usize {
+    let mut best: Option<(usize, u8)> = None;
+    for (idx, window) in windows.iter().enumerate() {
+        let Some(left) = window.left_pct else {
+            continue;
+        };
+        if best.is_none_or(|(_, current)| left < current) {
+            best = Some((idx, left));
+        }
+    }
+    best.map(|(idx, _)| idx).unwrap_or(0)
+}
+
+/// Meters to draw. Cursor's pane header, and `cursor_pools = "tighter"`, keep
+/// only the tighter pool. The table and sidebar otherwise keep both.
+fn shown_meters(usage: &ProviderUsage, now: u64, tighter_only: bool) -> Vec<Meter> {
+    let meters = meters_for(usage, now);
+    if !tighter_only || usage.provider != Provider::Cursor || meters.len() <= 1 {
+        return meters;
+    }
+    let idx = tighter_index(&usage.windows).min(meters.len() - 1);
+    vec![meters[idx].clone()]
+}
+
 fn dim_rgb(rgb: (u8, u8, u8)) -> (u8, u8, u8) {
     let mix = |a: u8, b: u8| ((u16::from(a) + u16::from(b) * 3) / 4) as u8;
     (
@@ -211,8 +257,9 @@ pub(crate) fn row_width(meters: &[Meter], fit: Fit) -> usize {
     widths + shown.len().saturating_sub(1)
 }
 
-/// The layouts to try, fullest first, for rows of up to `n` windows: labels,
-/// then the second window, then the squares, then the number.
+/// The layouts to try, fullest first, for rows of up to `n` windows: squares,
+/// then the second window, then the number. The two-letter label stays until
+/// only the countdown fits.
 fn fit_steps(n: usize, allow_labels: bool) -> Vec<Fit> {
     let mut steps = Vec::new();
     if allow_labels {
@@ -223,20 +270,27 @@ fn fit_steps(n: usize, allow_labels: bool) -> Vec<Fit> {
             number: true,
             countdown: true,
         });
-    }
-    steps.push(Fit {
-        labels: false,
-        windows: n,
-        squares: true,
-        number: true,
-        countdown: true,
-    });
-    if n > 1 {
         steps.push(Fit {
-            labels: false,
-            windows: 1,
-            squares: true,
+            labels: true,
+            windows: n,
+            squares: false,
             number: true,
+            countdown: true,
+        });
+        if n > 1 {
+            steps.push(Fit {
+                labels: true,
+                windows: 1,
+                squares: false,
+                number: true,
+                countdown: true,
+            });
+        }
+        steps.push(Fit {
+            labels: true,
+            windows: 1,
+            squares: false,
+            number: false,
             countdown: true,
         });
     }
@@ -357,13 +411,12 @@ pub(crate) fn header_usage_for(
     let snapshot = app.usage_snapshot.as_ref()?;
     let usage = snapshot.providers.iter().find(|u| u.provider == provider)?;
     Some(HeaderUsage {
-        meters: meters_for(usage, app.usage_now),
+        meters: shown_meters(usage, app.usage_now, true),
     })
 }
 
 /// Columns a header's meters take in `avail`, or zero when nothing fits.
-/// Labels (`5h`, `wk`, `mo`) are shown when there is room and are the first
-/// thing dropped, so a half width pane loses them and a full width one keeps them.
+/// Squares drop first. The two-letter label stays until only the countdown fits.
 pub(crate) fn header_width(usage: &HeaderUsage, avail: usize) -> usize {
     fit_row(&usage.meters, avail, true).map_or(0, |fit| row_width(&usage.meters, fit))
 }
@@ -397,7 +450,13 @@ pub(crate) fn table_meters_for(
         .providers
         .iter()
         .find(|u| u.provider == provider)
-        .map(|usage| meters_for(usage, app.usage_now))
+        .map(|usage| {
+            shown_meters(
+                usage,
+                app.usage_now,
+                app.usage_config.cursor_pools == crate::config::CursorPools::Tighter,
+            )
+        })
         .unwrap_or_default()
 }
 
@@ -500,7 +559,11 @@ fn block_rows(app: &AppState) -> Vec<BlockRow> {
             rows.push(BlockRow::Title);
         }
         rows.push(BlockRow::Provider(provider, None));
-        for meter in meters_for(usage, app.usage_now) {
+        for meter in shown_meters(
+            usage,
+            app.usage_now,
+            app.usage_config.cursor_pools == crate::config::CursorPools::Tighter,
+        ) {
             rows.push(BlockRow::Meter(vec![meter]));
         }
     }
@@ -597,6 +660,7 @@ mod tests {
             left_pct: left,
             resets_at: secs.map(|s| NOW + s),
             note: None,
+            reset: false,
         }
     }
 
@@ -731,6 +795,67 @@ mod tests {
     }
 
     #[test]
+    fn cursor_pools_are_labelled_and_the_header_keeps_the_tighter() {
+        let pools = usage(
+            Provider::Cursor,
+            vec![
+                window(WindowKind::Auto, Some(80), Some(86_400)),
+                window(WindowKind::Named, Some(40), Some(86_400)),
+            ],
+        );
+        let both = meters_for(&pools, NOW);
+        assert_eq!(both[0].label, "cm");
+        assert_eq!(both[0].number, "80%");
+        assert_eq!(both[1].label, "om");
+        assert_eq!(both[1].number, "40%");
+        let header = shown_meters(&pools, NOW, true);
+        assert_eq!(header.len(), 1);
+        assert_eq!(header[0].label, "om");
+        assert_eq!(header[0].number, "40%");
+        let tied = usage(
+            Provider::Cursor,
+            vec![
+                window(WindowKind::Auto, Some(50), Some(86_400)),
+                window(WindowKind::Named, Some(50), Some(86_400)),
+            ],
+        );
+        assert_eq!(shown_meters(&tied, NOW, true)[0].label, "cm");
+        let past = usage(
+            Provider::Cursor,
+            vec![window(WindowKind::Auto, Some(80), Some(0))],
+        );
+        let drawn = &meters_for(&past, NOW)[0];
+        assert_eq!(drawn.label, "cm");
+        assert_eq!(drawn.number, "100%");
+        assert_eq!(drawn.countdown, "idle");
+        assert_eq!(past.windows[0].left_pct, Some(80));
+        assert_eq!(
+            alert_phrase(Provider::Cursor, WindowKind::Named),
+            "Cursor other models at 10 percent"
+        );
+        assert_eq!(
+            recovery_phrase(Provider::Cursor, WindowKind::Auto, true, 100),
+            "Cursor models allowance has reset"
+        );
+    }
+
+    #[test]
+    fn recovery_phrase_names_the_provider_the_low_alert_uses() {
+        assert_eq!(
+            recovery_phrase(Provider::Codex, WindowKind::FiveHour, true, 100),
+            "GPT five hour allowance has reset"
+        );
+        assert_eq!(
+            recovery_phrase(Provider::Codex, WindowKind::FiveHour, false, 40),
+            "GPT five hour allowance is back, 40 percent left"
+        );
+        assert_eq!(
+            recovery_phrase(Provider::Codex, WindowKind::FiveHour, false, 100),
+            "GPT five hour allowance is back, 100 percent left"
+        );
+    }
+
+    #[test]
     fn no_windows_shows_question_marks() {
         let u = usage(Provider::Claude, Vec::new());
         let ms = meters_for(&u, NOW);
@@ -761,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn narrow_panes_drop_labels_then_weekly_then_squares_then_number() {
+    fn narrow_panes_drop_squares_then_the_second_window_and_keep_labels() {
         let m = claude_pair();
         let at = |w: usize| fit_row(&m, w, true);
         let full = at(200).unwrap();
@@ -772,29 +897,32 @@ mod tests {
         );
         let width = row_width(&m, full);
         assert_eq!(width, 43);
-        let no_labels = at(width - 1).unwrap();
-        assert!(!no_labels.labels && no_labels.windows == 2 && no_labels.squares);
-        let w2 = row_width(&m, no_labels);
+        let no_squares = at(width - 1).unwrap();
+        assert!(no_squares.labels && no_squares.windows == 2 && !no_squares.squares);
+        assert_eq!(text(&m, no_squares), "5h 70% 3/h wk 80% 4/d");
+        let w2 = row_width(&m, no_squares);
         let one_window = at(w2 - 1).unwrap();
-        assert!(!one_window.labels && one_window.windows == 1 && one_window.squares);
-        assert_eq!(text(&m, one_window), "■■■■■■■■■■ 70% 3/h");
+        assert!(one_window.labels && one_window.windows == 1 && !one_window.squares);
+        assert_eq!(text(&m, one_window), "5h 70% 3/h");
         let w3 = row_width(&m, one_window);
-        let no_squares = at(w3 - 1).unwrap();
-        assert!(!no_squares.squares && no_squares.number && no_squares.countdown);
-        assert_eq!(text(&m, no_squares), "70% 3/h");
-        let w4 = row_width(&m, no_squares);
-        assert_eq!(w4, 7);
+        let no_number = at(w3 - 1).unwrap();
+        assert!(no_number.labels && !no_number.number && no_number.countdown);
+        assert_eq!(text(&m, no_number), "5h 3/h");
+        let w4 = row_width(&m, no_number);
         let only_countdown = at(w4 - 1).unwrap();
-        assert!(!only_countdown.number && only_countdown.countdown);
+        assert!(!only_countdown.labels && only_countdown.countdown);
         assert_eq!(text(&m, only_countdown), "3/h");
         assert_eq!(at(2), None);
     }
 
     #[test]
-    fn sidebar_rows_keep_labels_off_the_drop_list_until_needed() {
+    fn sidebar_rows_drop_squares_and_keep_the_label() {
         let m = vec![claude_pair().remove(0)];
-        assert_eq!(fit_row(&m, 21, true).map(|f| f.labels), Some(true));
-        assert_eq!(fit_row(&m, 20, true).map(|f| f.labels), Some(false));
+        let wide = fit_row(&m, 21, true).unwrap();
+        assert!(wide.labels && wide.squares);
+        let narrow = fit_row(&m, 20, true).unwrap();
+        assert!(narrow.labels && !narrow.squares);
+        assert_eq!(text(&m, narrow), "5h 70% 3/h");
     }
 
     fn sidebar_app(providers: usize, player_open: bool) -> AppState {

@@ -6,17 +6,40 @@ use std::{
     path::Path,
 };
 
+/// Same reset time means the same window. A pane that redraws old numbers must not
+/// lower the saved percentage, a later reset replaces the window, an earlier one is ignored.
+fn merge_window(old: &Value, new: &Value) -> Value {
+    let reset = |v: &Value| v.get("resets_at").and_then(Value::as_f64);
+    let used = |v: &Value| v.get("used_percentage").and_then(Value::as_f64);
+    match (reset(old), reset(new)) {
+        (Some(o), Some(n)) if n < o => old.clone(),
+        (Some(o), Some(n)) if n == o => match (used(old), used(new)) {
+            (Some(a), Some(b)) if a > b => old.clone(),
+            _ => new.clone(),
+        },
+        _ => new.clone(),
+    }
+}
 pub(super) fn save_newer(path: &Path, state: &Value) -> io::Result<()> {
     let _lock = crate::platform::usage::lock_statusline(path)?;
     let seen = state
         .get("seen_at")
         .and_then(Value::as_u64)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing seen_at"))?;
-    let old = read_json::<Value>(path)
-        .ok()
+    let saved = read_json::<Value>(path).ok();
+    let old = saved
+        .as_ref()
         .and_then(|v| v.get("seen_at").and_then(Value::as_u64));
     if old.is_none_or(|old| seen > old) {
-        atomic_json(path, state)?;
+        let mut next = state.clone();
+        if let Some(saved) = &saved {
+            for key in ["five_hour", "seven_day"] {
+                if let (Some(o), Some(n)) = (saved.get(key), state.get(key)) {
+                    next[key] = merge_window(o, n);
+                }
+            }
+        }
+        atomic_json(path, &next)?;
     }
     Ok(())
 }

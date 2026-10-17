@@ -667,13 +667,75 @@ impl App {
             .then_some(self.last_usage_refresh + USAGE_REFRESH_INTERVAL)
     }
 
-    /// The moment a countdown or a stale mark next changes on screen.
+    /// The moment a countdown, a stale mark, or a low window's reset next changes.
     pub(crate) fn sync_usage_redraw_deadline(&mut self) {
         let present = crate::ui::usage_bar::providers_present(&self.state);
-        self.usage_redraw_deadline = self.state.usage_snapshot.as_ref().and_then(|snapshot| {
-            crate::ui::usage_bar::next_change_secs(snapshot, &present, epoch_secs())
-                .map(|secs| Instant::now() + Duration::from_secs(secs))
-        });
+        let now = epoch_secs();
+        let mut next =
+            self.state.usage_snapshot.as_ref().and_then(|snapshot| {
+                crate::ui::usage_bar::next_change_secs(snapshot, &present, now)
+            });
+        if let Some(snapshot) = self.state.usage_snapshot.as_ref() {
+            let usage = self
+                .usage_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(secs) = usage.recovery_wake_secs(snapshot, now) {
+                next = Some(next.map_or(secs, |cur| cur.min(secs)));
+            }
+        }
+        self.usage_redraw_deadline = next.map(|secs| Instant::now() + Duration::from_secs(secs));
+    }
+
+    /// Speaks a recovery and, when `alert_pane` is set, types that line into
+    /// the named pane. A missing pane is skipped. `SPEAK=0` silences both.
+    pub(crate) fn announce_allowance_recoveries(&mut self) {
+        let Some(snapshot) = self.state.usage_snapshot.clone() else {
+            return;
+        };
+        let recoveries = {
+            let mut usage = self
+                .usage_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            usage.take_recoveries(&snapshot, epoch_secs())
+        };
+        if recoveries.is_empty() {
+            return;
+        }
+        let speak = usage_alerts_enabled(
+            self.state.usage_config.alerts && self.state.usage_config.alert_on_recovery,
+            std::env::var("SPEAK").ok().as_deref(),
+        );
+        let command = self.state.usage_config.alert_command.clone();
+        for recovery in recoveries {
+            let phrase = crate::ui::usage_bar::recovery_phrase(
+                recovery.provider,
+                recovery.kind,
+                recovery.reset,
+                recovery.left_pct,
+            );
+            if speak {
+                let command = command.clone();
+                let spoken = phrase.clone();
+                std::thread::spawn(move || speak_usage_alert(&command, &spoken));
+                self.ping_alert_pane(&phrase);
+            }
+        }
+    }
+
+    fn ping_alert_pane(&mut self, phrase: &str) {
+        let name = self.state.usage_config.alert_pane.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&name) else {
+            return;
+        };
+        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
+            return;
+        };
+        let _ = runtime.try_send_bytes(bytes::Bytes::from(format!("{phrase}\n")));
     }
 
     /// True when a countdown on screen has changed text, so a redraw is due.
@@ -684,6 +746,7 @@ impl App {
         {
             return false;
         }
+        self.announce_allowance_recoveries();
         self.sync_usage_redraw_deadline();
         true
     }
@@ -1181,6 +1244,7 @@ mod usage_refresh_tests {
             left_pct: Some(5),
             resets_at,
             note: None,
+            reset: false,
         };
         let usage = |provider, windows, problem| ProviderUsage {
             provider,
@@ -1723,5 +1787,41 @@ mod tests {
         app.sync_animation_timer(Instant::now());
 
         assert!(app.next_animation_tick.is_none());
+    }
+
+    #[tokio::test]
+    async fn alert_pane_ping_reaches_a_named_pane_and_skips_a_missing_one() {
+        let mut app = super::super::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let (runtime, mut sent) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        ws.tabs[0].runtimes.insert(pane_id, runtime);
+        app.state.workspaces.push(ws);
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .unwrap()
+            .clone();
+        let name = crate::pane_names::assigned_names(&app.state.terminals)
+            .remove(&terminal_id)
+            .unwrap();
+        let line = "GPT five hour allowance has reset";
+        app.ping_alert_pane(line);
+        assert!(sent.try_recv().is_err());
+        app.state.usage_config.alert_pane = "NoSuchPane".into();
+        app.ping_alert_pane(line);
+        assert!(sent.try_recv().is_err());
+        app.state.usage_config.alert_pane = name;
+        app.ping_alert_pane(line);
+        assert_eq!(
+            sent.try_recv().expect("named pane"),
+            bytes::Bytes::from(format!("{line}\n"))
+        );
     }
 }

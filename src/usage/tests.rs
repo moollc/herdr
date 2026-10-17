@@ -103,9 +103,21 @@ fn newest_line_wins_and_reset_is_idle() {
         &event("2026-10-14T14:00:00Z", json!(20), 9999999999),
     );
     let p = codex::read(&c.codex_home, 20);
-    assert_eq!(p.windows[0].left_pct, Some(100));
+    assert_eq!(p.windows[0].left_pct, Some(10));
+    assert!(p.windows[0].reset);
     assert_eq!(p.windows[0].resets_at, Some(10));
     assert_eq!(p.seen_at, timestamp("2026-10-14T15:00:00Z"));
+    let mut published = UsageSnapshot {
+        version: 1,
+        taken_at: 20,
+        providers: vec![p],
+    };
+    UsageState::new(config()).save_snapshot(&mut published);
+    assert_eq!(published.providers[0].windows[0].left_pct, Some(10));
+    assert!(published.providers[0].windows[0].reset);
+    let published_json = serde_json::to_value(&published).expect("json");
+    assert_eq!(published_json["providers"][0]["windows"][0]["left_pct"], 10);
+    assert_eq!(published_json["providers"][0]["windows"][0]["reset"], true);
 }
 #[test]
 fn codex_bounded_tail_widens_and_ignores_partial_lines() {
@@ -210,7 +222,8 @@ fn claude_optional_malformed_and_expired() {
         if value.get("five_hour").is_some() {
             assert_eq!(actual.problem, Some(UsageProblem::FormatChanged));
         } else if value.get("seven_day").is_some() {
-            assert_eq!(actual.windows[1].left_pct, Some(100));
+            assert_eq!(actual.windows[1].left_pct, Some(70));
+            assert!(actual.windows[1].reset);
             assert_eq!(actual.windows[0].left_pct, None);
         } else {
             assert_eq!(actual.problem, Some(UsageProblem::NoData));
@@ -246,28 +259,98 @@ fn statusline_keeps_newer_even_with_concurrent_writers() {
         .get("five_hour")
         .is_none());
 }
+fn stale_reading(c: &UsageConfig, seen: u64, key: &str, used: u64, resets: u64) {
+    statusline::save_newer(
+        &c.claude_state_file,
+        &json!({"seen_at": seen, key: {"used_percentage": used, "resets_at": resets}}),
+    )
+    .expect("save");
+}
+#[test]
+fn statusline_idle_pane_cannot_lower_a_window_and_resets_follow_resets_at() {
+    for key in ["five_hour", "seven_day"] {
+        let c = config();
+        let saved = || read_json::<Value>(&c.claude_state_file).expect("state");
+        stale_reading(&c, 10, key, 26, 2_000);
+        // idle pane: newer seen_at, older numbers, same window
+        stale_reading(&c, 20, key, 9, 2_000);
+        assert_eq!(saved()[key]["used_percentage"], 26);
+        assert_eq!(saved()["seen_at"], 20);
+        // a real increase in the same window is kept
+        stale_reading(&c, 30, key, 40, 2_000);
+        assert_eq!(saved()[key]["used_percentage"], 40);
+        // an earlier reset time is an old window and is ignored
+        stale_reading(&c, 40, key, 99, 1_000);
+        assert_eq!(saved()[key]["used_percentage"], 40);
+        assert_eq!(saved()[key]["resets_at"], 2_000);
+        // a later reset time is a real reset, even with a low number
+        stale_reading(&c, 50, key, 3, 9_000);
+        assert_eq!(saved()[key]["used_percentage"], 3);
+        assert_eq!(saved()[key]["resets_at"], 9_000);
+    }
+}
+#[test]
+fn statusline_run_keeps_the_fresh_reading_when_an_idle_pane_redraws() {
+    let c = config();
+    let mut out = Vec::new();
+    let input = |used: u64| {
+        format!(
+            r#"{{"rate_limits":{{"five_hour":{{"used_percentage":{used},"resets_at":2000000000}}}}}}"#
+        )
+    };
+    statusline::run(&c, input(26).as_bytes(), &mut out, 100).expect("fresh");
+    out.clear();
+    statusline::run(&c, input(9).as_bytes(), &mut out, 200).expect("idle");
+    let saved = read_json::<Value>(&c.claude_state_file).expect("state");
+    assert_eq!(saved["five_hour"]["used_percentage"], 26);
+}
 #[test]
 fn cursor_sample_missing_unlimited_and_idle() {
     let value: Value =
         serde_json::from_str(&sample("cursor-usage-summary.sample.json")).expect("sample");
     let p = cursor::parse(&value, 1);
     assert_eq!(p.problem, None);
+    assert_eq!(p.windows.len(), 2);
+    assert_eq!(p.windows[0].kind, WindowKind::Auto);
+    assert_eq!(p.windows[1].kind, WindowKind::Named);
     assert_eq!(p.windows[0].left_pct, Some(80));
+    assert_eq!(p.windows[1].left_pct, Some(99));
+    assert_eq!(p.windows[0].resets_at, p.windows[1].resets_at);
     assert!(p.windows[0]
         .note
         .as_ref()
         .expect("note")
         .contains("overall 82% left, auto 80% left, named 99% left"));
-    assert_eq!(
-        cursor::parse(&value, u64::MAX).windows[0].left_pct,
-        Some(100)
-    );
+    let idle = cursor::parse(&value, u64::MAX);
+    assert_eq!(idle.windows[0].left_pct, Some(80));
+    assert_eq!(idle.windows[1].left_pct, Some(99));
+    assert!(idle.windows[0].reset && idle.windows[1].reset);
+    let idle_json = serde_json::to_value(&idle).expect("json");
+    assert_eq!(idle_json["windows"][0]["left_pct"], 80);
+    assert_eq!(idle_json["windows"][0]["reset"], true);
+    assert_eq!(idle_json["windows"][0]["kind"], "auto");
+    assert_eq!(idle_json["windows"][1]["kind"], "named");
+    let mut published = UsageSnapshot {
+        version: 1,
+        taken_at: u64::MAX,
+        providers: vec![idle.clone()],
+    };
+    UsageState::new(config()).save_snapshot(&mut published);
+    assert_eq!(published.providers[0].windows[0].left_pct, Some(80));
+    assert_eq!(published.providers[0].windows[1].left_pct, Some(99));
+    assert!(published.providers[0].windows[0].reset);
+    let published_json = serde_json::to_value(&published).expect("json");
+    assert_eq!(published_json["providers"][0]["windows"][0]["left_pct"], 80);
+    assert_eq!(published_json["providers"][0]["windows"][0]["reset"], true);
     let mut single = value.clone();
     single["individualUsage"]["plan"]
         .as_object_mut()
         .expect("plan")
         .remove("autoPercentUsed");
-    assert_eq!(cursor::parse(&single, 1).windows[0].left_pct, Some(99));
+    let named_only = cursor::parse(&single, 1);
+    assert_eq!(named_only.windows[0].left_pct, None);
+    assert_eq!(named_only.windows[1].left_pct, Some(99));
+    assert_eq!(named_only.problem, None);
     single["individualUsage"]["plan"]
         .as_object_mut()
         .expect("plan")
@@ -283,6 +366,47 @@ fn cursor_sample_missing_unlimited_and_idle() {
         cursor::parse(&json!({"error":"not_authenticated"}), 1).problem,
         Some(UsageProblem::LoginExpired)
     );
+}
+#[test]
+fn cursor_pools_alert_and_recover_on_their_own() {
+    let mut value: Value =
+        serde_json::from_str(&sample("cursor-usage-summary.sample.json")).expect("sample");
+    let set = |value: &mut Value, auto: f64, named: f64| {
+        let plan = value["individualUsage"]["plan"].as_object_mut().unwrap();
+        plan.insert("autoPercentUsed".into(), json!(auto));
+        plan.insert("apiPercentUsed".into(), json!(named));
+    };
+    let snap = |provider: ProviderUsage, taken: u64| UsageSnapshot {
+        version: 1,
+        taken_at: taken,
+        providers: vec![provider],
+    };
+    set(&mut value, 92.0, 40.0);
+    let low = cursor::parse(&value, 1_000);
+    assert_eq!(low.windows[0].left_pct, Some(8));
+    assert_eq!(low.windows[1].left_pct, Some(60));
+    let mut state = UsageState::new(config());
+    assert_eq!(
+        state.take_alerts(&snap(low, 1_000)),
+        vec![(Provider::Cursor, WindowKind::Auto)]
+    );
+    set(&mut value, 20.0, 40.0);
+    let back = state.take_recoveries(&snap(cursor::parse(&value, 1_100), 1_100), 1_100);
+    assert_eq!(back.len(), 1);
+    assert_eq!(back[0].kind, WindowKind::Auto);
+    assert!(!back[0].reset);
+    assert_eq!(back[0].left_pct, 80);
+    set(&mut value, 10.0, 95.0);
+    let named_low = cursor::parse(&value, 1_200);
+    assert_eq!(named_low.windows[1].left_pct, Some(5));
+    assert_eq!(
+        state.take_alerts(&snap(named_low, 1_200)),
+        vec![(Provider::Cursor, WindowKind::Named)]
+    );
+    let spoken = state.take_recoveries(&snap(cursor::parse(&value, u64::MAX), u64::MAX), u64::MAX);
+    assert_eq!(spoken.len(), 1);
+    assert_eq!(spoken[0].kind, WindowKind::Named);
+    assert!(spoken[0].reset);
 }
 #[test]
 fn fixture_refresh_and_alert_jitter() {
@@ -312,6 +436,92 @@ fn fixture_refresh_and_alert_jitter() {
     assert_eq!(state.take_alerts(&snap).len(), 1);
     snap.taken_at = 24000;
     assert!(state.take_alerts(&snap).is_empty());
+}
+fn codex_window(left: u8, resets: u64, taken: u64) -> UsageSnapshot {
+    let mut provider = unknown(Provider::Codex, UsageProblem::NoData);
+    provider.problem = None;
+    provider.windows[0].left_pct = Some(left);
+    provider.windows[0].resets_at = Some(resets);
+    UsageSnapshot {
+        version: 1,
+        taken_at: taken,
+        providers: vec![provider],
+    }
+}
+#[test]
+fn recovery_fires_once_on_reset_and_not_for_a_window_that_was_never_low() {
+    let mut state = UsageState::new(config());
+    let never_low = codex_window(80, 5_000, 1);
+    assert!(state.take_recoveries(&never_low, 1).is_empty());
+    let already_reset = codex_window(5, 100, 500);
+    assert!(state.take_alerts(&already_reset).is_empty());
+    assert!(state.take_recoveries(&already_reset, 500).is_empty());
+
+    let low = codex_window(10, 5_000, 1);
+    assert_eq!(
+        state.take_alerts(&low),
+        vec![(Provider::Codex, WindowKind::FiveHour)]
+    );
+    assert!(state.take_recoveries(&low, 1).is_empty());
+    assert!(state.take_recoveries(&low, 4_999).is_empty());
+    assert_eq!(
+        state.recovery_wake_secs(&low, 1),
+        Some(5_000 + RESET_WAKE_MARGIN_SECS - 1)
+    );
+    let back = state.take_recoveries(&low, 5_000);
+    assert_eq!(
+        back,
+        vec![AllowanceRecovery {
+            provider: Provider::Codex,
+            kind: WindowKind::FiveHour,
+            left_pct: 100,
+            reset: true,
+        }]
+    );
+    assert!(state.take_recoveries(&low, 5_100).is_empty());
+    assert!(state.recovery_wake_secs(&low, 5_100).is_none());
+}
+#[test]
+fn recovery_fires_once_when_allowance_rises_above_the_threshold() {
+    let mut state = UsageState::new(config());
+    let low = codex_window(9, 9_000, 1);
+    assert_eq!(state.take_alerts(&low).len(), 1);
+    let rose = codex_window(40, 9_000, 2);
+    assert_eq!(
+        state.take_recoveries(&rose, 2),
+        vec![AllowanceRecovery {
+            provider: Provider::Codex,
+            kind: WindowKind::FiveHour,
+            left_pct: 40,
+            reset: false,
+        }]
+    );
+    assert!(state.take_recoveries(&rose, 3).is_empty());
+}
+#[test]
+fn recovery_wake_uses_the_margin_the_earliest_reset_and_skips_a_login_problem() {
+    let mut state = UsageState::new(config());
+    let mut snap = codex_window(10, 5_000, 1);
+    snap.providers[0].windows[1].left_pct = Some(8);
+    snap.providers[0].windows[1].resets_at = Some(8_000);
+    assert_eq!(state.take_alerts(&snap).len(), 2);
+    assert_eq!(
+        state.recovery_wake_secs(&snap, 1),
+        Some(5_000 + RESET_WAKE_MARGIN_SECS - 1)
+    );
+    assert_eq!(
+        state.recovery_wake_secs(&snap, 5_000 + RESET_WAKE_MARGIN_SECS),
+        Some(0)
+    );
+    snap.providers[0].problem = Some(UsageProblem::LoginExpired);
+    assert_eq!(state.recovery_wake_secs(&snap, 9_000), None);
+    assert_eq!(state.recovery_wake_secs(&snap, 9_001), None);
+    assert!(state.take_recoveries(&snap, 9_000).is_empty());
+    snap.providers[0].problem = None;
+    let back = state.take_recoveries(&snap, 9_000);
+    assert_eq!(back.len(), 2);
+    assert!(back.iter().all(|item| item.reset && item.left_pct == 100));
+    assert!(state.take_recoveries(&snap, 9_001).is_empty());
 }
 #[test]
 fn refresh_only_wanted_providers_and_snapshot() {
@@ -870,9 +1080,10 @@ fn cli_login_hints_follow_cursor_line() {
         cli::write_plain(&snapshot, 1000, &mut out).expect("print");
         let text = String::from_utf8(out).expect("utf8");
         let lines: Vec<_> = text.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("cursor monthly"));
-        assert_eq!(lines[1], hint);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("cursor auto"));
+        assert!(lines[1].starts_with("cursor named"));
+        assert_eq!(lines[2], hint);
     }
 }
 #[test]

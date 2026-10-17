@@ -253,6 +253,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # matching the current name-only titles. Turn them on from Settings → pane
 # labels, or here. Status is the agent's mark before its name: a spinner while
 # it works, a dot once it finishes, which a click turns into a check.
+# usage is off until you set it true.
 # [ui.pane_header]
 # status = true
 # agent_name = true
@@ -261,21 +262,25 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # parent_directory = false
 # git_branch = false
 # git_status = false
-# usage = true
+# usage = false
 
 # Allowance meters (five hour and weekly) for Claude, GPT and Cursor.
-# Each pane's header shows its own provider (usage in [ui.pane_header]); the
-# agent table has an Allowance column (table); the sidebar lists the providers
-# of the agents that are open. alerts speaks once per window at 10% left;
+# The sidebar lists the providers of the agents that are open (sidebar, on).
+# The agent table Allowance column (table) and each pane header
+# (usage in [ui.pane_header]) are off until you turn them on here or in
+# Settings → pane labels. alerts speaks once per window at 10% left;
 # SPEAK=0 in the environment silences it. `herdr view usage hide` turns the
 # table, the headers and the sidebar off together for the session.
 # [ui.usage]
-# table = true
+# table = false
 # sidebar = true
 # alerts = false
 # alert_command = "" # macOS say by default; whitespace-separated program and arguments
+# alert_on_recovery = true # with alerts on, speak once when a window resets or climbs back above 10% left
+# alert_pane = "" # also send that recovery line to this pane by name; empty sends nothing
 # cursor_login = false # enable with herdr usage cursor-login
-# claude_statusline = true # display only; usage is recorded even when off
+# claude_statusline = false # display only; set true to print meters; usage is recorded either way
+# cursor_pools = "both" # both or tighter; table and sidebar, labelled cm and om. A pane header always shows the tighter pool (cm or om)
 # codex_home = "~/.codex" # read first; $CODEX_HOME, ~/.codex and pane Codex homes are read too
 
 # Agent panel scope: "current" or "all". Toggling it in the sidebar saves this setting.

@@ -52,6 +52,10 @@ pub enum WindowKind {
     FiveHour,
     Weekly,
     Monthly,
+    /// Cursor's Auto pool. Shares the monthly reset with `Named`.
+    Auto,
+    /// Cursor's named-model pool (Grok, Claude, GPT and others picked by name).
+    Named,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +72,10 @@ pub struct UsageWindow {
     pub left_pct: Option<u8>,
     pub resets_at: Option<u64>,
     pub note: Option<String>,
+    /// The reset time had passed when this reading was stored. The percent is
+    /// the one the provider reported, not a filled-in 100.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reset: bool,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderUsage {
@@ -230,6 +238,21 @@ impl UsageState {
         homes
     }
 }
+
+/// How long after `resets_at` to wake, so the check is not early.
+pub(crate) const RESET_WAKE_MARGIN_SECS: u64 = 2;
+
+/// One recovery notice for a window that was low and is back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AllowanceRecovery {
+    pub(crate) provider: Provider,
+    pub(crate) kind: WindowKind,
+    /// Remaining allowance after a climb. Unused when `reset` is set.
+    pub(crate) left_pct: u8,
+    /// The reset time passed. The spoken line must not invent a percentage.
+    pub(crate) reset: bool,
+}
+
 impl UsageState {
     pub fn new(config: UsageConfig) -> Self {
         // Read the revision first so a concurrent login is noticed on refresh.
@@ -424,7 +447,7 @@ impl UsageState {
                 if window.left_pct.is_some()
                     && window.resets_at.is_some_and(|t| t <= snapshot.taken_at)
                 {
-                    window.left_pct = Some(100);
+                    window.reset = true;
                 }
             }
         }
@@ -570,10 +593,91 @@ impl UsageState {
         }
         out
     }
+
+    /// A window that was already spoken for, because it was at or under 10%
+    /// left, is back. Fires once when its reset time has passed or its
+    /// remaining allowance is above 10% again. A window that was never low is
+    /// not in the map, so startup does not speak. A climb keeps the provider's
+    /// remaining percent. A passed reset stores 100, matching the full bar,
+    /// and is marked `reset` so the spoken line does not say a percentage.
+    pub(crate) fn take_recoveries(
+        &mut self,
+        snapshot: &UsageSnapshot,
+        now: u64,
+    ) -> Vec<AllowanceRecovery> {
+        let keys: Vec<_> = self.alerts.keys().copied().collect();
+        let mut out = Vec::new();
+        for key in keys {
+            let Some(usage) = snapshot.providers.iter().find(|p| p.provider == key.0) else {
+                continue;
+            };
+            if provider_blocks_recovery(usage) {
+                continue;
+            }
+            let Some(window) = usage.windows.iter().find(|w| w.kind == key.1) else {
+                continue;
+            };
+            let reset_passed = window.resets_at.is_some_and(|at| at <= now);
+            let rose = window.left_pct.is_some_and(|left| left > 10);
+            if !(reset_passed || rose) {
+                continue;
+            }
+            self.alerts.remove(&key);
+            out.push(AllowanceRecovery {
+                provider: key.0,
+                kind: key.1,
+                left_pct: if reset_passed {
+                    100
+                } else {
+                    window.left_pct.unwrap_or(100)
+                },
+                reset: reset_passed,
+            });
+        }
+        out
+    }
+
+    /// Seconds until a low window should wake: its reset time plus a short
+    /// margin, so the wake is not early. `Some(0)` when that moment has passed.
+    /// A provider problem that `take_recoveries` skips does not wake, so a
+    /// passed reset does not return 0 on every call.
+    pub(crate) fn recovery_wake_secs(&self, snapshot: &UsageSnapshot, now: u64) -> Option<u64> {
+        let mut next: Option<u64> = None;
+        for &(provider, kind) in self.alerts.keys() {
+            let Some(usage) = snapshot.providers.iter().find(|p| p.provider == provider) else {
+                continue;
+            };
+            if provider_blocks_recovery(usage) {
+                continue;
+            }
+            let Some(window) = usage.windows.iter().find(|w| w.kind == kind) else {
+                continue;
+            };
+            let Some(at) = window.resets_at else {
+                continue;
+            };
+            let secs = at
+                .saturating_add(RESET_WAKE_MARGIN_SECS)
+                .saturating_sub(now);
+            next = Some(next.map_or(secs, |cur| cur.min(secs)));
+        }
+        next
+    }
+}
+fn provider_blocks_recovery(usage: &ProviderUsage) -> bool {
+    matches!(
+        usage.problem,
+        Some(
+            UsageProblem::NoLogin
+                | UsageProblem::LoginExpired
+                | UsageProblem::FormatChanged
+                | UsageProblem::NoData
+        )
+    )
 }
 pub(super) fn unknown(provider: Provider, problem: UsageProblem) -> ProviderUsage {
     let kinds: &[WindowKind] = if provider == Provider::Cursor {
-        &[WindowKind::Monthly]
+        &[WindowKind::Auto, WindowKind::Named]
     } else {
         &[WindowKind::FiveHour, WindowKind::Weekly]
     };
@@ -586,6 +690,7 @@ pub(super) fn unknown(provider: Provider, problem: UsageProblem) -> ProviderUsag
                 left_pct: None,
                 resets_at: None,
                 note: None,
+                reset: false,
             })
             .collect(),
         seen_at: None,
@@ -616,12 +721,13 @@ pub(super) fn window(
         left_pct: None,
         resets_at: None,
         note: None,
+        reset: false,
     };
     if let Some(v) = value {
         w.resets_at = Some(v.get("resets_at").and_then(Value::as_u64).ok_or(())?);
         w.left_pct = Some(percent(v.get(field).ok_or(())?).ok_or(())?);
         if w.resets_at.is_some_and(|t| t <= now) {
-            w.left_pct = Some(100);
+            w.reset = true;
         }
     }
     Ok(w)
