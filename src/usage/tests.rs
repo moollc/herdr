@@ -304,6 +304,84 @@ fn statusline_run_keeps_the_fresh_reading_when_an_idle_pane_redraws() {
     let saved = read_json::<Value>(&c.claude_state_file).expect("state");
     assert_eq!(saved["five_hour"]["used_percentage"], 26);
 }
+fn session_reading(
+    c: &UsageConfig,
+    seen: u64,
+    who: (&str, u64),
+    key: &str,
+    used: u64,
+    resets: u64,
+) {
+    statusline::save_newer(
+        &c.claude_state_file,
+        &json!({
+            "seen_at": seen,
+            "session": {"id": who.0, "marker": who.1},
+            key: {"used_percentage": used, "resets_at": resets}
+        }),
+    )
+    .expect("save");
+}
+#[test]
+fn statusline_a_new_response_can_lower_a_window_but_a_redraw_cannot() {
+    for key in ["five_hour", "seven_day"] {
+        let c = config();
+        let saved = || read_json::<Value>(&c.claude_state_file).expect("state");
+        let used = || saved()[key]["used_percentage"].clone();
+        // first sight of two sessions: nothing known, numbers can only go up
+        session_reading(&c, 10, ("a", 100), key, 100, 2_000);
+        session_reading(&c, 11, ("b", 50), key, 60, 2_000);
+        assert_eq!(used(), 100);
+        // session a answers again, so its reading is new: a manual full reset shows
+        session_reading(&c, 20, ("a", 200), key, 0, 2_000);
+        assert_eq!(used(), 0);
+        assert_eq!(saved()[key]["resets_at"], 2_000);
+        // session b only redraws the response it had (same marker): ignored
+        session_reading(&c, 30, ("b", 50), key, 100, 2_000);
+        assert_eq!(used(), 0);
+        // session a redraws its last response: ignored too
+        session_reading(&c, 40, ("a", 200), key, 55, 2_000);
+        assert_eq!(used(), 0);
+        // a new response from b is accepted, also when higher
+        session_reading(&c, 50, ("b", 90), key, 7, 2_000);
+        assert_eq!(used(), 7);
+        // an earlier reset time is ignored even for a new response; a later one replaces
+        session_reading(&c, 60, ("a", 300), key, 80, 1_000);
+        assert_eq!(used(), 7);
+        session_reading(&c, 70, ("a", 400), key, 2, 9_000);
+        assert_eq!(used(), 2);
+        assert_eq!(saved()[key]["resets_at"], 9_000);
+        // the markers are remembered even when the numbers were ignored
+        assert_eq!(saved()["sessions"]["a"]["marker"], 400);
+        assert_eq!(saved()["sessions"]["b"]["marker"], 90);
+        assert!(saved().get("session").is_none());
+    }
+}
+#[test]
+fn statusline_run_reads_the_session_and_api_time_from_the_input() {
+    let c = config();
+    let mut out = Vec::new();
+    let input = |used: u64, api_ms: u64| {
+        format!(
+            r#"{{"session_id":"s1","cost":{{"total_api_duration_ms":{api_ms}}},"rate_limits":{{"seven_day":{{"used_percentage":{used},"resets_at":2000000000}}}}}}"#
+        )
+    };
+    let used = || {
+        read_json::<Value>(&c.claude_state_file).expect("state")["seven_day"]["used_percentage"]
+            .clone()
+    };
+    statusline::run(&c, input(100, 5_000).as_bytes(), &mut out, 100).expect("first");
+    // an idle redraw with a lower number and a newer time changes nothing
+    statusline::run(&c, input(9, 5_000).as_bytes(), &mut out, 200).expect("idle");
+    assert_eq!(used(), 100);
+    // after the first call the session is known, so a new response shows a real drop
+    statusline::run(&c, input(0, 9_000).as_bytes(), &mut out, 300).expect("reset");
+    assert_eq!(used(), 0);
+    assert_eq!(
+        read_json::<Value>(&c.claude_state_file).expect("state")["sessions"]["s1"]["marker"],
+        9_000
+    );
+}
 #[test]
 fn cursor_sample_missing_unlimited_and_idle() {
     let value: Value =

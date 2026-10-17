@@ -6,15 +6,34 @@ use std::{
     path::Path,
 };
 
-/// Same reset time means the same window. A pane that redraws old numbers must not
-/// lower the saved percentage, a later reset replaces the window, an earlier one is ignored.
-fn merge_window(old: &Value, new: &Value) -> Value {
+/// How the numbers in one status line call relate to this session's last call.
+/// Claude Code sends the rate limits of the session's last API response, and
+/// redraws them unchanged while idle. `cost.total_api_duration_ms` only grows when
+/// a new response arrives, so it tells a new response from a redraw.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// A new response since this session was last seen: authoritative.
+    Fresh,
+    /// The same response redrawn: older than what is saved.
+    Stale,
+    /// A session or marker not seen before: cannot tell, so it can only raise.
+    Unknown,
+}
+const MAX_SESSIONS: usize = 32;
+
+/// Same reset time means the same window. An earlier reset time is an old window and
+/// is ignored, a later one replaces the window. In the same window a fresh reading
+/// replaces the saved one even when lower (a manual reset), a stale one changes
+/// nothing, and an unknown one never lowers it.
+fn merge_window(old: &Value, new: &Value, reading: Reading) -> Value {
     let reset = |v: &Value| v.get("resets_at").and_then(Value::as_f64);
     let used = |v: &Value| v.get("used_percentage").and_then(Value::as_f64);
     match (reset(old), reset(new)) {
         (Some(o), Some(n)) if n < o => old.clone(),
-        (Some(o), Some(n)) if n == o => match (used(old), used(new)) {
-            (Some(a), Some(b)) if a > b => old.clone(),
+        (Some(o), Some(n)) if n == o => match (reading, used(old), used(new)) {
+            (Reading::Fresh, _, _) => new.clone(),
+            (Reading::Stale, _, _) => old.clone(),
+            (Reading::Unknown, Some(a), Some(b)) if a > b => old.clone(),
             _ => new.clone(),
         },
         _ => new.clone(),
@@ -30,15 +49,58 @@ pub(super) fn save_newer(path: &Path, state: &Value) -> io::Result<()> {
     let old = saved
         .as_ref()
         .and_then(|v| v.get("seen_at").and_then(Value::as_u64));
-    if old.is_none_or(|old| seen > old) {
-        let mut next = state.clone();
-        if let Some(saved) = &saved {
-            for key in ["five_hour", "seven_day"] {
-                if let (Some(o), Some(n)) = (saved.get(key), state.get(key)) {
-                    next[key] = merge_window(o, n);
+    // Remember each session's last marker, even when its numbers are not saved.
+    let mut sessions = saved
+        .as_ref()
+        .and_then(|v| v.get("sessions"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let mut reading = Reading::Unknown;
+    if let (Some(id), Some(marker)) = (
+        state.pointer("/session/id").and_then(Value::as_str),
+        state.pointer("/session/marker").and_then(Value::as_u64),
+    ) {
+        let before = sessions
+            .get(id)
+            .and_then(|v| v.get("marker"))
+            .and_then(Value::as_u64);
+        reading = match before {
+            Some(b) if marker > b => Reading::Fresh,
+            Some(b) if marker == b => Reading::Stale,
+            _ => Reading::Unknown,
+        };
+        sessions.insert(id.to_string(), json!({"marker": marker, "seen_at": seen}));
+        while sessions.len() > MAX_SESSIONS {
+            let oldest = sessions
+                .iter()
+                .min_by_key(|(_, v)| v.get("seen_at").and_then(Value::as_u64).unwrap_or(0))
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(key) => sessions.remove(&key),
+                None => break,
+            };
+        }
+    }
+    let mut next = match (&saved, old.is_none_or(|old| seen > old)) {
+        (Some(saved), false) => saved.clone(),
+        _ => {
+            let mut next = state.clone();
+            if let Some(saved) = &saved {
+                for key in ["five_hour", "seven_day"] {
+                    if let (Some(o), Some(n)) = (saved.get(key), state.get(key)) {
+                        next[key] = merge_window(o, n, reading);
+                    }
                 }
             }
+            next
         }
+    };
+    next.as_object_mut().map(|object| object.remove("session"));
+    if !sessions.is_empty() {
+        next["sessions"] = Value::Object(sessions);
+    }
+    if saved.as_ref() != Some(&next) {
         atomic_json(path, &next)?;
     }
     Ok(())
@@ -59,6 +121,15 @@ pub fn run(
                 if let Some(v) = object.get(key) {
                     state[key] = v.clone();
                 }
+            }
+            // The session and its API time tell a new response from a redraw.
+            if let (Some(id), Some(marker)) = (
+                value.get("session_id").and_then(Value::as_str),
+                value
+                    .pointer("/cost/total_api_duration_ms")
+                    .and_then(Value::as_u64),
+            ) {
+                state["session"] = json!({"id": id, "marker": marker});
             }
             save_newer(&config.claude_state_file, &state)?;
         }
