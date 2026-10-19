@@ -289,7 +289,15 @@ impl App {
             return false;
         }
 
-        let Some(resume_command) = shell_command_from_argv(&plan.argv) else {
+        // The plan is stored unpinned; the pin in force now decides the flags.
+        let pinned_argv = crate::agent_model::apply_pin_to_argv(
+            &plan.argv,
+            self.state
+                .terminals
+                .get(&terminal_id)
+                .and_then(|terminal| terminal.model_pin.as_ref()),
+        );
+        let Some(resume_command) = shell_command_from_argv(&pinned_argv) else {
             tracing::warn!(
                 pane = pane_id.raw(),
                 terminal = %terminal_id,
@@ -398,7 +406,7 @@ fn stable_terminal_inner_rect(pane_inner: Rect) -> Rect {
     )
 }
 
-fn shell_command_from_argv(argv: &[String]) -> Option<String> {
+pub(super) fn shell_command_from_argv(argv: &[String]) -> Option<String> {
     let mut parts = argv.iter();
     let first = shell_quote(parts.next()?);
     let mut command = first;

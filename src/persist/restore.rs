@@ -635,19 +635,22 @@ fn restore_pane(
         .filter(|saved_id| used_terminal_ids.insert(saved_id.clone()))
         .unwrap_or_else(TerminalId::alloc);
     let saved_label = saved_pane.and_then(|p| p.label.clone());
+    let saved_model_pin = saved_pane.and_then(|p| p.model_pin.clone());
     let saved_agent_name = saved_pane.and_then(|p| p.agent_name.clone());
     let saved_title_name = saved_pane.and_then(|p| p.title_name.clone());
     let saved_summary = saved_pane.and_then(|p| p.summary.clone());
     let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
     let saved_agent_timing = saved_pane.and_then(|p| p.agent_timing.as_ref());
     let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
-    let startup = {
+    let mut startup = {
         let mut agent_restore = AgentRestoreState {
             enabled: runtime_context.resume_agents_on_restore,
             resumed_sessions: resumed_agent_sessions,
         };
         pane_restore_startup(saved_agent_session, saved_history, &mut agent_restore)
     };
+    // The plan stays unpinned. The pin is applied at the moment of launch, so
+    // clearing a pin while the resume waits leaves nothing to undo.
     let initial_restore_agent = startup
         .restore_plan
         .as_ref()
@@ -677,6 +680,7 @@ fn restore_pane(
         if let Some(label) = saved_label {
             terminal.set_manual_label(label);
         }
+        terminal.model_pin = saved_model_pin;
         if let Some(agent_name) = saved_agent_name {
             terminal.set_agent_name(agent_name);
         }
@@ -720,7 +724,11 @@ fn restore_pane(
         && saved_launch_argv
             .as_ref()
             .is_some_and(|argv| !argv.is_empty());
+    // The saved command stays unpinned; only the spawned argv carries the pin.
     let restart_argv = restart_argv(saved_launch_argv.as_deref(), restarted_saved_command);
+    let spawn_argv = restart_argv
+        .as_ref()
+        .map(|argv| crate::agent_model::apply_pin_to_argv(argv, saved_model_pin.as_ref()));
     let runtime_result = if let Some(imported) = imported_runtime {
         TerminalRuntime::from_handoff_fd(
             crate::handoff_runtime::ImportedHandoffRuntime {
@@ -739,7 +747,7 @@ fn restore_pane(
             rows,
             cols,
             cwd.clone(),
-            restart_argv.as_deref().unwrap_or_default(),
+            spawn_argv.as_deref().unwrap_or_default(),
             runtime_context.scrollback_limit_bytes,
             crate::terminal_theme::TerminalTheme::default(),
             runtime_context.events.clone(),
@@ -802,6 +810,7 @@ fn restore_pane(
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
+            terminal.model_pin = saved_model_pin;
             if let Some(agent_name) = saved_agent_name {
                 terminal.set_agent_name(agent_name);
             }
@@ -1328,6 +1337,7 @@ mod tests {
                     seen: true,
                     completed: false,
                     agent_timing: None,
+                    model_pin: None,
                     title_name: None,
                     summary: None,
                 },
@@ -1394,6 +1404,7 @@ mod tests {
                     seen: true,
                     completed: false,
                     agent_timing: None,
+                    model_pin: None,
                     title_name: None,
                     summary: None,
                 },
@@ -1475,6 +1486,7 @@ mod tests {
                             seen: true,
                             completed: false,
                             agent_timing: None,
+                            model_pin: None,
                             title_name: None,
                             summary: None,
                         },
@@ -1545,6 +1557,7 @@ mod tests {
                 seen,
                 completed,
                 agent_timing: None,
+                model_pin: None,
                 title_name: None,
                 summary: None,
             }
@@ -1683,6 +1696,7 @@ mod tests {
                             seen: true,
                             completed: false,
                             agent_timing: None,
+                            model_pin: None,
                             title_name: None,
                             summary: None,
                         },
@@ -1733,6 +1747,186 @@ mod tests {
         assert_eq!(session.session_ref.value, "opencode-session");
     }
 
+    #[cfg(unix)]
+    fn codex_pin_snapshot(pin: Option<crate::agent_model::ModelPin>) -> SessionSnapshot {
+        let cwd = std::env::current_dir().unwrap();
+        SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                purpose: None,
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                agent_order: Vec::new(),
+                tabs: vec![TabSnapshot {
+                    goal: None,
+                    layout_preview_hidden: false,
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            terminal_id: None,
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                                source: "herdr:codex".into(),
+                                agent: "codex".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Id,
+                                value: "codex-session".into(),
+                            }),
+                            launch_argv: None,
+                            orientation: crate::agent_orientation::OrientationState::Suppressed,
+                            orientation_offer: None,
+                            seen: true,
+                            completed: false,
+                            agent_timing: None,
+                            model_pin: pin,
+                            title_name: None,
+                            summary: None,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            composer_agent: None,
+            agent_order: Vec::new(),
+            detached_agents: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn restored_codex_terminal(snapshot: &SessionSnapshot) -> crate::terminal::TerminalState {
+        let (events, _event_rx) = mpsc::channel(4);
+        let (_workspaces, terminals, _runtimes, _detached) = restore(
+            snapshot,
+            None,
+            24,
+            80,
+            0,
+            "/bin/sh",
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        terminals.into_values().next().expect("terminal restored")
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn restore_resumes_a_pinned_pane_on_its_pinned_model() {
+        let pin = crate::agent_model::ModelPin::new("gpt-6.1-sol", Some("medium")).unwrap();
+        let terminal = restored_codex_terminal(&codex_pin_snapshot(Some(pin.clone())));
+        assert_eq!(terminal.model_pin.as_ref(), Some(&pin));
+        // The waiting plan stays unpinned; the pin is applied at launch.
+        let plan_argv = terminal.pending_agent_resume_plan.unwrap().argv;
+        assert_eq!(plan_argv, ["codex", "resume", "codex-session"]);
+        assert_eq!(
+            crate::agent_model::apply_pin_to_argv(&plan_argv, terminal.model_pin.as_ref()),
+            [
+                "codex",
+                "-m",
+                "gpt-6.1-sol",
+                "-c",
+                "model_reasoning_effort=medium",
+                "resume",
+                "codex-session"
+            ]
+        );
+        // Cleared while the resume waits: the launch carries no pin flags.
+        assert_eq!(
+            crate::agent_model::apply_pin_to_argv(&plan_argv, None),
+            ["codex", "resume", "codex-session"]
+        );
+    }
+
+    #[tokio::test]
+    async fn restoring_a_pinned_saved_command_keeps_the_saved_command_unpinned() {
+        let cwd = std::env::current_dir().unwrap();
+        let terminal_id = TerminalId::alloc();
+        let launch_argv: Vec<String> = vec!["/bin/sleep".into(), "30".into()];
+        let pin = crate::agent_model::ModelPin::new("some-model", None)
+            .and_then(|pin| pin.with_launch(Some("/bin/sleep"), &["--pinned-flag".to_string()]))
+            .unwrap();
+        // The pin changes what is launched.
+        assert_ne!(
+            crate::agent_model::apply_pin_to_argv(&launch_argv, Some(&pin)),
+            launch_argv
+        );
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: Vec::new(),
+            active: None,
+            selected: 0,
+            composer_agent: None,
+            agent_order: Vec::new(),
+            detached_agents: vec![super::super::snapshot::DetachedAgentSnapshot {
+                pane_id: 7,
+                pane: super::super::snapshot::PaneSnapshot {
+                    terminal_id: Some(terminal_id.clone()),
+                    cwd,
+                    label: None,
+                    agent_name: None,
+                    agent_session: None,
+                    launch_argv: Some(launch_argv.clone()),
+                    orientation: crate::agent_orientation::OrientationState::Pending,
+                    orientation_offer: None,
+                    seen: true,
+                    completed: false,
+                    agent_timing: None,
+                    model_pin: Some(pin.clone()),
+                    title_name: None,
+                    summary: None,
+                },
+                seen: true,
+                completed: false,
+            }],
+            ..Default::default()
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+        let (_workspaces, terminals, runtimes, _detached) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            "/usr/bin/true",
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        // What the next snapshot will save is the unpinned command, so a
+        // later --clear plus a restart launches without the pin.
+        assert_eq!(terminals[&terminal_id].launch_argv, Some(launch_argv));
+        assert_eq!(terminals[&terminal_id].model_pin, Some(pin));
+        for runtime in runtimes.into_values() {
+            runtime.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn restore_without_a_pin_resumes_unchanged() {
+        let terminal = restored_codex_terminal(&codex_pin_snapshot(None));
+        assert!(terminal.model_pin.is_none());
+        assert_eq!(
+            terminal.pending_agent_resume_plan.unwrap().argv,
+            ["codex", "resume", "codex-session"]
+        );
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn native_agent_restore_defers_runtime_launch() {
@@ -1770,6 +1964,7 @@ mod tests {
                             seen: true,
                             completed: false,
                             agent_timing: None,
+                            model_pin: None,
                             title_name: None,
                             summary: None,
                         },
@@ -1945,6 +2140,7 @@ mod tests {
                 seen: true,
                 completed: false,
                 agent_timing: None,
+                model_pin: None,
                 title_name: None,
                 summary: None,
             },
@@ -2011,6 +2207,7 @@ mod tests {
             seen: true,
             completed: false,
             agent_timing: None,
+            model_pin: None,
             title_name: None,
             summary: None,
         };

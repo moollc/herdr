@@ -2,10 +2,10 @@ use bytes::Bytes;
 
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, PaneAckOrientationParams, PaneClearAgentAuthorityParams,
-    PaneListParams, PaneReadParams, PaneReadResult, PaneReleaseAgentParams, PaneRenameParams,
-    PaneReportAgentParams, PaneReportAgentSessionParams, PaneReportMetadataParams,
-    PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneTarget,
-    ReadFormat, ReadSource, ResponseResult,
+    PaneListParams, PanePinModelParams, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
+    PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
+    PaneReportMetadataParams, PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams,
+    PaneSplitParams, PaneTarget, ReadFormat, ReadSource, ResponseResult,
 };
 use crate::app::{App, Mode};
 
@@ -122,6 +122,61 @@ impl App {
             _ => terminal.clear_manual_label(),
         }
         self.state.mark_session_dirty();
+        let pane = self.pane_info(ws_idx, pane_id).unwrap();
+
+        encode_success(id, ResponseResult::PaneInfo { pane })
+    }
+
+    pub(super) fn handle_pane_pin_model(
+        &mut self,
+        id: String,
+        params: PanePinModelParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let pin = match params.model.as_deref() {
+            None => {
+                if params.effort.is_some() || params.launcher.is_some() || !params.args.is_empty() {
+                    return encode_error(
+                        id,
+                        "invalid_model_pin",
+                        "an effort, launcher or flags need a model".to_string(),
+                    );
+                }
+                None
+            }
+            Some(model) => match crate::agent_model::ModelPin::new(model, params.effort.as_deref())
+                .and_then(|pin| pin.with_launch(params.launcher.as_deref(), &params.args))
+            {
+                Some(pin) => Some(pin),
+                None => {
+                    return encode_error(
+                        id,
+                        "invalid_model_pin",
+                        "model must not be empty".to_string(),
+                    )
+                }
+            },
+        };
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.terminal_id(pane_id))
+            .cloned()
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        // A waiting resume and a saved launch command stay unpinned; the pin
+        // is applied when they launch, so setting or clearing it needs no
+        // rewrite here.
+        terminal.model_pin = pin;
+        self.state.mark_session_dirty();
+        self.schedule_session_save();
         let pane = self.pane_info(ws_idx, pane_id).unwrap();
 
         encode_success(id, ResponseResult::PaneInfo { pane })

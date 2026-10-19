@@ -6,6 +6,7 @@
 
 pub(crate) mod actions;
 mod agent_orientation;
+mod agent_restart;
 mod agent_resume;
 mod agents;
 mod api;
@@ -65,6 +66,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::events::AppEvent;
 
+pub use agent_restart::AgentRestart;
 pub use state::{AppState, Mode, ToastKind, ViewState};
 
 /// Full application: AppState + runtime concerns (event channels, async I/O).
@@ -3437,6 +3439,213 @@ mod tests {
             .unwrap()
             .manual_label
             .is_none());
+    }
+
+    #[test]
+    fn pane_pin_model_request_sets_reports_and_clears_the_pin() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-pane-pin-model");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let pin = |model: Option<&str>, effort: Option<&str>| crate::api::schema::Request {
+            id: "req_pin".into(),
+            method: crate::api::schema::Method::PanePinModel(
+                crate::api::schema::PanePinModelParams {
+                    pane_id: pane_id.clone(),
+                    model: model.map(str::to_string),
+                    effort: effort.map(str::to_string),
+                    launcher: None,
+                    args: Vec::new(),
+                },
+            ),
+        };
+
+        // A waiting resume is never rewritten by a pin or a clear; the pin is
+        // applied only when it launches.
+        let waiting_argv: Vec<String> = ["codex", "resume", "waiting-session"]
+            .map(String::from)
+            .to_vec();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            agent: "codex".into(),
+            argv: waiting_argv.clone(),
+            dedupe_key: "herdr:codex\0codex\0Id\0waiting-session".into(),
+        });
+
+        // Unpinned: model_ok is null (absent).
+        let info = app.pane_info(0, pane).unwrap();
+        assert!(info.model_pin.is_none() && info.model_ok.is_none());
+
+        // Pinned, nothing detected yet: model_ok stays null.
+        let response = app.handle_api_request(pin(Some("gpt-6.1-sol"), Some("medium")));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "pane_info");
+        assert_eq!(response["result"]["pane"]["model_pin"], "gpt-6.1-sol");
+        assert_eq!(response["result"]["pane"]["effort_pin"], "medium");
+        assert!(response["result"]["pane"].get("model_ok").is_none());
+
+        // Detected model matches, then drifts.
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .model_info = Some(crate::agent_model::AgentModelInfo {
+            model: "gpt-6.1-sol".into(),
+            effort: Some("medium".into()),
+        });
+        let info = app.pane_info(0, pane).unwrap();
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(info.effort.as_deref(), Some("medium"));
+        assert_eq!(info.model_ok, Some(true));
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .model_info = Some(crate::agent_model::AgentModelInfo {
+            model: "gpt-6.1-luna".into(),
+            effort: Some("high".into()),
+        });
+        assert_eq!(app.pane_info(0, pane).unwrap().model_ok, Some(false));
+
+        // The pin is saved with the pane and comes back from the snapshot.
+        let saved =
+            serde_json::to_string(&crate::persist::capture(&app.state, &app.terminal_runtimes))
+                .unwrap();
+        assert!(saved.contains("gpt-6.1-sol"), "pin missing from snapshot");
+
+        // Clearing removes it; an effort without a model is refused.
+        let response = app.handle_api_request(pin(None, None));
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["type"], "pane_info");
+        assert!(response["result"]["pane"].get("model_pin").is_none());
+        assert!(response["result"]["pane"].get("model_ok").is_none());
+        assert!(app.state.terminals[&terminal_id].model_pin.is_none());
+        assert_eq!(
+            app.state.terminals[&terminal_id]
+                .pending_agent_resume_plan
+                .as_ref()
+                .map(|plan| plan.argv.clone()),
+            Some(waiting_argv),
+            "set and clear leave the waiting resume unpinned"
+        );
+        let response = app.handle_api_request(pin(None, Some("high")));
+        assert!(response.contains("invalid_model_pin"));
+        let response = app.handle_api_request(pin(Some("  "), None));
+        assert!(response.contains("invalid_model_pin"));
+    }
+
+    fn restart_fixture() -> (App, String, crate::terminal::TerminalId) {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("api-restart-agent");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let pane_id = app.pane_info(0, pane).unwrap().pane_id;
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        (app, pane_id, terminal_id)
+    }
+
+    fn api_call(app: &mut App, method: crate::api::schema::Method) -> serde_json::Value {
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "req".into(),
+            method,
+        });
+        serde_json::from_str(&response).unwrap()
+    }
+
+    fn pin_with_launcher(app: &mut App, pane_id: &str, launcher: Option<&str>) {
+        let response = api_call(
+            app,
+            crate::api::schema::Method::PanePinModel(crate::api::schema::PanePinModelParams {
+                pane_id: pane_id.into(),
+                model: Some("gpt-6.1-sol".into()),
+                effort: Some("medium".into()),
+                launcher: launcher.map(str::to_string),
+                args: vec!["--extra-flag".into()],
+            }),
+        );
+        assert_eq!(response["result"]["type"], "pane_info");
+    }
+
+    fn restart_call(app: &mut App, pane_id: &str) -> serde_json::Value {
+        api_call(
+            app,
+            crate::api::schema::Method::PaneRestartAgent(crate::api::schema::PaneTarget {
+                pane_id: pane_id.into(),
+            }),
+        )
+    }
+
+    #[test]
+    fn restart_agent_refuses_without_a_pin_or_launcher_or_while_busy() {
+        let (mut app, pane_id, terminal_id) = restart_fixture();
+        assert_eq!(
+            restart_call(&mut app, &pane_id)["error"]["code"],
+            "no_model_pin"
+        );
+
+        pin_with_launcher(&mut app, &pane_id, None);
+        assert_eq!(
+            restart_call(&mut app, &pane_id)["error"]["code"],
+            "no_launcher"
+        );
+
+        pin_with_launcher(&mut app, &pane_id, Some("codex-gpt"));
+        for busy in [
+            crate::detect::AgentState::Working,
+            crate::detect::AgentState::Blocked,
+        ] {
+            app.state.terminals.get_mut(&terminal_id).unwrap().state = busy;
+            assert_eq!(
+                restart_call(&mut app, &pane_id)["error"]["code"],
+                "agent_busy"
+            );
+        }
+        assert!(app.state.terminals[&terminal_id].pending_restart.is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_agent_types_the_pinned_launch_once_the_shell_is_free() {
+        let (mut app, pane_id, terminal_id) = restart_fixture();
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        pin_with_launcher(&mut app, &pane_id, Some("codex-gpt"));
+
+        let response = restart_call(&mut app, &pane_id);
+        assert_eq!(response["result"]["type"], "pane_info");
+        assert!(app.state.terminals[&terminal_id].pending_restart.is_some());
+
+        // The shell has to stay free for a moment before the command goes in.
+        let now = Instant::now();
+        assert!(!app.advance_agent_restarts(now));
+        assert!(rx.try_recv().is_err());
+        assert!(app.advance_agent_restarts(now + Duration::from_secs(1)));
+        let typed = rx.try_recv().expect("launch command typed");
+        assert_eq!(
+            String::from_utf8_lossy(&typed),
+            "codex-gpt -m gpt-6.1-sol -c model_reasoning_effort=medium --extra-flag\r"
+        );
+        let terminal = &app.state.terminals[&terminal_id];
+        assert!(terminal.pending_restart.is_none());
+        assert!(terminal.model_pin.is_some(), "the pin outlives the restart");
     }
 
     #[test]

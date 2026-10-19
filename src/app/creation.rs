@@ -341,6 +341,29 @@ impl App {
             custom_status: presentation.custom_status,
             state_labels: presentation.state_labels,
             agent_session: terminal_agent_session_info(terminal),
+            model: terminal.model_info.as_ref().map(|info| info.model.clone()),
+            effort: terminal
+                .model_info
+                .as_ref()
+                .and_then(|info| info.effort.clone()),
+            model_pin: terminal.model_pin.as_ref().map(|pin| pin.model.clone()),
+            effort_pin: terminal
+                .model_pin
+                .as_ref()
+                .and_then(|pin| pin.effort.clone()),
+            launcher_pin: terminal
+                .model_pin
+                .as_ref()
+                .and_then(|pin| pin.launcher.clone()),
+            args_pin: terminal
+                .model_pin
+                .as_ref()
+                .map(|pin| pin.args.clone())
+                .unwrap_or_default(),
+            model_ok: crate::agent_model::model_ok(
+                terminal.model_info.as_ref(),
+                terminal.model_pin.as_ref(),
+            ),
             revision: terminal.revision,
         })
     }

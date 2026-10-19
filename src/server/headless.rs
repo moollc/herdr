@@ -3056,6 +3056,7 @@ impl HeadlessServer {
                 .app
                 .start_pending_agent_resumes(self.app.pending_agent_resume_due(now));
         }
+        changed |= self.app.advance_agent_restarts(now);
         self.app.sync_headless_animation_timer(now);
         changed
     }

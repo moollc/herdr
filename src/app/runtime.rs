@@ -345,6 +345,7 @@ impl App {
             self.sync_pending_agent_resume_deadline(now);
             changed |= self.start_pending_agent_resumes(self.pending_agent_resume_due(now));
         }
+        changed |= self.advance_agent_restarts(now);
         self.sync_animation_timer(now);
         changed
     }
@@ -943,6 +944,7 @@ impl App {
             self.next_auto_update_check,
             self.agent_metadata_deadline,
             self.pending_agent_resume_deadline,
+            self.agent_restart_deadline(),
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
             self.selection_highlight_clear_deadline,

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 mod agents;
 mod integrations;
 mod panes;
-mod responses;
+pub(super) mod responses;
 mod tabs;
 mod view;
 mod workspaces;
@@ -723,6 +723,10 @@ impl App {
             Method::PaneList(params) => return self.handle_pane_list(request.id, params),
             Method::PaneGet(target) => return self.handle_pane_get(request.id, target),
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
+            Method::PanePinModel(params) => return self.handle_pane_pin_model(request.id, params),
+            Method::PaneRestartAgent(target) => {
+                return self.handle_pane_restart_agent(request.id, target);
+            }
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
             Method::PaneReportAgent(params) => {
                 return self.handle_pane_report_agent(request.id, params);

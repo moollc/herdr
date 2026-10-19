@@ -1148,6 +1148,173 @@ pub fn display_model_name(raw: &str) -> String {
     parts.join(" ")
 }
 
+/// The model (and optionally reasoning effort) a pane is meant to run.
+///
+/// A pin is a promise made by the person, not a setting herdr forces on a
+/// running agent: herdr passes it on the command line when it starts or
+/// resumes the agent, and reports whether the model the session log shows
+/// still matches. It never types into an agent to change a model.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ModelPin {
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// The program that starts the agent (`codex-gpt`, `claude`,
+    /// `cursor-agent`). Unset means "whatever the resume plan names".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher: Option<String>,
+    /// Other flags the launch carries, in order
+    /// (`--dangerously-bypass-approvals-and-sandbox`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+}
+
+impl ModelPin {
+    /// A pin from user input; `None` when the model is blank.
+    pub fn new(model: &str, effort: Option<&str>) -> Option<Self> {
+        let model = model.trim();
+        if model.is_empty() || model.chars().any(char::is_control) {
+            return None;
+        }
+        let effort = effort
+            .map(str::trim)
+            .filter(|effort| !effort.is_empty() && !effort.chars().any(char::is_control))
+            .map(str::to_string);
+        Some(Self {
+            model: model.to_string(),
+            effort,
+            launcher: None,
+            args: Vec::new(),
+        })
+    }
+
+    /// The same pin with the full launch command: program and extra flags.
+    pub fn with_launch(mut self, launcher: Option<&str>, args: &[String]) -> Option<Self> {
+        let launcher = launcher.map(str::trim).filter(|l| !l.is_empty());
+        let clean = |s: &str| !s.is_empty() && !s.chars().any(char::is_control);
+        if launcher.is_some_and(|l| !clean(l) || l.contains(char::is_whitespace))
+            || !args.iter().all(|a| clean(a))
+        {
+            return None;
+        }
+        self.launcher = launcher.map(str::to_string);
+        self.args = args.to_vec();
+        Some(self)
+    }
+
+    /// The whole command that starts this pane's agent, when the pin names a
+    /// launcher: `codex-gpt -m gpt-6.1-sol -c model_reasoning_effort=medium
+    /// --dangerously-bypass-approvals-and-sandbox`.
+    pub fn launch_argv(&self) -> Option<Vec<String>> {
+        let launcher = self.launcher.as_ref()?;
+        let mut argv = vec![launcher.clone()];
+        argv.extend(pin_flags(launcher, self));
+        argv.extend(self.args.iter().cloned());
+        Some(argv)
+    }
+}
+
+/// Two model ids name the same model when their pretty names match, so
+/// `claude-fable-5`, `claude-fable-5[1m]` and `Fable 5` agree.
+pub fn same_model(a: &str, b: &str) -> bool {
+    display_model_name(a).eq_ignore_ascii_case(&display_model_name(b))
+}
+
+/// Whether the detected model matches the pin: `Some(true)` or `Some(false)`
+/// when both are known, `None` when there is no pin or nothing detected.
+/// Effort is compared only when the pin and the log both carry one.
+pub fn model_ok(info: Option<&AgentModelInfo>, pin: Option<&ModelPin>) -> Option<bool> {
+    let (info, pin) = (info?, pin?);
+    if !same_model(&info.model, &pin.model) {
+        return Some(false);
+    }
+    if let (Some(seen), Some(wanted)) = (info.effort.as_deref(), pin.effort.as_deref()) {
+        if !seen.eq_ignore_ascii_case(wanted) {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// Command line flags that start an agent on the pinned model, by program
+/// name. Empty for a program herdr has no flag for.
+pub fn pin_flags(program: &str, pin: &ModelPin) -> Vec<String> {
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    let mut flags = Vec::new();
+    // `codex-gpt` and other wrappers around Codex take Codex's flags.
+    let name = if name.starts_with("codex") {
+        "codex"
+    } else {
+        name
+    };
+    match name {
+        "codex" => {
+            flags.extend(["-m".to_string(), pin.model.clone()]);
+            if let Some(effort) = &pin.effort {
+                flags.extend(["-c".to_string(), format!("model_reasoning_effort={effort}")]);
+            }
+        }
+        "claude" => {
+            flags.extend(["--model".to_string(), pin.model.clone()]);
+            if let Some(effort) = &pin.effort {
+                flags.extend(["--effort".to_string(), effort.clone()]);
+            }
+        }
+        // Cursor's agent has a model flag and no effort flag; effort rides
+        // in the model id there (`gpt-5-high`).
+        "cursor-agent" | "agent" => {
+            flags.extend(["--model".to_string(), pin.model.clone()]);
+        }
+        _ => {}
+    }
+    flags
+}
+
+/// `argv` with the pin's flags placed right after the program, replacing any
+/// model or effort flag it already carried. Unchanged when there is no pin or
+/// herdr has no flag for the program. Flags go before any subcommand
+/// (`codex -m x resume ID`), where each CLI accepts its global options.
+pub fn apply_pin_to_argv(argv: &[String], pin: Option<&ModelPin>) -> Vec<String> {
+    let Some(pin) = pin else {
+        return argv.to_vec();
+    };
+    let Some(program) = argv.first() else {
+        return Vec::new();
+    };
+    // A pin that names its launcher decides the program (`codex-gpt` where
+    // the resume plan says `codex`).
+    let program = pin.launcher.as_ref().unwrap_or(program);
+    let mut flags = pin_flags(program, pin);
+    if flags.is_empty() && pin.launcher.is_none() {
+        return argv.to_vec();
+    }
+    flags.extend(pin.args.iter().cloned());
+    let mut out = vec![program.clone()];
+    out.extend(flags);
+    let mut rest = argv[1..].iter();
+    while let Some(arg) = rest.next() {
+        let takes_value = matches!(arg.as_str(), "-m" | "--model" | "--effort");
+        let effort_override = arg == "-c"
+            && rest
+                .clone()
+                .next()
+                .is_some_and(|next| next.starts_with("model_reasoning_effort="));
+        if takes_value || effort_override {
+            rest.next();
+        } else if arg.starts_with("--model=")
+            || arg.starts_with("--effort=")
+            || pin.args.contains(arg)
+        {
+        } else {
+            out.push(arg.clone());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1841,5 +2008,193 @@ mod tests {
         assert_eq!(held.entry.info, Some(info));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn info(model: &str, effort: Option<&str>) -> AgentModelInfo {
+        AgentModelInfo {
+            model: model.into(),
+            effort: effort.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn model_ok_true_false_and_null() {
+        let pin = ModelPin::new("gpt-6.1-sol", Some("medium")).unwrap();
+        assert_eq!(
+            model_ok(Some(&info("gpt-6.1-sol", Some("medium"))), Some(&pin)),
+            Some(true)
+        );
+        assert_eq!(
+            model_ok(Some(&info("gpt-6.1-luna", Some("medium"))), Some(&pin)),
+            Some(false)
+        );
+        assert_eq!(
+            model_ok(Some(&info("gpt-6.1-sol", Some("high"))), Some(&pin)),
+            Some(false)
+        );
+        // effort unknown on either side is not a mismatch
+        assert_eq!(
+            model_ok(Some(&info("gpt-6.1-sol", None)), Some(&pin)),
+            Some(true)
+        );
+        let model_only = ModelPin::new("gpt-6.1-sol", None).unwrap();
+        assert_eq!(
+            model_ok(Some(&info("gpt-6.1-sol", Some("high"))), Some(&model_only)),
+            Some(true)
+        );
+        // nothing detected, or nothing pinned
+        assert_eq!(model_ok(None, Some(&pin)), None);
+        assert_eq!(model_ok(Some(&info("gpt-6.1-sol", None)), None), None);
+        // same normalisation as the display name
+        let claude = ModelPin::new("claude-fable-5", None).unwrap();
+        assert_eq!(
+            model_ok(Some(&info("claude-fable-5[1m]", None)), Some(&claude)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn model_ok_from_fixture_session_logs() {
+        let codex = [
+            r#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol","effort":"medium"}}"#,
+            r#"{"type":"turn_context","payload":{"model":"gpt-6.1-luna","effort":"high"}}"#,
+        ]
+        .join("\n");
+        let seen = parse_codex_rollout_tail(&codex);
+        let sol = ModelPin::new("gpt-6.1-sol", Some("medium")).unwrap();
+        let luna = ModelPin::new("gpt-6.1-luna", Some("high")).unwrap();
+        assert_eq!(model_ok(seen.as_ref(), Some(&sol)), Some(false));
+        assert_eq!(model_ok(seen.as_ref(), Some(&luna)), Some(true));
+
+        let claude =
+            r#"{"type":"assistant","message":{"model":"claude-opus-5-5"},"effort":"high"}"#;
+        let seen = parse_claude_transcript_tail(claude);
+        let pin = ModelPin::new("claude-opus-5-5", Some("high")).unwrap();
+        assert_eq!(model_ok(seen.as_ref(), Some(&pin)), Some(true));
+        let other = ModelPin::new("claude-sonnet-5-5", None).unwrap();
+        assert_eq!(model_ok(seen.as_ref(), Some(&other)), Some(false));
+
+        let grok = r#"{"current_model_id":"grok-4.7","reasoning_effort":"low"}"#;
+        let seen = parse_grok_summary_tail(grok);
+        let pin = ModelPin::new("grok-4.7", Some("low")).unwrap();
+        assert_eq!(model_ok(seen.as_ref(), Some(&pin)), Some(true));
+        let other = ModelPin::new("grok-4.7", Some("high")).unwrap();
+        assert_eq!(model_ok(seen.as_ref(), Some(&other)), Some(false));
+        assert_eq!(
+            model_ok(parse_grok_summary_tail("{}").as_ref(), Some(&pin)),
+            None
+        );
+    }
+
+    #[test]
+    fn pin_argv_per_agent_and_no_pin_is_unchanged() {
+        let argv = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let pin = ModelPin::new("gpt-6.1-sol", Some("medium")).unwrap();
+        assert_eq!(
+            apply_pin_to_argv(&argv(&["codex", "resume", "abc"]), Some(&pin)),
+            argv(&[
+                "codex",
+                "-m",
+                "gpt-6.1-sol",
+                "-c",
+                "model_reasoning_effort=medium",
+                "resume",
+                "abc"
+            ])
+        );
+        assert_eq!(
+            apply_pin_to_argv(&argv(&["claude", "--resume", "abc"]), Some(&pin)),
+            argv(&[
+                "claude",
+                "--model",
+                "gpt-6.1-sol",
+                "--effort",
+                "medium",
+                "--resume",
+                "abc"
+            ])
+        );
+        assert_eq!(
+            apply_pin_to_argv(&argv(&["/x/cursor-agent"]), Some(&pin)),
+            argv(&["/x/cursor-agent", "--model", "gpt-6.1-sol"])
+        );
+        // an older flag in the saved command is replaced, not duplicated
+        assert_eq!(
+            apply_pin_to_argv(
+                &argv(&[
+                    "codex",
+                    "-m",
+                    "old",
+                    "-c",
+                    "model_reasoning_effort=low",
+                    "-c",
+                    "x=1"
+                ]),
+                Some(&pin)
+            ),
+            argv(&[
+                "codex",
+                "-m",
+                "gpt-6.1-sol",
+                "-c",
+                "model_reasoning_effort=medium",
+                "-c",
+                "x=1"
+            ])
+        );
+        // no pin, or a program with no flag: launch unchanged
+        let plain = argv(&["codex", "resume", "abc"]);
+        assert_eq!(apply_pin_to_argv(&plain, None), plain);
+        let other = argv(&["pi", "--session", "/s"]);
+        assert_eq!(apply_pin_to_argv(&other, Some(&pin)), other);
+        let model_only = ModelPin::new("m", None).unwrap();
+        assert_eq!(
+            apply_pin_to_argv(&plain, Some(&model_only)),
+            argv(&["codex", "-m", "m", "resume", "abc"])
+        );
+    }
+
+    #[test]
+    fn full_launch_pin_names_the_launcher_and_every_flag() {
+        let argv = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let flags = argv(&["--extra-flag"]);
+        let pin = ModelPin::new("gpt-6.1-sol", Some("medium"))
+            .unwrap()
+            .with_launch(Some("codex-gpt"), &flags)
+            .unwrap();
+        assert_eq!(
+            pin.launch_argv().unwrap(),
+            argv(&[
+                "codex-gpt",
+                "-m",
+                "gpt-6.1-sol",
+                "-c",
+                "model_reasoning_effort=medium",
+                "--extra-flag"
+            ])
+        );
+        // a resume plan says `codex`; the pin's launcher wins, flags not doubled
+        assert_eq!(
+            apply_pin_to_argv(
+                &argv(&["codex", "--extra-flag", "resume", "abc"]),
+                Some(&pin)
+            ),
+            argv(&[
+                "codex-gpt",
+                "-m",
+                "gpt-6.1-sol",
+                "-c",
+                "model_reasoning_effort=medium",
+                "--extra-flag",
+                "resume",
+                "abc"
+            ])
+        );
+        // no launcher: no launch command to restart with
+        assert!(ModelPin::new("m", None).unwrap().launch_argv().is_none());
+        assert!(ModelPin::new("m", None)
+            .unwrap()
+            .with_launch(Some("two words"), &[])
+            .is_none());
     }
 }

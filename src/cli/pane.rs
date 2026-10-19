@@ -1,7 +1,7 @@
 use crate::api::schema::{
-    Method, PaneListParams, PaneReadParams, PaneRenameParams, PaneReportAgentParams,
-    PaneReportMetadataParams, PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams,
-    PaneSplitParams, PaneTarget, ReadFormat, ReadSource, Request,
+    Method, PaneListParams, PanePinModelParams, PaneReadParams, PaneRenameParams,
+    PaneReportAgentParams, PaneReportMetadataParams, PaneSendInputParams, PaneSendKeysParams,
+    PaneSendTextParams, PaneSplitParams, PaneTarget, ReadFormat, ReadSource, Request,
 };
 
 pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
@@ -15,6 +15,8 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
         "get" => pane_get(&args[1..]),
         "read" => pane_read(&args[1..]),
         "rename" => pane_rename(&args[1..]),
+        "pin-model" => pane_pin_model(&args[1..]),
+        "restart-agent" => pane_restart_agent(&args[1..]),
         "split" => pane_split(&args[1..]),
         "close" => pane_close(&args[1..]),
         "send-text" => pane_send_text(&args[1..]),
@@ -100,6 +102,157 @@ fn pane_rename(args: &[String]) -> std::io::Result<i32> {
             label,
         }),
     })?)
+}
+
+fn pane_pin_model(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: herdr pane pin-model <pane_id> <model> [effort] [--launcher <program>] [-- <flags>...]\n       herdr pane pin-model <pane_id> --clear";
+    let Some(raw_pane_id) = args.first() else {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    };
+    let rest = &args[1..];
+    let (head, flags) = match rest.iter().position(|arg| arg == "--") {
+        Some(at) => (&rest[..at], rest[at + 1..].to_vec()),
+        None => (rest, Vec::new()),
+    };
+    let mut model = None;
+    let mut effort = None;
+    let mut launcher = None;
+    let mut clear = false;
+    let mut index = 0;
+    while index < head.len() {
+        match head[index].as_str() {
+            "--clear" => {
+                clear = true;
+                index += 1;
+            }
+            "--launcher" => {
+                let Some(value) = head.get(index + 1) else {
+                    eprintln!("missing value for --launcher");
+                    return Ok(2);
+                };
+                launcher = Some(value.clone());
+                index += 2;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+            other if model.is_none() => {
+                model = Some(other.to_string());
+                index += 1;
+            }
+            other if effort.is_none() => {
+                effort = Some(other.to_string());
+                index += 1;
+            }
+            _ => {
+                eprintln!("{USAGE}");
+                return Ok(2);
+            }
+        }
+    }
+    if clear == model.is_some() || (clear && (launcher.is_some() || !flags.is_empty())) {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:pane:pin-model".into(),
+        method: Method::PanePinModel(PanePinModelParams {
+            pane_id: super::normalize_pane_id(raw_pane_id),
+            model,
+            effort,
+            launcher,
+            args: flags,
+        }),
+    })?)
+}
+
+/// `herdr pane restart-agent <pane> [--timeout SECONDS]`: quit the agent,
+/// start the pinned launch command, and report the model the new agent shows.
+fn pane_restart_agent(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: herdr pane restart-agent <pane_id> [--timeout SECONDS]";
+    let Some(raw_pane_id) = args.first() else {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    };
+    let timeout_secs = match &args[1..] {
+        [] => 90,
+        [flag, value] if flag == "--timeout" => match value.parse::<u64>() {
+            Ok(secs) => secs,
+            Err(_) => {
+                eprintln!("{USAGE}");
+                return Ok(2);
+            }
+        },
+        _ => {
+            eprintln!("{USAGE}");
+            return Ok(2);
+        }
+    };
+    let pane_id = super::normalize_pane_id(raw_pane_id);
+    let started = super::send_request(&Request {
+        id: "cli:pane:restart-agent".into(),
+        method: Method::PaneRestartAgent(PaneTarget {
+            pane_id: pane_id.clone(),
+        }),
+    })?;
+    if started.get("error").is_some() {
+        eprintln!("{}", serde_json::to_string(&started).unwrap());
+        return Ok(1);
+    }
+
+    // A fresh agent writes no model until its first turn, so the reading can
+    // stay empty. Wait for a model; failing that, report the agent as started
+    // once it has been back at an idle prompt for a few polls.
+    let pinned = started["result"]["pane"].clone();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut idle_polls = 0;
+    let mut polls = 0;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        polls += 1;
+        let response = super::send_request(&Request {
+            id: "cli:pane:restart-agent:get".into(),
+            method: Method::PaneGet(PaneTarget {
+                pane_id: pane_id.clone(),
+            }),
+        })?;
+        let pane = &response["result"]["pane"];
+        let model = pane.get("model").and_then(|model| model.as_str());
+        let ok = pane.get("model_ok").and_then(|ok| ok.as_bool());
+        let idle = pane.get("agent").is_some()
+            && matches!(
+                pane.get("agent_status").and_then(|s| s.as_str()),
+                Some("idle" | "done")
+            );
+        idle_polls = if idle { idle_polls + 1 } else { 0 };
+        if model.is_some() || (idle_polls >= 3 && polls >= 8) {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "pane_id": pane_id,
+                    "model": model,
+                    "effort": pane.get("effort"),
+                    "model_ok": ok,
+                    "pinned_model": pinned.get("model_pin"),
+                    "pinned_effort": pinned.get("effort_pin"),
+                    "pinned_launcher": pinned.get("launcher_pin"),
+                    "note": if model.is_none() {
+                        "agent restarted on the pinned launch; its model shows after the first turn"
+                    } else {
+                        "model read from the new session"
+                    },
+                })
+            );
+            return Ok(if ok == Some(false) { 1 } else { 0 });
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!("restart sent, but the new agent did not settle within {timeout_secs}s");
+            return Ok(3);
+        }
+    }
 }
 
 fn pane_read(args: &[String]) -> std::io::Result<i32> {
@@ -606,6 +759,8 @@ fn print_pane_help() {
     eprintln!("  herdr pane list [--workspace <workspace_id>]");
     eprintln!("  herdr pane get <pane_id>");
     eprintln!("  herdr pane rename <pane_id> <label>|--clear");
+    eprintln!("  herdr pane pin-model <pane_id> <model> [effort] [--launcher <program>] [-- <flags>...]|--clear");
+    eprintln!("  herdr pane restart-agent <pane_id> [--timeout SECONDS]");
     eprintln!("  herdr pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!(
         "  herdr pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]"

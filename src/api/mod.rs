@@ -40,6 +40,8 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::PaneSplit(_)
             | Method::ViewSet(_)
             | Method::PaneRename(_)
+            | Method::PanePinModel(_)
+            | Method::PaneRestartAgent(_)
             | Method::PaneReportAgent(_)
             | Method::PaneReportAgentSession(_)
             | Method::PaneReportMetadata(_)

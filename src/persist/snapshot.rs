@@ -258,6 +258,9 @@ pub struct PaneSnapshot {
     pub completed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_timing: Option<AgentTimingSnapshot>,
+    /// Model the pane is pinned to; survives restart and live handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_pin: Option<crate::agent_model::ModelPin>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -580,6 +583,7 @@ fn capture_pane(
         seen: pane.seen,
         completed: pane.completed,
         agent_timing: terminal.and_then(AgentTimingSnapshot::from_terminal),
+        model_pin: terminal.and_then(|terminal| terminal.model_pin.clone()),
     }
 }
 
@@ -858,6 +862,7 @@ mod tests {
                 seen: true,
                 completed: false,
                 agent_timing: None,
+                model_pin: None,
                 title_name: None,
                 summary: None,
             },
@@ -876,6 +881,7 @@ mod tests {
                 seen: true,
                 completed: false,
                 agent_timing: None,
+                model_pin: None,
                 title_name: None,
                 summary: None,
             },
@@ -1454,6 +1460,7 @@ mod tests {
                 seen: true,
                 completed: false,
                 agent_timing: None,
+                model_pin: None,
                 title_name: None,
                 summary: None,
             },
@@ -1474,6 +1481,7 @@ mod tests {
                 seen: true,
                 completed: false,
                 agent_timing: None,
+                model_pin: None,
                 title_name: None,
                 summary: None,
             },

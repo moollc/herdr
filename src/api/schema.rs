@@ -80,6 +80,10 @@ pub enum Method {
     PaneGet(PaneTarget),
     #[serde(rename = "pane.rename")]
     PaneRename(PaneRenameParams),
+    #[serde(rename = "pane.pin_model")]
+    PanePinModel(PanePinModelParams),
+    #[serde(rename = "pane.restart_agent")]
+    PaneRestartAgent(PaneTarget),
     #[serde(rename = "pane.send_text")]
     PaneSendText(PaneSendTextParams),
     #[serde(rename = "pane.send_keys")]
@@ -395,6 +399,25 @@ pub enum SplitDirection {
 pub struct PaneListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+}
+
+/// Pin a pane to a model, or clear the pin (no `model`). Herdr passes a pin
+/// on the command line when it starts or resumes the agent and reports
+/// `model_ok`; it never types a model change into a running agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanePinModelParams {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Program that starts the agent (`codex-gpt`); needed by
+    /// `pane.restart_agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher: Option<String>,
+    /// Other flags the launch carries, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1010,6 +1033,24 @@ pub struct PaneInfo {
     pub state_labels: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<AgentSessionInfo>,
+    /// Model and effort the agent's session log shows it running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// What the pane is pinned to, if anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher_pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args_pin: Vec<String>,
+    /// `true` or `false` when the pane is pinned and a model is detected;
+    /// absent (null) when unpinned or the model is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ok: Option<bool>,
     pub revision: u64,
 }
 
@@ -1609,6 +1650,13 @@ mod tests {
                     custom_status: None,
                     state_labels: HashMap::new(),
                     agent_session: None,
+                    model: None,
+                    effort: None,
+                    model_pin: None,
+                    effort_pin: None,
+                    launcher_pin: None,
+                    args_pin: Vec::new(),
+                    model_ok: None,
                     revision: 0,
                 },
                 worktree: WorktreeInfo {
@@ -1661,6 +1709,13 @@ mod tests {
                     custom_status: None,
                     state_labels: HashMap::new(),
                     agent_session: None,
+                    model: None,
+                    effort: None,
+                    model_pin: None,
+                    effort_pin: None,
+                    launcher_pin: None,
+                    args_pin: Vec::new(),
+                    model_ok: None,
                     revision: 0,
                 },
             },

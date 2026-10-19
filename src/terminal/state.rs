@@ -71,6 +71,10 @@ pub struct TerminalState {
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     pub manual_label: Option<String>,
+    /// The model this pane is meant to run; see `agent_model::ModelPin`.
+    pub model_pin: Option<crate::agent_model::ModelPin>,
+    /// A `pane.restart_agent` waiting for the agent to leave its shell.
+    pub pending_restart: Option<crate::app::AgentRestart>,
     pub agent_name: Option<String>,
     /// Model + reasoning effort observed in the agent's session log; refreshed
     /// in the background from the session reported for this terminal.
@@ -138,6 +142,8 @@ impl TerminalState {
             agent_metadata: HashMap::new(),
             persisted_agent_session: None,
             manual_label: None,
+            model_pin: None,
+            pending_restart: None,
             agent_name: None,
             model_info: None,
             session_title: None,
