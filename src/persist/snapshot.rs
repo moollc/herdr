@@ -219,6 +219,10 @@ pub struct TabSnapshot {
     pub root_pane: Option<u32>,
 }
 
+fn auto_orientation_is_unarmed(state: &crate::agent_orientation::AutoOrientation) -> bool {
+    state.is_unarmed()
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct PaneSnapshot {
     /// Terminal identity, restored so everything derived from it (assigned
@@ -243,6 +247,10 @@ pub struct PaneSnapshot {
     pub orientation: crate::agent_orientation::OrientationState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orientation_offer: Option<crate::agent_orientation::OrientationOffer>,
+    /// Hook-free startup note progress. Live handoff keeps it. Cold restore
+    /// drops it. Snapshots from before the field read as unarmed.
+    #[serde(default, skip_serializing_if = "auto_orientation_is_unarmed")]
+    pub auto_orientation: crate::agent_orientation::AutoOrientation,
     /// Whether the finish had been acknowledged. An agent that finished wears
     /// the done marker until its marker is clicked, and clicking it leaves the
     /// check behind until it is clicked again or another run finishes, so both
@@ -580,6 +588,9 @@ fn capture_pane(
             .map(|terminal| terminal.orientation)
             .unwrap_or_default(),
         orientation_offer: terminal.and_then(|terminal| terminal.orientation_offer.clone()),
+        auto_orientation: terminal
+            .map(|terminal| terminal.auto_orientation)
+            .unwrap_or_default(),
         seen: pane.seen,
         completed: pane.completed,
         agent_timing: terminal.and_then(AgentTimingSnapshot::from_terminal),
@@ -782,6 +793,7 @@ mod tests {
             pane.orientation,
             crate::agent_orientation::OrientationState::Suppressed
         );
+        assert!(pane.auto_orientation.is_unarmed());
         for state in [
             crate::agent_orientation::OrientationState::Pending,
             crate::agent_orientation::OrientationState::Offered,
@@ -797,6 +809,14 @@ mod tests {
                 serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
             assert_eq!(restored.orientation, state);
             assert_eq!(restored.orientation_offer, pane.orientation_offer);
+            pane.auto_orientation = crate::agent_orientation::AutoOrientation::Done;
+            let restored: PaneSnapshot =
+                serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
+            assert_eq!(
+                restored.auto_orientation,
+                crate::agent_orientation::AutoOrientation::Done
+            );
+            pane.auto_orientation = crate::agent_orientation::AutoOrientation::Unarmed;
             assert_eq!(restored.orientation.restored(true), state);
             assert_eq!(
                 restored.orientation.restored(false),
@@ -859,6 +879,7 @@ mod tests {
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
                 orientation_offer: None,
+                auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen: true,
                 completed: false,
                 agent_timing: None,
@@ -878,6 +899,7 @@ mod tests {
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
                 orientation_offer: None,
+                auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen: true,
                 completed: false,
                 agent_timing: None,
@@ -1457,6 +1479,7 @@ mod tests {
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
                 orientation_offer: None,
+                auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen: true,
                 completed: false,
                 agent_timing: None,
@@ -1478,6 +1501,7 @@ mod tests {
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
                 orientation_offer: None,
+                auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen: true,
                 completed: false,
                 agent_timing: None,

@@ -785,6 +785,10 @@ fn restore_pane(
             } else {
                 None
             };
+            terminal.auto_orientation = saved_pane
+                .map(|pane| pane.auto_orientation)
+                .unwrap_or_default()
+                .restored(was_imported);
             if restarted_saved_command
                 && saved_pane.is_some_and(|pane| {
                     pane.orientation != crate::agent_orientation::OrientationState::Suppressed
@@ -1334,6 +1338,7 @@ mod tests {
                     launch_argv: None,
                     orientation: crate::agent_orientation::OrientationState::Suppressed,
                     orientation_offer: None,
+                    auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                     seen: true,
                     completed: false,
                     agent_timing: None,
@@ -1401,6 +1406,7 @@ mod tests {
                     launch_argv: Some(launch_argv.clone()),
                     orientation: crate::agent_orientation::OrientationState::Pending,
                     orientation_offer: None,
+                    auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                     seen: true,
                     completed: false,
                     agent_timing: None,
@@ -1483,6 +1489,7 @@ mod tests {
                             launch_argv: Some(launch_argv.clone()),
                             orientation: crate::agent_orientation::OrientationState::Suppressed,
                             orientation_offer: None,
+                            auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                             seen: true,
                             completed: false,
                             agent_timing: None,
@@ -1554,6 +1561,7 @@ mod tests {
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
                 orientation_offer: None,
+                auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen,
                 completed,
                 agent_timing: None,
@@ -1693,6 +1701,7 @@ mod tests {
                             launch_argv: None,
                             orientation: crate::agent_orientation::OrientationState::Suppressed,
                             orientation_offer: None,
+                            auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                             seen: true,
                             completed: false,
                             agent_timing: None,
@@ -1780,6 +1789,7 @@ mod tests {
                             launch_argv: None,
                             orientation: crate::agent_orientation::OrientationState::Suppressed,
                             orientation_offer: None,
+                            auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                             seen: true,
                             completed: false,
                             agent_timing: None,
@@ -1881,6 +1891,7 @@ mod tests {
                     launch_argv: Some(launch_argv.clone()),
                     orientation: crate::agent_orientation::OrientationState::Pending,
                     orientation_offer: None,
+                    auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                     seen: true,
                     completed: false,
                     agent_timing: None,
@@ -1961,6 +1972,7 @@ mod tests {
                             launch_argv: None,
                             orientation: crate::agent_orientation::OrientationState::Pending,
                             orientation_offer: None,
+                            auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                             seen: true,
                             completed: false,
                             agent_timing: None,
@@ -2137,6 +2149,7 @@ mod tests {
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
                 orientation_offer: None,
+                auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen: true,
                 completed: false,
                 agent_timing: None,
@@ -2204,6 +2217,7 @@ mod tests {
             launch_argv: None,
             orientation: crate::agent_orientation::OrientationState::Suppressed,
             orientation_offer: None,
+            auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
             seen: true,
             completed: false,
             agent_timing: None,

@@ -28,9 +28,12 @@ impl OrientationState {
 }
 
 /// Hook-free startup orientation for agents Herdr only detects, such as ones
-/// typed into a shell. Runtime only: each new agent process, including one
-/// coming back after a cold restart, is oriented once when it first goes idle.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// typed into a shell. Each new agent process, including one coming back
+/// after a cold restart, is oriented once when it first goes idle.
+/// The session snapshot carries the value so a live handoff keeps it.
+/// A cold restore drops it (`restored(false)`), because that start is a new process.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AutoOrientation {
     /// No agent process is being tracked.
     #[default]
@@ -39,6 +42,21 @@ pub enum AutoOrientation {
     Armed,
     /// Oriented, skipped, or cancelled for the current agent process.
     Done,
+}
+
+impl AutoOrientation {
+    pub(crate) fn is_unarmed(&self) -> bool {
+        matches!(self, Self::Unarmed)
+    }
+
+    /// A live import is the same process. A cold restore is not.
+    pub fn restored(self, live_import: bool) -> Self {
+        if live_import {
+            self
+        } else {
+            Self::Unarmed
+        }
+    }
 }
 
 pub const AUTO_NOTE: &str = "Herdr sent this automatically when you started. It is context, not a task. Reply with one short line naming your pane, workspace and session, then wait for the user.";
@@ -178,6 +196,13 @@ mod tests {
             OrientationState::Delivered.restored(true),
             OrientationState::Delivered
         );
+        assert_eq!(AutoOrientation::Done.restored(true), AutoOrientation::Done);
+        assert_eq!(
+            AutoOrientation::Done.restored(false),
+            AutoOrientation::Unarmed
+        );
+        assert!(AutoOrientation::Unarmed.is_unarmed());
+        assert!(!AutoOrientation::Armed.is_unarmed());
     }
     #[test]
     fn preserves_tasks_and_slash_dispatch() {

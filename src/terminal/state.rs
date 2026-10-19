@@ -109,7 +109,8 @@ pub struct TerminalState {
     /// SessionStart offer/receipt metadata; retained after delivery so a lost
     /// acknowledgement response can be acknowledged idempotently.
     pub orientation_offer: Option<crate::agent_orientation::OrientationOffer>,
-    /// Hook-free orientation progress for the current agent process. Not persisted.
+    /// Hook-free orientation progress for the current agent process.
+    /// The session snapshot carries it for a live handoff. A cold restore drops it.
     pub auto_orientation: crate::agent_orientation::AutoOrientation,
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,

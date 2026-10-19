@@ -885,6 +885,126 @@ mod tests {
         }
     }
 
+    /// Same process after a live handoff: a note that already went out stays
+    /// out, including when a session change has cleared `OrientationState`.
+    /// A terminal that never had the note still gets it.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn handoff_keeps_delivered_auto_orientation_and_still_orients_a_new_terminal() {
+        use crate::agent_orientation::AutoOrientation;
+
+        for (orientation, auto) in [
+            (OrientationState::Delivered, AutoOrientation::Done),
+            (OrientationState::Suppressed, AutoOrientation::Done),
+        ] {
+            let note = handoff_idle_note(orientation, auto).await;
+            assert!(
+                !note.contains(crate::agent_orientation::AUTO_NOTE),
+                "{orientation:?} already delivered and was sent again: {note}"
+            );
+        }
+        let note = handoff_idle_note(OrientationState::Suppressed, AutoOrientation::Unarmed).await;
+        assert!(
+            note.contains(crate::agent_orientation::AUTO_NOTE),
+            "a terminal that never had the note should still get it, got {note:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn handoff_idle_note(
+        orientation: OrientationState,
+        auto: crate::agent_orientation::AutoOrientation,
+    ) -> String {
+        use crate::detect::{Agent, AgentState};
+        use std::collections::HashMap;
+        use std::io::Read;
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let (mut original, old_pane, terminal, _rx) = prompt_app(orientation);
+        original
+            .state
+            .terminals
+            .get_mut(&terminal)
+            .unwrap()
+            .auto_orientation = auto;
+        let detached = original.state.detached_agents.remove(0);
+        original
+            .state
+            .workspaces
+            .push(crate::workspace::Workspace::from_existing_pane(
+                old_pane,
+                detached.pane,
+                std::env::temp_dir(),
+                original.event_tx.clone(),
+                original.render_notify.clone(),
+                original.render_dirty.clone(),
+            ));
+        original.state.active = Some(0);
+        let snapshot = crate::persist::capture(&original.state, &original.terminal_runtimes);
+        let snapshot = serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        let (master, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut imports = HashMap::from([(
+            old_pane.raw(),
+            crate::handoff_runtime::ImportedHandoffRuntime {
+                master_fd: master.into_raw_fd(),
+                state: crate::handoff_runtime::HandoffRuntimeState {
+                    pane_id: old_pane.raw(),
+                    child_pid: 0,
+                    rows: 24,
+                    cols: 80,
+                    cell_width_px: 0,
+                    cell_height_px: 0,
+                    keyboard_protocol_flags: 0,
+                    keyboard_protocol_ansi: None,
+                    input_state: None,
+                    initial_history_ansi: None,
+                },
+            },
+        )]);
+        let (_, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut restored = App::new_from_handoff(
+            &crate::config::Config::default(),
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+            &snapshot,
+            &mut imports,
+        )
+        .unwrap();
+        assert!(imports.is_empty(), "must consume the live runtime import");
+        assert_eq!(restored.state.terminals[&terminal].orientation, orientation);
+        assert_eq!(
+            restored.state.terminals[&terminal].auto_orientation, auto,
+            "live handoff must keep auto orientation"
+        );
+        let pane = restored.state.workspaces[0].focused_pane_id().unwrap();
+        restored.unpause_handoff_readers();
+        observe(
+            &mut restored,
+            pane,
+            &terminal,
+            Some(Agent::Codex),
+            AgentState::Idle,
+        );
+        let mut buf = [0u8; 8192];
+        let read = tokio::task::spawn_blocking(move || peer.read(&mut buf).map(|n| (n, buf)))
+            .await
+            .expect("handoff read join");
+        match read {
+            Ok((n, buf)) => String::from_utf8_lossy(&buf[..n]).into_owned(),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                String::new()
+            }
+            Err(err) => panic!("handoff read failed: {err}"),
+        }
+    }
+
     #[tokio::test]
     async fn resumed_session_prompt_is_not_injected() {
         let (mut app, pane, _, mut rx) = prompt_app(OrientationState::Pending.restored(false));
