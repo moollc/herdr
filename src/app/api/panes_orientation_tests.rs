@@ -37,6 +37,18 @@ fn acknowledge(app: &mut App, pane: crate::layout::PaneId, session: &str, offer:
     )
 }
 
+async fn submitted_bytes(rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>) -> Vec<u8> {
+    let mut got = rx.try_recv().expect("prompt text").to_vec();
+    if !got.ends_with(b"\r") {
+        let enter = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("submit enter")
+            .expect("submit channel open");
+        got.extend_from_slice(&enter);
+    }
+    got
+}
+
 #[tokio::test]
 #[ignore = "requires a separately provisioned compatible Codex client; set HERDR_TEST_CODEX and run explicitly"]
 async fn external_codex_deepseek_model_request_receives_orientation_before_task() {
@@ -211,6 +223,7 @@ async fn external_codex_deepseek_panel_hook_delivers_generated_identity_before_l
     let expected_name =
         crate::pane_names::assigned_names(&app.state.terminals)[&terminal_id].clone();
     let socket_path = std::env::temp_dir().join(format!("herdr-hook-{}.sock", pane.raw()));
+    let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path).unwrap();
     let hook = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src/integration/assets/codex/herdr-agent-state.sh");
@@ -283,7 +296,10 @@ async fn external_codex_deepseek_panel_hook_delivers_generated_identity_before_l
         },
     );
     assert!(response.contains("result"));
-    assert_eq!(&rx.try_recv().unwrap()[..], format!("{task}\r").as_bytes());
+    assert_eq!(
+        submitted_bytes(&mut rx).await,
+        format!("{task}\r").as_bytes()
+    );
     assert!(
         !session_start(&mut app, pane, "external-codex", "startup", u64::MAX - 2)
             .contains("context")
@@ -362,7 +378,10 @@ async fn orientation_offered_blocks_task_until_hook_emission_is_acknowledged() {
     );
     assert!(acknowledge(&mut app, pane, "external", &offer).contains("result"));
     app.send_agent_task(pane, task).unwrap();
-    assert_eq!(&rx.try_recv().unwrap()[..], format!("{task}\r").as_bytes());
+    assert_eq!(
+        submitted_bytes(&mut rx).await,
+        format!("{task}\r").as_bytes()
+    );
 }
 
 #[tokio::test]
@@ -487,8 +506,17 @@ async fn orientation_navigation_and_empty_input_preserve_pending_and_raw_batches
         .contains("result"));
     assert_eq!(&rx.try_recv().unwrap()[..], b"occupied");
     let batch = rx.try_recv().unwrap();
-    assert!(batch.starts_with(b"literal task\r"));
-    assert!(rx.try_recv().is_err());
+    assert!(batch.starts_with(b"literal task"));
+    if batch.contains(&b'\r') {
+        assert!(rx.try_recv().is_err());
+    } else {
+        assert!(rx.try_recv().is_err(), "Enter waits out the settle delay");
+        let keys = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("delayed keys")
+            .expect("keys");
+        assert!(keys.starts_with(b"\r"));
+    }
     assert_eq!(
         app.state.terminals[&terminal_id].orientation,
         crate::agent_orientation::OrientationState::Suppressed

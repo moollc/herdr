@@ -317,6 +317,14 @@ impl TerminalRuntime {
         self.0.try_send_bytes(bytes)
     }
 
+    pub(crate) fn submit_key(&self) -> u64 {
+        self.0.submit_key()
+    }
+
+    pub(crate) fn user_input_sender(&self) -> crate::pane::UserInputSender {
+        self.0.user_input_sender()
+    }
+
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
         self.0.send_paste(text).await
     }

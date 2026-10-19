@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::io;
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
@@ -785,6 +785,9 @@ impl AgentDetectionPresence {
 /// Dropping this shuts down all background tasks and closes the PTY.
 pub struct PaneRuntime {
     pane_id: PaneId,
+    /// Stable id for the paste-then-Enter lane. Test runtimes share pane id 0,
+    /// so the lane cannot key off that.
+    submit_key: u64,
     terminal: Arc<PaneTerminal>,
     io: PaneRuntimeIo,
     current_size: Cell<(u16, u16, u32, u32)>,
@@ -796,6 +799,35 @@ pub struct PaneRuntime {
     preserve_processes_on_drop: bool,
     // Task handles for deterministic shutdown
     detect_handle: tokio::task::AbortHandle,
+}
+
+fn next_submit_key() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Clone of the bytes written into a pane. The settle timer holds this so it
+/// can press Enter later without keeping the runtime borrowed.
+#[derive(Clone)]
+pub(crate) enum UserInputSender {
+    #[cfg(unix)]
+    Actor(PtyIoActorHandle),
+    #[cfg(test)]
+    Test(mpsc::Sender<Bytes>),
+}
+
+impl UserInputSender {
+    pub(crate) fn try_send(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        match self {
+            #[cfg(unix)]
+            Self::Actor(actor) => actor.try_write_user_input(bytes),
+            #[cfg(test)]
+            Self::Test(sender) => sender.try_send(bytes),
+        }
+    }
 }
 
 enum PaneRuntimeIo {
@@ -929,6 +961,15 @@ impl PaneRuntimeIo {
             PaneRuntimeIo::Actor(actor) => actor.try_write_user_input(bytes),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => sender.try_send(bytes),
+        }
+    }
+
+    fn user_input_sender(&self) -> UserInputSender {
+        match self {
+            #[cfg(unix)]
+            PaneRuntimeIo::Actor(actor) => UserInputSender::Actor(actor.clone()),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { sender, .. } => UserInputSender::Test(sender.clone()),
         }
     }
 }
@@ -1555,6 +1596,7 @@ impl PaneRuntime {
 
         Ok(Self {
             pane_id,
+            submit_key: next_submit_key(),
             terminal,
             io,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
@@ -1985,6 +2027,7 @@ impl PaneRuntime {
 
         Ok(Self {
             pane_id,
+            submit_key: next_submit_key(),
             terminal,
             io,
             current_size: Cell::new((rows, cols, 0, 0)),
@@ -2168,6 +2211,14 @@ impl PaneRuntime {
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         self.io.try_send_bytes(bytes)
+    }
+
+    pub(crate) fn submit_key(&self) -> u64 {
+        self.submit_key
+    }
+
+    pub(crate) fn user_input_sender(&self) -> UserInputSender {
+        self.io.user_input_sender()
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
@@ -2443,6 +2494,7 @@ impl PaneRuntime {
         (
             Self {
                 pane_id: PaneId::from_raw(0),
+                submit_key: next_submit_key(),
                 terminal: Arc::new(PaneTerminal::new(
                     GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
                 )),
@@ -2768,6 +2820,7 @@ mod tests {
             .unwrap();
         let runtime = PaneRuntime {
             pane_id: PaneId::from_raw(0),
+            submit_key: next_submit_key(),
             terminal: Arc::new(PaneTerminal::new(
                 GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
             )),
@@ -2796,6 +2849,7 @@ mod tests {
         let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
         let runtime = PaneRuntime {
             pane_id: PaneId::from_raw(0),
+            submit_key: next_submit_key(),
             terminal: Arc::new(PaneTerminal::new(
                 GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
             )),

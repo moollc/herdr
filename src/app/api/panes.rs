@@ -10,8 +10,8 @@ use crate::api::schema::{
 use crate::app::{App, Mode};
 
 use super::super::api_helpers::{
-    detect_state_from_api, encode_api_keys, encode_api_text, normalize_custom_status,
-    normalize_reported_agent_label,
+    deliver_text_then_keys, detect_state_from_api, encode_api_keys, encode_api_text,
+    normalize_custom_status, normalize_reported_agent_label,
 };
 use super::responses::{encode_error, encode_success};
 
@@ -549,17 +549,39 @@ impl App {
             Ok(encoded_keys) => encoded_keys,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
-        let mut batch = if params.text.is_empty() {
-            Vec::new()
+        let trailing: Vec<u8> = encoded_keys.into_iter().flatten().collect();
+        let submits_with_enter = params
+            .keys
+            .iter()
+            .any(|key| key.eq_ignore_ascii_case("enter"));
+        if submits_with_enter {
+            let text = if params.text.is_empty() {
+                Vec::new()
+            } else {
+                encode_api_text(runtime, &params.text)
+            };
+            if let Err((code, message)) = deliver_text_then_keys(runtime, &text, &trailing) {
+                return encode_error(
+                    id,
+                    if code == "agent_send_failed" {
+                        "pane_send_failed"
+                    } else {
+                        code
+                    },
+                    message,
+                );
+            }
         } else {
-            encode_api_text(runtime, &params.text)
-        };
-        for bytes in encoded_keys {
-            batch.extend(bytes);
-        }
-        if !batch.is_empty() {
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(batch)) {
-                return encode_error(id, "pane_send_failed", err.to_string());
+            let mut batch = if params.text.is_empty() {
+                Vec::new()
+            } else {
+                encode_api_text(runtime, &params.text)
+            };
+            batch.extend(trailing);
+            if !batch.is_empty() {
+                if let Err(err) = runtime.try_send_bytes(Bytes::from(batch)) {
+                    return encode_error(id, "pane_send_failed", err.to_string());
+                }
             }
         }
         if !params.text.trim().is_empty() {

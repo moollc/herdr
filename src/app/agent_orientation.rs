@@ -342,6 +342,28 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn next_submit_chunk(rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>) -> bytes::Bytes {
+        if let Ok(bytes) = rx.try_recv() {
+            return bytes;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("submit bytes")
+            .expect("submit channel open")
+    }
+
+    /// Paste and Enter, whether they arrived as one write or as the settle pair.
+    async fn collect_submitted(rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>) -> Vec<u8> {
+        let first = next_submit_chunk(rx).await;
+        if first.ends_with(b"\r") {
+            return first.to_vec();
+        }
+        let mut out = first.to_vec();
+        out.extend_from_slice(&next_submit_chunk(rx).await);
+        out
+    }
+
     fn prompt_app(
         state: OrientationState,
     ) -> (
@@ -432,6 +454,10 @@ mod tests {
         assert!(first.contains(crate::agent_orientation::OPEN.trim_end()));
         assert!(first.contains(crate::agent_orientation::AUTO_NOTE));
         assert!(first.contains(&format!("raw live pane=\"p_{}\"", pane.raw())));
+        if !first.ends_with('\r') {
+            let enter = next_submit_chunk(&mut rx).await;
+            assert_eq!(&enter[..], b"\r");
+        }
         assert_eq!(
             app.state.terminals[&terminal].orientation,
             OrientationState::Delivered
@@ -653,7 +679,13 @@ mod tests {
             ),
         });
         assert!(response.contains("result"));
-        assert_eq!(&rx.try_recv().unwrap()[..], b"follow up\r");
+        let pending = next_submit_chunk(&mut rx).await;
+        let follow = if pending.as_ref() == b"\r" {
+            collect_submitted(&mut rx).await
+        } else {
+            pending.to_vec()
+        };
+        assert_eq!(follow, b"follow up\r");
         app.state.terminals.get_mut(&terminal).unwrap().orientation = OrientationState::Pending;
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "raw".into(),
@@ -680,21 +712,18 @@ mod tests {
             OrientationState::Pending
         );
         app.send_agent_task(pane, "fix\n  tests\n").unwrap();
-        let bytes = rx.try_recv().unwrap();
+        let bytes = collect_submitted(&mut rx).await;
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(text.contains(crate::agent_orientation::OPEN));
         assert!(text.ends_with("fix\n  tests\n\r"));
         assert!(text.contains("workspace/tab: detached"));
-        assert!(
-            rx.try_recv().is_err(),
-            "paste and Enter occupy one queue slot"
-        );
+        assert!(rx.try_recv().is_err(), "prompt bytes are fully read");
         assert_eq!(
             app.state.terminals[&terminal].orientation,
             OrientationState::Delivered
         );
         app.send_agent_task(pane, "second task").unwrap();
-        assert_eq!(&rx.try_recv().unwrap()[..], b"second task\r");
+        assert_eq!(collect_submitted(&mut rx).await, b"second task\r");
     }
 
     #[tokio::test]
@@ -828,17 +857,30 @@ mod tests {
                 ),
             });
             assert!(response.contains("result"), "{response}");
-            let mut received = vec![0; expected.len() + 1];
-            peer.read_exact(&mut received).unwrap();
-            assert_eq!(received, format!("{expected}\r").as_bytes());
+            let expected_bytes = format!("{expected}\r").into_bytes();
+            let mut received = vec![0; expected_bytes.len()];
+            let (received, mut peer) = tokio::task::spawn_blocking(move || {
+                peer.read_exact(&mut received)?;
+                std::io::Result::Ok((received, peer))
+            })
+            .await
+            .expect("handoff read")
+            .expect("handoff prompt bytes");
+            assert_eq!(received, expected_bytes);
             assert_eq!(
                 restored.state.terminals[&terminal].orientation,
                 OrientationState::Delivered
             );
 
             restored.send_agent_task(pane, "follow up").unwrap();
-            let mut received = [0; 10];
-            peer.read_exact(&mut received).unwrap();
+            let received = tokio::task::spawn_blocking(move || {
+                let mut received = [0; 10];
+                peer.read_exact(&mut received)?;
+                std::io::Result::Ok(received)
+            })
+            .await
+            .expect("handoff follow up")
+            .expect("handoff follow up bytes");
             assert_eq!(&received, b"follow up\r");
         }
     }
@@ -847,7 +889,7 @@ mod tests {
     async fn resumed_session_prompt_is_not_injected() {
         let (mut app, pane, _, mut rx) = prompt_app(OrientationState::Pending.restored(false));
         app.send_agent_task(pane, "resume work").unwrap();
-        assert_eq!(&rx.try_recv().unwrap()[..], b"resume work\r");
+        assert_eq!(collect_submitted(&mut rx).await, b"resume work\r");
     }
 
     #[tokio::test]
