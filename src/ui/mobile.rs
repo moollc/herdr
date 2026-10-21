@@ -858,6 +858,7 @@ mod tests {
             name: "Olivia".into(),
             agent_label: agent_label.map(str::to_string),
             model_info: None,
+            model_pin_warning: None,
             location,
             state: AgentState::Idle,
             seen: true,

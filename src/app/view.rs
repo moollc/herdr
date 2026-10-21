@@ -15,6 +15,10 @@ pub(crate) enum Fold {
     /// The sidebar's spaces section, down to its header and the space on
     /// screen.
     Spaces,
+    /// The right Tasks column.
+    Tasks,
+    /// Full sidebar agent details, folded to one name per row.
+    AgentDetails,
     /// The agent table, down to its one-row header.
     AgentTable,
     /// The agent and pane rows listed under a space's card.
@@ -34,6 +38,8 @@ impl AppState {
         match fold {
             Fold::Sidebar => !self.sidebar_collapsed,
             Fold::Spaces => !self.spaces_collapsed,
+            Fold::Tasks => !self.tasks_collapsed,
+            Fold::AgentDetails => !self.agents_compact,
             Fold::AgentTable => !self.agent_table_collapsed,
             Fold::SpaceAgents(ws) => crate::ui::workspace_agents_expanded(self, *ws),
             Fold::SpaceGroup(key) => !self.collapsed_space_keys.contains(key),
@@ -55,6 +61,8 @@ impl AppState {
         match fold {
             Fold::Sidebar => self.sidebar_collapsed = !shown,
             Fold::Spaces => self.spaces_collapsed = !shown,
+            Fold::Tasks => self.tasks_collapsed = !shown,
+            Fold::AgentDetails => self.agents_compact = !shown,
             Fold::AgentTable => self.agent_table_collapsed = !shown,
             Fold::Usage => self.usage_hidden = !shown,
             Fold::SpaceAgents(ws) => {

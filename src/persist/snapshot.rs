@@ -53,6 +53,10 @@ pub struct SessionSnapshot {
     pub agent_table_collapsed: bool,
     #[serde(default)]
     pub spaces_collapsed: bool,
+    #[serde(default)]
+    pub tasks_collapsed: bool,
+    #[serde(default)]
+    pub agents_compact: bool,
     /// `herdr view usage hide`: the allowance meters are off in the table, the
     /// pane headers and the sidebar for this session.
     #[serde(default)]
@@ -77,6 +81,8 @@ impl Default for SessionSnapshot {
             sidebar_collapsed: false,
             agent_table_collapsed: false,
             spaces_collapsed: false,
+            tasks_collapsed: false,
+            agents_compact: false,
             usage_hidden: false,
         }
     }
@@ -363,6 +369,10 @@ struct RawSessionSnapshot {
     #[serde(default)]
     spaces_collapsed: bool,
     #[serde(default)]
+    tasks_collapsed: bool,
+    #[serde(default)]
+    agents_compact: bool,
+    #[serde(default)]
     usage_hidden: bool,
 }
 
@@ -387,6 +397,8 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         sidebar_collapsed: raw.sidebar_collapsed,
         agent_table_collapsed: raw.agent_table_collapsed,
         spaces_collapsed: raw.spaces_collapsed,
+        tasks_collapsed: raw.tasks_collapsed,
+        agents_compact: raw.agents_compact,
         usage_hidden: raw.usage_hidden,
     })
 }
@@ -466,6 +478,8 @@ pub fn capture(
         sidebar_collapsed: state.sidebar_collapsed,
         agent_table_collapsed: state.agent_table_collapsed,
         spaces_collapsed: state.spaces_collapsed,
+        tasks_collapsed: state.tasks_collapsed,
+        agents_compact: state.agents_compact,
         usage_hidden: state.usage_hidden,
         detached_agents: state
             .detached_agents
@@ -1571,5 +1585,28 @@ mod tests {
             .replace(",\"usage_hidden\":false", "");
         assert!(!old.contains("usage_hidden"));
         assert!(!parse_snapshot(&old).unwrap().usage_hidden);
+    }
+    #[test]
+    fn tasks_column_fold_persists_and_old_snapshot_defaults_open() {
+        let mut state = state_with_workspaces(&["example"]);
+        state.tasks_collapsed = true;
+        let snapshot = capture_from_state(&state);
+        let value = serde_json::to_value(&snapshot).unwrap();
+        let restored: SessionSnapshot = serde_json::from_value(value.clone()).unwrap();
+        assert!(restored.tasks_collapsed);
+        let mut legacy = value;
+        legacy.as_object_mut().unwrap().remove("tasks_collapsed");
+        let restored: SessionSnapshot = serde_json::from_value(legacy).unwrap();
+        assert!(!restored.tasks_collapsed);
+    }
+    #[test]
+    fn h24_compact_fold_round_trip_and_legacy_default() {
+        let mut state = state_with_workspaces(&["example"]);
+        state.agents_compact = true;
+        let value = serde_json::to_value(capture_from_state(&state)).unwrap();
+        assert!(parse_snapshot(&value.to_string()).unwrap().agents_compact);
+        let mut old = value;
+        old.as_object_mut().unwrap().remove("agents_compact");
+        assert!(!parse_snapshot(&old.to_string()).unwrap().agents_compact);
     }
 }

@@ -619,3 +619,49 @@ macOS stores the login in the existing `herdr-cursor-usage` Keychain item. Linux
 If the helper or Secret Service is unavailable, Herdr asks once before saving a **plaintext** fallback. Answering no saves nothing. The fallback is `usage/cursor-login/cookie` under Herdr's state directory (`$XDG_STATE_HOME/herdr`, normally `~/.local/state/herdr`; debug builds use `herdr-dev`). The credential folder is 0700 and the file is 0600. Symlink paths, hardlinks, special files and permissive existing credential files/folders are rejected. Locked, denied or timed-out keyring operations do not silently fall back. Existing plaintext storage is cleared after a successful keyring save. Forget clears only Herdr's keyring item and empties its fallback file; it never changes browser data. These permissions restrict access but do not encrypt the fallback.
 
 Linux default-browser discovery tries `xdg-settings get default-web-browser`, then `xdg-mime query default x-scheme-handler/https`, then mimeapps.list in XDG precedence. Desktop IDs are parsed as data; Exec entries are never run. Stable Chrome, Chromium, Brave, Edge and Vivaldi IDs are recognized; unknown IDs get a plain unsupported message. Discovery helpers share a three-second deadline. Recognition does not enable Linux cookie import: v10/v11 decryption and native Linux integration testing remain follow-up work.
+
+## Optional Tasks column
+
+Set top-level `tasks_file = "~/tasks.json"`, or `HERDR_TASKS_FILE` before
+starting the server. The environment variable takes precedence; an empty
+value disables the source. Config reload also updates the path.
+
+```json
+{"rows":[{"mark":"run","title":"Build the next release","who":"builder"},{"mark":"approve","title":"Review release","who":"you"}]}
+```
+
+Every row requires `mark`, `title`, and `who`. Marks are `run`, `approve`,
+`ready`, `wait`, `stuck`, and `done`. Active rows retain file order. Done rows
+are faded below a thin rule, keeping only the last three in file order.
+The owner is faint and right aligned; long titles end in an ellipsis.
+Unknown fields are accepted. Control characters render as spaces.
+
+The right column mirrors Spaces in width, header and theme colors. Click
+`tasks ▾` or press `prefix+t` to fold it; click the folded strip or press the
+same key to open it. The key is configurable as `[keys] toggle_tasks`.
+`herdr view tasks show|hide|toggle` uses the same saved choice. The thin strip
+shows only the count of unfinished tasks and a working circle when any run.
+The choice survives restarts. Narrow windows fold it to this strip automatically,
+keeping at least 60 columns per horizontal pane where room permits. The
+column is absent in the mobile layout. Folding the agent table has no effect
+on Tasks. Git Status hides independently when every displayed cell is empty.
+
+The file is checked at most once every two seconds and parsed only when its
+modification time or size changes. A missing file means no column. Broken,
+unreadable, non-regular, or over-1-MiB input displays one dim error line and
+is retried. Atomic replacement avoids partial reads. Rendering clips at the
+window height. Running rows share the agent status animation and timer.
+
+### Spaces previews and compact agents
+
+Each layout preview draws solid blocks in the same arrangement as the panes,
+with two text rows per pane band. The focused pane is brighter. Blocks and
+agent names use the same state colors as the agent table margin. Set
+`[ui] state_colors = false` to turn those sidebar colors off together. This
+switch defaults to `true` and takes effect on config reload.
+
+Click the small arrow beside an agent name, press `prefix+a`, or run
+`herdr view agents compact|full|toggle` to fold every sidebar agent to one
+name per line or restore its full details. This choice is saved with the
+session. `[keys] toggle_agents` remaps the shortcut. Clicking a name still
+focuses the pane, and dragging it still moves the agent.

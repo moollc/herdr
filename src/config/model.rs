@@ -185,6 +185,10 @@ pub struct ConfigReloadReport {
 #[serde(default)]
 pub struct Config {
     pub onboarding: Option<bool>,
+    /// Legacy board source, retained for configuration compatibility.
+    pub board_file: Option<String>,
+    /// Optional generic JSON source for the right Tasks column.
+    pub tasks_file: Option<String>,
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,
     pub session: SessionConfig,
@@ -252,6 +256,10 @@ pub struct KeysConfig {
     pub commander: BindingConfig,
     /// Toggle sidebar collapse. Default: "prefix+b"
     pub toggle_sidebar: BindingConfig,
+    /// Toggle the right Tasks column. Default: "prefix+t".
+    pub toggle_tasks: BindingConfig,
+    /// Toggle compact sidebar agent names. Default: "prefix+a".
+    pub toggle_agents: BindingConfig,
     /// Toggle agent table collapse. Default: "prefix+shift+b"
     pub toggle_agent_table: BindingConfig,
     /// Move workspace selection up in navigate mode. Default: "up".
@@ -369,6 +377,8 @@ pub struct WorktreesConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
+    /// Color sidebar pane blocks and agent names by state. Default: true.
+    pub state_colors: bool,
     /// Sidebar width (columns) when expanded. Default: 26.
     pub sidebar_width: u16,
     /// Minimum sidebar width (columns) when expanded. Default: 18.
@@ -570,6 +580,8 @@ impl Default for KeysConfig {
             composer: BindingConfig::one("prefix+/"),
             commander: BindingConfig::one("f2"),
             toggle_sidebar: BindingConfig::one("prefix+b"),
+            toggle_tasks: BindingConfig::one("prefix+t"),
+            toggle_agents: BindingConfig::one("prefix+a"),
             toggle_agent_table: BindingConfig::one("prefix+shift+b"),
             navigate_workspace_up: BindingConfig::one("up"),
             navigate_workspace_down: BindingConfig::one("down"),
@@ -630,6 +642,7 @@ impl Default for WorktreesConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
+            state_colors: true,
             sidebar_width: 26,
             sidebar_min_width: 18,
             sidebar_max_width: 36,

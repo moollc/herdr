@@ -79,6 +79,8 @@ impl App {
         match params.part {
             ViewPart::Sidebar => global(Fold::Sidebar),
             ViewPart::Spaces => global(Fold::Spaces),
+            ViewPart::Tasks => global(Fold::Tasks),
+            ViewPart::AgentDetails => global(Fold::AgentDetails),
             ViewPart::AgentTable => global(Fold::AgentTable),
             ViewPart::Usage => global(Fold::Usage),
             ViewPart::SpaceAgents => {
@@ -294,5 +296,44 @@ mod tests {
             !app.state.usage_hidden,
             "a failed write must not hide only part of the UI"
         );
+    }
+    #[test]
+    fn tasks_view_show_hide_toggle_and_scope() {
+        let mut app = app();
+        for (change, collapsed) in [
+            (ViewChange::Hide, true),
+            (ViewChange::Show, false),
+            (ViewChange::Toggle, true),
+            (ViewChange::Toggle, false),
+        ] {
+            let reply = set(&mut app, ViewPart::Tasks, change, None);
+            assert!(!reply.contains("error"), "{reply}");
+            assert_eq!(app.state.tasks_collapsed, collapsed);
+        }
+        assert!(
+            set(&mut app, ViewPart::Tasks, ViewChange::Hide, Some("1")).contains("invalid_request")
+        );
+    }
+    #[test]
+    fn h24_detail_fold_api_and_scope() {
+        let mut app = app();
+        for (change, compact) in [
+            (ViewChange::Hide, true),
+            (ViewChange::Show, false),
+            (ViewChange::Toggle, true),
+            (ViewChange::Toggle, false),
+        ] {
+            let reply = set(&mut app, ViewPart::AgentDetails, change, None);
+            assert!(!reply.contains("error"), "{reply}");
+            assert_eq!(app.state.agents_compact, compact);
+            assert!(app.state.is_shown(&Fold::SpaceAgents(1)));
+        }
+        assert!(set(
+            &mut app,
+            ViewPart::AgentDetails,
+            ViewChange::Hide,
+            Some("1")
+        )
+        .contains("invalid_request"));
     }
 }

@@ -149,6 +149,30 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         }
     }
 
+    if let Some(value) = table.get("board_file") {
+        match value.clone().try_into::<String>() {
+            Ok(path) => config.board_file = Some(path),
+            Err(err) => {
+                diagnostics.push(format!(
+                    "invalid board_file setting: {err}; keeping current board"
+                ));
+                invalid_sections.push("board_file".to_string());
+            }
+        }
+    }
+
+    if let Some(value) = table.get("tasks_file") {
+        match value.clone().try_into::<String>() {
+            Ok(path) => config.tasks_file = Some(path),
+            Err(err) => {
+                diagnostics.push(format!(
+                    "invalid tasks_file setting: {err}; keeping current tasks"
+                ));
+                invalid_sections.push("tasks_file".to_string());
+            }
+        }
+    }
+
     load_live_section(
         table,
         "theme",
@@ -576,5 +600,16 @@ mouse_capture = false
         let (updated, removed) = remove_keybinding_config_sections(content);
         assert!(!removed);
         assert_eq!(updated, content);
+    }
+    #[test]
+    fn board_file_live_config_preserves_invalid_and_supports_removal() {
+        let loaded = load_live_config_from_str("board_file = '~/tasks.json'").unwrap();
+        assert_eq!(loaded.config.board_file.as_deref(), Some("~/tasks.json"));
+        assert!(loaded.invalid_sections.is_empty());
+        let invalid = load_live_config_from_str("board_file = 42").unwrap();
+        assert!(invalid.invalid_sections.iter().any(|s| s == "board_file"));
+        let removed = load_live_config_from_str("").unwrap();
+        assert!(removed.config.board_file.is_none());
+        assert!(removed.invalid_sections.is_empty());
     }
 }

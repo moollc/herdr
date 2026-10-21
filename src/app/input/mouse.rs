@@ -219,6 +219,9 @@ impl AppState {
             return None;
         }
 
+        if crate::ui::tasks_mouse(self, mouse) {
+            return None;
+        }
         let in_table = self.in_agent_table(mouse.column, mouse.row);
         let sidebar = self.view.sidebar_rect;
         let in_sidebar = mouse.column >= sidebar.x
@@ -646,6 +649,15 @@ impl AppState {
                     if let Some((ws_idx, _tab_idx, pane_id)) =
                         self.agent_detail_target_at(mouse.row)
                     {
+                        if self.view.agent_row_areas.iter().any(|area| {
+                            area.ws_idx == ws_idx
+                                && area.pane_id == pane_id
+                                && mouse.column == area.rect.x + 1
+                                && mouse.row == area.rect.y
+                        }) {
+                            self.toggle_shown(&crate::app::view::Fold::AgentDetails);
+                            return None;
+                        }
                         self.sidebar_agent_press = Some(SidebarAgentPressState {
                             ws_idx,
                             pane_id,
@@ -1445,8 +1457,7 @@ impl AppState {
                 if crate::ui::player::player_scroll_volume(self, mouse.column, mouse.row, false) {
                     return None;
                 }
-                if crate::ui::player::player_scroll_playlist(self, mouse.column, mouse.row, false)
-                {
+                if crate::ui::player::player_scroll_playlist(self, mouse.column, mouse.row, false) {
                     return None;
                 }
                 if crate::ui::should_show_scrollbar(crate::ui::workspace_list_scroll_metrics(
@@ -2723,8 +2734,8 @@ mod tests {
     };
     use super::*;
     use crate::{
-        app::App,
         app::state::{ContextMenuKind, ContextMenuState, MenuListState, Mode, ViewLayout},
+        app::App,
         detect::{Agent, AgentState},
         workspace::Workspace,
     };
@@ -6129,7 +6140,10 @@ mod tests {
             "boxed player should be 3 rows at 122x45: {player:?}"
         );
         let toggle = crate::ui::player::player_toggle_rect(player);
-        assert!(toggle.width > 1, "toggle must be the full bar, not 1 cell: {toggle:?}");
+        assert!(
+            toggle.width > 1,
+            "toggle must be the full bar, not 1 cell: {toggle:?}"
+        );
         assert!(app.state.mouse_capture);
 
         // Click the TITLE, not the chevron cell — that's what a real mouse does.
@@ -6185,7 +6199,9 @@ mod tests {
         assert!(!app.state.player_expanded, "play must not expand the box");
         let posts = crate::ui::player::take_test_posts();
         assert!(
-            posts.iter().any(|(path, _)| path == "/play" || path == "/pause"),
+            posts
+                .iter()
+                .any(|(path, _)| path == "/play" || path == "/pause"),
             "play click must POST /play or /pause, got {posts:?}"
         );
     }
@@ -6218,10 +6234,10 @@ mod tests {
         ));
         let posts = crate::ui::player::take_test_posts();
         assert!(
-            posts.iter().any(|(path, body)| {
-                path == "/load" && body.contains("/System/Library/Sounds/Glass.aiff")
-            }),
-            "queue row must POST /load, got {posts:?}"
+            posts
+                .iter()
+                .any(|(path, body)| { path == "/playlist/play" && body.contains("\"index\":0") }),
+            "queue row must POST /playlist/play for its index, got {posts:?}"
         );
     }
 
@@ -6268,7 +6284,9 @@ mod tests {
         app.state.mode = Mode::Terminal;
         app.state.sidebar_width = 32;
         app.state.player_expanded = true;
-        app.state.player_link.set_text("https://elevenlabs.io/music/queued");
+        app.state
+            .player_link
+            .set_text("https://elevenlabs.io/music/queued");
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 122, 45));
         crate::ui::player::take_test_posts();
 
@@ -6329,7 +6347,9 @@ mod tests {
         app.route_client_input(format!("\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m").into_bytes());
         let posts = crate::ui::player::take_test_posts();
         assert!(
-            posts.iter().any(|(path, body)| path == "/playlist/add" && body.contains("ab")),
+            posts
+                .iter()
+                .any(|(path, body)| path == "/playlist/add" && body.contains("ab")),
             "SGR Add must POST /playlist/add, got {posts:?}"
         );
         assert!(
@@ -6462,9 +6482,9 @@ mod tests {
         ));
         let posts = crate::ui::player::take_test_posts();
         assert!(
-            posts.iter().any(|(path, body)| {
-                path == "/volume" && body.contains("0.9")
-            }),
+            posts
+                .iter()
+                .any(|(path, body)| { path == "/volume" && body.contains("0.9") }),
             "minus must POST /volume 0.9, got {posts:?}"
         );
         assert_eq!(crate::ui::player::current_snapshot().volume(), 0.9);
@@ -6494,7 +6514,9 @@ mod tests {
         ));
         let posts = crate::ui::player::take_test_posts();
         assert!(
-            posts.iter().any(|(path, body)| path == "/volume" && body.contains("0.4")),
+            posts
+                .iter()
+                .any(|(path, body)| path == "/volume" && body.contains("0.4")),
             "plus must POST /volume 0.4, got {posts:?}"
         );
 
@@ -6506,9 +6528,9 @@ mod tests {
         ));
         let posts = crate::ui::player::take_test_posts();
         assert!(
-            posts.iter().any(|(path, body)| {
-                path == "/volume" && body.contains("\"level\":")
-            }),
+            posts
+                .iter()
+                .any(|(path, body)| { path == "/volume" && body.contains("\"level\":") }),
             "bar click must POST /volume, got {posts:?}"
         );
         let level: f64 = posts
@@ -6518,7 +6540,10 @@ mod tests {
             .and_then(|v| v["level"].as_f64())
             .unwrap();
         assert!(level >= 0.0 && level <= 1.0, "level {level}");
-        assert!(level < 0.3, "leftmost bar cell should be quiet, got {level}");
+        assert!(
+            level < 0.3,
+            "leftmost bar cell should be quiet, got {level}"
+        );
     }
 
     #[test]
@@ -6534,10 +6559,15 @@ mod tests {
         ));
         let posts = crate::ui::player::take_test_posts();
         assert!(
-            posts.iter().any(|(path, body)| path == "/volume" && body.contains("0.9")),
+            posts
+                .iter()
+                .any(|(path, body)| path == "/volume" && body.contains("0.9")),
             "wheel down on volume must POST /volume, got {posts:?}"
         );
-        assert_eq!(app.state.selected, selected, "volume wheel must not move spaces");
+        assert_eq!(
+            app.state.selected, selected,
+            "volume wheel must not move spaces"
+        );
 
         crate::ui::player::take_test_posts();
         app.handle_mouse(mouse(
@@ -6563,7 +6593,9 @@ mod tests {
         app.route_client_input(format!("\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m").into_bytes());
         let posts = crate::ui::player::take_test_posts();
         assert!(
-            posts.iter().any(|(path, body)| path == "/volume" && body.contains("0.9")),
+            posts
+                .iter()
+                .any(|(path, body)| path == "/volume" && body.contains("0.9")),
             "SGR click on minus must POST /volume, got {posts:?}"
         );
     }
@@ -6578,7 +6610,9 @@ mod tests {
         app.route_client_input(format!("\x1b[<65;{col};{row}M").into_bytes());
         let posts = crate::ui::player::take_test_posts();
         assert!(
-            posts.iter().any(|(path, body)| path == "/volume" && body.contains("0.9")),
+            posts
+                .iter()
+                .any(|(path, body)| path == "/volume" && body.contains("0.9")),
             "SGR wheel-down on the meter must POST /volume, got {posts:?}"
         );
     }
@@ -6628,10 +6662,10 @@ mod tests {
         ));
         let posts = crate::ui::player::take_test_posts();
         assert!(
-            posts.iter().any(|(path, body)| {
-                path == "/load" && body.contains("/System/Library/Sounds/Glass.aiff")
-            }),
-            "row click must POST /load, got {posts:?}"
+            posts
+                .iter()
+                .any(|(path, body)| { path == "/playlist/play" && body.contains("\"index\":0") }),
+            "row click must POST /playlist/play for its index, got {posts:?}"
         );
 
         crate::ui::player::take_test_posts();
@@ -6642,7 +6676,9 @@ mod tests {
         ));
         let posts = crate::ui::player::take_test_posts();
         assert!(
-            posts.iter().any(|(path, body)| path == "/playlist/remove" && body.contains("1")),
+            posts
+                .iter()
+                .any(|(path, body)| path == "/playlist/remove" && body.contains("1")),
             "× must POST /playlist/remove, got {posts:?}"
         );
     }
@@ -6660,7 +6696,9 @@ mod tests {
         ));
         let posts = crate::ui::player::take_test_posts();
         assert!(
-            posts.iter().any(|(path, body)| path == "/seek" && body.contains("seconds")),
+            posts
+                .iter()
+                .any(|(path, body)| path == "/seek" && body.contains("seconds")),
             "seekable scrub must POST /seek, got {posts:?}"
         );
 
@@ -6724,8 +6762,10 @@ mod tests {
         app.route_client_input(format!("\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m").into_bytes());
         let posts = crate::ui::player::take_test_posts();
         assert!(
-            posts.iter().any(|(path, _)| path == "/load"),
-            "SGR click on playlist row must POST /load, got {posts:?}"
+            posts
+                .iter()
+                .any(|(path, body)| path == "/playlist/play" && body.contains("\"index\":0")),
+            "SGR click on playlist row must POST /playlist/play, got {posts:?}"
         );
     }
 }

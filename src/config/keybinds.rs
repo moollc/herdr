@@ -272,6 +272,8 @@ pub struct Keybinds {
     pub composer: ActionKeybinds,
     pub commander: ActionKeybinds,
     pub toggle_sidebar: ActionKeybinds,
+    pub toggle_tasks: ActionKeybinds,
+    pub toggle_agents: ActionKeybinds,
     pub toggle_agent_table: ActionKeybinds,
     pub detach: ActionKeybinds,
     pub reload_config: ActionKeybinds,
@@ -455,6 +457,8 @@ impl Config {
             composer: action!("keys.composer", &self.keys.composer),
             commander: action!("keys.commander", &self.keys.commander),
             toggle_sidebar: action!("keys.toggle_sidebar", &self.keys.toggle_sidebar),
+            toggle_tasks: action!("keys.toggle_tasks", &self.keys.toggle_tasks),
+            toggle_agents: action!("keys.toggle_agents", &self.keys.toggle_agents),
             toggle_agent_table: action!("keys.toggle_agent_table", &self.keys.toggle_agent_table),
             detach: action!("keys.detach", &self.keys.detach),
             reload_config: action!("keys.reload_config", &self.keys.reload_config),
@@ -1696,5 +1700,39 @@ description = "say hello"
             keybinds.custom_commands[0].description,
             Some("say hello".to_string())
         );
+    }
+    #[test]
+    fn tasks_column_binding_uses_free_prefix_t_and_can_be_customized() {
+        let config = Config::default();
+        let binds = config.keybinds();
+        let key = TerminalKey::new(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(binds.toggle_tasks.matches_prefix_key(key));
+        assert!(!binds.toggle_sidebar.matches_prefix_key(key));
+        assert!(!binds.rename_tab.matches_prefix_key(key));
+        let custom: Config = toml::from_str("[keys]\ntoggle_tasks = 'prefix+y'\n").unwrap();
+        assert!(custom
+            .keybinds()
+            .toggle_tasks
+            .matches_prefix_key(TerminalKey::new(KeyCode::Char('y'), KeyModifiers::NONE)));
+        assert!(!custom.keybinds().toggle_tasks.matches_prefix_key(key));
+    }
+    #[test]
+    fn h24_compact_binding_and_state_color_config() {
+        let config = Config::default();
+        assert!(config.ui.state_colors);
+        let key = TerminalKey::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let binds = config.keybinds();
+        assert!(binds.toggle_agents.matches_prefix_key(key));
+        assert!(!binds.toggle_sidebar.matches_prefix_key(key));
+        assert!(!binds.toggle_tasks.matches_prefix_key(key));
+        let custom: Config =
+            toml::from_str("[ui]\nstate_colors = false\n[keys]\ntoggle_agents = 'prefix+y'\n")
+                .unwrap();
+        assert!(!custom.ui.state_colors);
+        assert!(!custom.keybinds().toggle_agents.matches_prefix_key(key));
+        assert!(custom
+            .keybinds()
+            .toggle_agents
+            .matches_prefix_key(TerminalKey::new(KeyCode::Char('y'), KeyModifiers::NONE)));
     }
 }

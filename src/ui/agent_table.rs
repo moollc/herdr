@@ -133,6 +133,8 @@ pub(crate) struct AgentPanelEntry {
     pub name: String,
     pub agent_label: Option<String>,
     pub model_info: Option<crate::agent_model::AgentModelInfo>,
+    /// Warning shown beside the model when the pane is pinned to another one.
+    pub model_pin_warning: Option<String>,
     /// Where the agent is working: cwd plus git branch and dirty marker.
     pub location: Option<AgentLocation>,
     pub state: AgentState,
@@ -377,7 +379,6 @@ pub(crate) fn split_agent_table(app: &mut AppState, area: Rect) -> (AgentTableLa
         height: table_height,
         ..inset
     };
-
     let most = (table.width / MIN_GROUP).max(1) as usize;
     let count = entries.len().div_ceil(per_group.max(1)).clamp(1, most);
     let group_width = table.width / count as u16;
@@ -396,6 +397,9 @@ pub(crate) fn split_agent_table(app: &mut AppState, area: Rect) -> (AgentTableLa
         .min(entries.len().saturating_sub(visible));
     let shown = visible.min(entries.len().saturating_sub(app.agent_table_scroll));
 
+    let hide_git = entries
+        .iter()
+        .all(|entry| git_cell_text(entry.location.as_ref()).is_empty());
     let groups: Vec<AgentTableGroup> = (0..count)
         .map(|index| {
             // Every group but the last hands its rightmost column to the rule
@@ -415,7 +419,7 @@ pub(crate) fn split_agent_table(app: &mut AppState, area: Rect) -> (AgentTableLa
                     .min(entries.len())];
             let mut columns = Vec::with_capacity(COLUMNS);
             let mut x = area.x + GUTTER;
-            for width in column_widths(app, held, area.width) {
+            for width in column_widths(app, held, area.width, hide_git) {
                 columns.push(Rect {
                     x,
                     y: area.y,
@@ -520,7 +524,12 @@ fn position_of(entries: &[AgentPanelEntry], ws_idx: usize, pane_id: PaneId) -> O
 /// instead of at the far side of the group. A group is measured against its
 /// own agents only, so one group's long title does not stretch the same
 /// column in the group beside it.
-fn column_widths(app: &AppState, held: &[AgentPanelEntry], group_width: u16) -> Vec<usize> {
+fn column_widths(
+    app: &AppState,
+    held: &[AgentPanelEntry],
+    group_width: u16,
+    hide_git: bool,
+) -> Vec<usize> {
     let mut wanted: Vec<usize> = HEADINGS
         .iter()
         .map(|heading| heading.chars().count())
@@ -555,6 +564,9 @@ fn column_widths(app: &AppState, held: &[AgentPanelEntry], group_width: u16) -> 
     let mut room = (group_width as usize).saturating_sub(GUTTER as usize);
     let mut widths = vec![0usize; COLUMNS];
     for (column, width) in widths.iter_mut().enumerate() {
+        if column == COL_GIT && hide_git {
+            continue;
+        }
         if column == COL_ALLOWANCE {
             if allowance_on {
                 // No gap after the last column: the meters may use it all.
@@ -746,6 +758,7 @@ fn agent_panel_entries_with_runtimes(
                 name,
                 agent_label: Some(detail.agent_label),
                 model_info: detail.model_info,
+                model_pin_warning: detail.model_pin_warning,
                 location,
                 state: detail.state,
                 seen: detail.seen,
@@ -792,6 +805,10 @@ fn agent_panel_entries_with_runtimes(
             name,
             agent_label: Some(agent_label),
             model_info: terminal.model_info.clone(),
+            model_pin_warning: crate::agent_model::pin_warning(
+                terminal.model_info.as_ref(),
+                terminal.model_pin.as_ref(),
+            ),
             location: app
                 .view
                 .agent_locations
@@ -1621,6 +1638,7 @@ mod tests {
             name: path.to_string(),
             agent_label: None,
             model_info: None,
+            model_pin_warning: None,
             location: Some(AgentLocation {
                 path: path.to_string(),
                 git: None,
@@ -2594,5 +2612,24 @@ mod tests {
                 .all(|e| usage_bar::table_meters_for(&state, &e.terminal_id).is_empty()));
             assert!(!lines.join("\n").contains('%'));
         }
+    }
+    #[test]
+    fn tasks_column_leaves_table_independent_and_hides_only_empty_git() {
+        let mut state = state_with_agents(4);
+        state.workspaces[0].cached_git_branch = None;
+        for terminal in state.terminals.values_mut() {
+            terminal.cwd = std::env::temp_dir().join("synthetic-tasks-cwd");
+        }
+        let (before, _) = painted_rows(&mut state, 160);
+        assert!(before.groups.iter().all(|g| g.columns[COL_GIT].width == 0));
+        state.tasks.configured = true;
+        let (after, _) = painted_rows(&mut state, 160);
+        assert_eq!(before.area, after.area);
+        assert_eq!(before.groups.len(), after.groups.len());
+        let mut entries = agent_panel_entries(&state);
+        // A nonempty cell restores the column independently of Tasks.
+        let location = entries[0].location.as_mut().expect("test agent location");
+        location.git = Some("main !".into());
+        assert!(column_widths(&state, &entries, 160, false)[COL_GIT] > 0);
     }
 }

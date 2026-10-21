@@ -24,6 +24,7 @@ mod agent_resume;
 mod agent_summary;
 mod api;
 mod app;
+mod board;
 mod build_info;
 mod checksum;
 mod cli;
@@ -57,6 +58,7 @@ mod selection;
 mod server;
 mod session;
 mod sound;
+mod tasks;
 mod terminal;
 mod terminal_notify;
 mod terminal_theme;
@@ -77,6 +79,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Show first-run notification setup on startup.
 # Missing also shows onboarding; set false after you've chosen.
 # onboarding = true
+
+# Optional right Tasks column (generic JSON rows). HERDR_TASKS_FILE overrides it.
+# tasks_file = "~/tasks.json"
 
 [theme]
 # Built-in themes: catppuccin, terminal, tokyo-night, dracula, synthwave,
@@ -169,6 +174,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # zoom = "prefix+z"       # legacy alias: fullscreen
 # resize_mode = "prefix+r"
 # toggle_sidebar = "prefix+b"
+# toggle_tasks = "prefix+t"
+# toggle_agents = "prefix+a"
 
 # Navigate-mode movement. These local shortcuts win while navigate mode is open.
 # They are independent from focus_pane_*. Do not include prefix+, esc, enter, tab, or 1..9 here.
@@ -200,6 +207,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # auto_land = false
 
 [ui]
+# Color sidebar pane blocks and agent names by their state.
+state_colors = true
 # Sidebar width (auto-scaled based on workspace names, this sets the default)
 # sidebar_width = 26
 

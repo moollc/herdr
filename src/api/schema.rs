@@ -131,6 +131,10 @@ pub enum ViewPart {
     Sidebar,
     /// The sidebar's spaces section.
     Spaces,
+    /// The right Tasks column.
+    Tasks,
+    /// Full sidebar agent details, folded to one name per row.
+    AgentDetails,
     /// The agent table.
     AgentTable,
     /// The agent and pane rows under a space's card.

@@ -3015,6 +3015,7 @@ impl HeadlessServer {
             changed |= self.app.usage_redraw_due(now);
             changed |= self.app.start_agent_model_refresh_if_due(now);
             changed |= self.app.poll_player_if_due(now);
+            changed |= self.app.poll_board_if_due(now);
         }
 
         if self

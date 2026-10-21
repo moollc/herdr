@@ -6,6 +6,8 @@ use ratatui::{
 };
 
 mod agent_table;
+mod tasks;
+pub(crate) use tasks::{has_animation as tasks_has_animation, mouse as tasks_mouse};
 mod commander;
 mod composer;
 mod describe_dialog;
@@ -118,10 +120,9 @@ use crate::app::state::ViewLayout;
 use crate::app::{AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
 
-/// The `bounce` set from sindresorhus/cli-spinners: one braille dot moving
-/// down the left column of its cell and back up.
-const SPINNERS: &[&str] = &["⠁", "⠂", "⠄", "⠂"];
-/// How long each frame holds, which is the set's own interval.
+/// Shared working-circle frames for agent status and running tasks.
+const SPINNERS: &[&str] = &["◐", "◓", "◑", "◒"];
+/// Keep the existing agent animation cadence for both surfaces.
 const SPINNER_FRAME_MS: u128 = 120;
 
 /// Map spinner_tick, which counts animation ticks, to a spinner frame. The
@@ -246,10 +247,17 @@ fn compute_view_internal(
     } else {
         Rect::default()
     };
+    let tasks_width = tasks::column_width(app, area.width.saturating_sub(sidebar_width));
+    let tasks_rect = Rect::new(
+        area.right().saturating_sub(tasks_width),
+        area.y,
+        tasks_width,
+        area.height,
+    );
     let main_area = Rect::new(
         area.x.saturating_add(sidebar_width),
         area.y,
-        area.width.saturating_sub(sidebar_width),
+        area.width.saturating_sub(sidebar_width + tasks_width),
         area.height,
     );
 
@@ -332,6 +340,7 @@ fn compute_view_internal(
         layout: ViewLayout::Desktop,
         composer,
         sidebar_rect,
+        tasks_rect,
         workspace_card_areas,
         tab_row_areas,
         agent_row_areas,
@@ -442,6 +451,7 @@ fn compute_mobile_view(
         layout: ViewLayout::Mobile,
         composer,
         sidebar_rect: Rect::default(),
+        tasks_rect: Rect::default(),
         workspace_card_areas: Vec::new(),
         tab_row_areas: Vec::new(),
         agent_row_areas: Vec::new(),
@@ -490,6 +500,7 @@ pub fn render_with_runtime_registry(
     }
     if app.view.layout != ViewLayout::Mobile {
         render_sidebar(app, terminal_runtimes, frame, app.view.sidebar_rect);
+        tasks::render(app, frame, app.view.tasks_rect);
         render_player(app, frame, app.view.player_rect);
         let entries = agent_panel_entries_from(app, terminal_runtimes);
         render_agent_table(app, frame, &app.view.agent_table, &entries);
@@ -803,7 +814,8 @@ mod tests {
         app.player_expanded = true;
 
         compute_view(&mut app, Rect::new(0, 0, 100, 24));
-        let expected = crate::ui::player::player_rows_for_sidebar(&app, app.view.sidebar_rect.height);
+        let expected =
+            crate::ui::player::player_rows_for_sidebar(&app, app.view.sidebar_rect.height);
         assert_eq!(app.view.player_rect.height, expected);
         assert!(
             expected > crate::ui::player::PLAYER_COLLAPSED_ROWS,
@@ -897,7 +909,8 @@ mod tests {
         collapsed
             .draw(|frame| render(&app, frame))
             .expect("draw collapsed 120x32");
-        let collapsed_strip = sidebar_strip(collapsed.backend().buffer(), app.view.sidebar_rect.width);
+        let collapsed_strip =
+            sidebar_strip(collapsed.backend().buffer(), app.view.sidebar_rect.width);
         assert!(
             collapsed_strip.contains("+ new") && collapsed_strip.contains("▸"),
             "collapsed 120x32 missing + new / chevron:\n{collapsed_strip}"
@@ -905,7 +918,8 @@ mod tests {
 
         app.player_expanded = true;
         compute_view(&mut app, Rect::new(0, 0, 120, 32));
-        let expected = crate::ui::player::player_rows_for_sidebar(&app, app.view.sidebar_rect.height);
+        let expected =
+            crate::ui::player::player_rows_for_sidebar(&app, app.view.sidebar_rect.height);
         let new_expanded = new_workspace_button_rect(&app, app.view.sidebar_rect);
         assert_eq!(app.view.player_rect.height, expected);
         assert_eq!(
@@ -927,7 +941,8 @@ mod tests {
         expanded
             .draw(|frame| render(&app, frame))
             .expect("draw expanded 120x32");
-        let expanded_strip = sidebar_strip(expanded.backend().buffer(), app.view.sidebar_rect.width);
+        let expanded_strip =
+            sidebar_strip(expanded.backend().buffer(), app.view.sidebar_rect.width);
         assert!(
             expanded_strip.contains("▾")
                 && expanded_strip.contains("Add")
@@ -972,7 +987,12 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let player = app.view.player_rect;
         let top: String = (player.x..player.x + player.width)
-            .map(|x| buffer.cell((x, player.y)).map(|c| c.symbol()).unwrap_or(" "))
+            .map(|x| {
+                buffer
+                    .cell((x, player.y))
+                    .map(|c| c.symbol())
+                    .unwrap_or(" ")
+            })
             .collect();
         let mid: String = (player.x..player.x + player.width)
             .map(|x| {

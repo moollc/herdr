@@ -10,21 +10,29 @@ pub(super) fn run_view_command(args: &[String]) -> std::io::Result<i32> {
         print_view_help();
         return Ok(0);
     }
-    let Some(part) = parse_part(raw_part) else {
+    let Some(mut part) = parse_part(raw_part) else {
         eprintln!("unknown part: {raw_part}");
         print_view_help();
         return Ok(2);
     };
 
+    let raw_change = args.get(1).map(String::as_str).unwrap_or("toggle");
+    if matches!(raw_part, "agents" | "space-agents")
+        && matches!(raw_change, "compact" | "full" | "toggle")
+    {
+        part = ViewPart::AgentDetails;
+    }
     let mut change = ViewChange::Toggle;
     let mut workspace_id = None;
     let mut tab_id = None;
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
-            "show" => change = ViewChange::Show,
-            "hide" => change = ViewChange::Hide,
-            "toggle" => change = ViewChange::Toggle,
+            raw if parse_change(part, raw).is_some() => {
+                if let Some(parsed) = parse_change(part, raw) {
+                    change = parsed;
+                }
+            }
             flag @ ("--workspace" | "--tab") => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for {flag}");
@@ -56,10 +64,23 @@ pub(super) fn run_view_command(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+fn parse_change(part: ViewPart, raw: &str) -> Option<ViewChange> {
+    match raw {
+        "compact" if part == ViewPart::AgentDetails => Some(ViewChange::Hide),
+        "full" if part == ViewPart::AgentDetails => Some(ViewChange::Show),
+        "show" => Some(ViewChange::Show),
+        "hide" => Some(ViewChange::Hide),
+        "toggle" => Some(ViewChange::Toggle),
+        _ => None,
+    }
+}
+
 fn parse_part(raw: &str) -> Option<ViewPart> {
     Some(match raw.replace('_', "-").as_str() {
         "sidebar" => ViewPart::Sidebar,
         "spaces" => ViewPart::Spaces,
+        "tasks" => ViewPart::Tasks,
+        "agent-details" => ViewPart::AgentDetails,
         "agent-table" => ViewPart::AgentTable,
         "agents" | "space-agents" => ViewPart::SpaceAgents,
         "group" | "space-group" => ViewPart::SpaceGroup,
@@ -75,9 +96,11 @@ fn print_view_help() {
         "  herdr view <part> [show|hide|toggle] [--workspace <workspace_id>] [--tab <tab_id>]"
     );
     eprintln!();
+    eprintln!("  herdr view agents compact|full|toggle (remembered for the sidebar)");
     eprintln!("parts:");
     eprintln!("  sidebar       the whole sidebar");
     eprintln!("  spaces        the sidebar's spaces section");
+    eprintln!("  tasks         the right Tasks column");
     eprintln!("  agent-table   the agent table");
     eprintln!(
         "  agents        the agent rows under a space's card (--workspace, or the space on screen)"
@@ -100,6 +123,24 @@ mod tests {
         assert_eq!(parse_part("agents"), Some(ViewPart::SpaceAgents));
         assert_eq!(parse_part("minimaps"), Some(ViewPart::Minimap));
         assert_eq!(parse_part("usage"), Some(ViewPart::Usage));
+        assert_eq!(parse_part("tasks"), Some(ViewPart::Tasks));
         assert_eq!(parse_part("panes"), None);
+    }
+    #[test]
+    fn h24_compact_full_and_toggle_cli_changes() {
+        assert_eq!(
+            parse_change(ViewPart::AgentDetails, "compact"),
+            Some(ViewChange::Hide)
+        );
+        assert_eq!(
+            parse_change(ViewPart::AgentDetails, "full"),
+            Some(ViewChange::Show)
+        );
+        assert_eq!(
+            parse_change(ViewPart::AgentDetails, "toggle"),
+            Some(ViewChange::Toggle)
+        );
+        assert_eq!(parse_change(ViewPart::SpaceAgents, "compact"), None);
+        assert_eq!(parse_part("agent-details"), Some(ViewPart::AgentDetails));
     }
 }

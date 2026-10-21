@@ -311,6 +311,7 @@ impl App {
         changed |= self.usage_redraw_due(now);
         changed |= self.start_agent_model_refresh_if_due(now);
         changed |= self.poll_player_if_due(now);
+        changed |= self.poll_board_if_due(now);
 
         if self
             .next_auto_update_check
@@ -409,10 +410,12 @@ impl App {
     /// all, and so is every set-down agent: a row spins whether or not a pane
     /// is showing that agent.
     fn agent_panel_has_animation(&self) -> bool {
-        self.state
-            .workspaces
-            .iter()
-            .any(|ws| ws.has_working_pane(&self.state.terminals))
+        crate::ui::tasks_has_animation(&self.state)
+            || self
+                .state
+                .workspaces
+                .iter()
+                .any(|ws| ws.has_working_pane(&self.state.terminals))
             || self.state.detached_agents.iter().any(|detached| {
                 self.state
                     .terminals
@@ -524,6 +527,11 @@ impl App {
 
         let update_tx = self.event_tx.clone();
         std::thread::spawn(move || crate::update::auto_update(update_tx));
+    }
+
+    pub(crate) fn poll_board_if_due(&mut self, now: Instant) -> bool {
+        self.board_watcher.poll(now, &mut self.state.board)
+            | self.tasks_watcher.poll(now, &mut self.state.tasks)
     }
 
     pub(crate) fn poll_player_if_due(&mut self, now: Instant) -> bool {
@@ -935,6 +943,14 @@ impl App {
                 .then(|| self.agent_model_refresh_deadline())
                 .flatten(),
             include_git_refresh.then_some(self.last_player_poll + PLAYER_POLL_INTERVAL),
+            include_git_refresh
+                .then(|| {
+                    [self.board_watcher.deadline(), self.tasks_watcher.deadline()]
+                        .into_iter()
+                        .flatten()
+                        .min()
+                })
+                .flatten(),
             include_git_refresh
                 .then(|| self.usage_refresh_deadline())
                 .flatten(),
@@ -1825,5 +1841,30 @@ mod tests {
             sent.try_recv().expect("named pane"),
             bytes::Bytes::from(format!("{line}\n"))
         );
+    }
+    #[test]
+    fn tasks_running_row_drives_existing_animation_timer() {
+        let (mut app, _) = test_app_with_pane();
+        app.state.tasks.configured = true;
+        app.state.tasks.tasks = Some(crate::tasks::Tasks {
+            rows: vec![crate::tasks::Row {
+                mark: crate::tasks::Mark::Run,
+                title: "work".into(),
+                who: "owner".into(),
+            }],
+        });
+        app.state.view.tasks_rect = ratatui::layout::Rect::new(100, 0, 26, 20);
+        app.sync_animation_timer(Instant::now());
+        assert!(app.next_animation_tick.is_some());
+        app.state.tasks_collapsed = true;
+        app.state.view.tasks_rect.width = 4;
+        app.sync_animation_timer(Instant::now());
+        assert!(
+            app.next_animation_tick.is_some(),
+            "the folded running circle still animates"
+        );
+        app.state.view.tasks_rect = ratatui::layout::Rect::default();
+        app.sync_animation_timer(Instant::now());
+        assert!(app.next_animation_tick.is_none());
     }
 }

@@ -403,7 +403,11 @@ impl AppState {
         let Some(ws_idx) = self.active else {
             return;
         };
-        let Some(pane_id) = self.workspaces.get(ws_idx).and_then(|ws| ws.focused_pane_id()) else {
+        let Some(pane_id) = self
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.focused_pane_id())
+        else {
             return;
         };
         let Some(terminal_id) = self
@@ -1339,7 +1343,8 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         // Scroll the merged list past the workspace card so agent rows shift up.
-        app.state.view.sidebar_rect = Rect::new(0, 0, 26, 20);
+        app.state.view.sidebar_rect =
+            Rect::new(0, 0, 26, 20 + crate::ui::player::PLAYER_COLLAPSED_ROWS);
         app.state.workspace_scroll = 1;
         let (cards, _tabs, agent_rows, folder_rows) =
             crate::ui::compute_workspace_list_areas(&app.state, app.state.view.sidebar_rect);
@@ -1383,7 +1388,8 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app.state.view.terminal_area = Rect::new(0, 0, 120, 36);
-        app.state.view.sidebar_rect = Rect::new(0, 0, 26, 30);
+        app.state.view.sidebar_rect =
+            Rect::new(0, 0, 26, 30 + crate::ui::player::PLAYER_COLLAPSED_ROWS);
         let (cards, tabs, agent_rows, folder_rows) =
             crate::ui::compute_workspace_list_areas(&app.state, app.state.view.sidebar_rect);
         app.state.view.workspace_card_areas = cards;
@@ -1440,7 +1446,8 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app.state.view.terminal_area = Rect::new(0, 0, 120, 36);
-        app.state.view.sidebar_rect = Rect::new(0, 0, 26, 30);
+        app.state.view.sidebar_rect =
+            Rect::new(0, 0, 26, 30 + crate::ui::player::PLAYER_COLLAPSED_ROWS);
         let layout = |app: &crate::app::App| {
             crate::ui::compute_workspace_list_areas(&app.state, app.state.view.sidebar_rect)
         };
@@ -1470,6 +1477,9 @@ mod tests {
             "folding the preview leaves you in the tab you were in"
         );
 
+        let arrow =
+            crate::ui::tab_preview_toggle_rect(&app.state, &app.state.view.tab_row_areas[0])
+                .expect("a collapsed split tab keeps its arrow");
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             arrow.x,
@@ -1669,8 +1679,12 @@ mod tests {
         app.state.workspaces = vec![Workspace::test_new("a"), Workspace::test_new("b")];
         app.state.active = Some(0);
         app.state.selected = 0;
-        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
-        app.state.view.sidebar_rect = Rect::new(0, 0, 26, 20);
+        crate::ui::compute_view(
+            &mut app.state,
+            Rect::new(0, 0, 106, 20 + crate::ui::player::PLAYER_COLLAPSED_ROWS),
+        );
+        app.state.view.sidebar_rect =
+            Rect::new(0, 0, 26, 20 + crate::ui::player::PLAYER_COLLAPSED_ROWS);
         app.state.view.workspace_card_areas =
             crate::ui::compute_workspace_card_areas(&app.state, app.state.view.sidebar_rect);
         let target_row = app.state.view.workspace_card_areas[1].rect.y;
@@ -1906,8 +1920,12 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Navigate;
-        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 30));
-        app.state.view.sidebar_rect = Rect::new(0, 0, 26, 30);
+        crate::ui::compute_view(
+            &mut app.state,
+            Rect::new(0, 0, 106, 30 + crate::ui::player::PLAYER_COLLAPSED_ROWS),
+        );
+        app.state.view.sidebar_rect =
+            Rect::new(0, 0, 26, 30 + crate::ui::player::PLAYER_COLLAPSED_ROWS);
         app.state.view.workspace_card_areas =
             crate::ui::compute_workspace_card_areas(&app.state, app.state.view.sidebar_rect);
         let list = app.state.workspace_list_rect();
@@ -1928,6 +1946,9 @@ mod tests {
             Workspace::test_new("b"),
             Workspace::test_new("c"),
         ];
+        app.state.spaces_collapsed = false;
+        app.state.active = Some(0);
+        app.state.selected = 0;
         let active_id = app.state.workspaces[1].id.clone();
         let selected_id = app.state.workspaces[2].id.clone();
         app.state.active = Some(1);
@@ -2392,8 +2413,12 @@ mod tests {
             .get_mut(&second_terminal_id)
             .unwrap()
             .cwd = second_repo.clone();
-        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
-        app.state.view.sidebar_rect = Rect::new(0, 0, 26, 20);
+        crate::ui::compute_view(
+            &mut app.state,
+            Rect::new(0, 0, 106, 20 + crate::ui::player::PLAYER_COLLAPSED_ROWS),
+        );
+        app.state.view.sidebar_rect =
+            Rect::new(0, 0, 26, 20 + crate::ui::player::PLAYER_COLLAPSED_ROWS);
         app.state.view.workspace_card_areas =
             crate::ui::compute_workspace_card_areas(&app.state, app.state.view.sidebar_rect);
 
@@ -2431,10 +2456,26 @@ mod tests {
             Workspace::test_new("b"),
             Workspace::test_new("c"),
         ];
-        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 30));
-        app.state.view.sidebar_rect = Rect::new(0, 0, 26, 30);
-        app.state.view.workspace_card_areas =
-            crate::ui::compute_workspace_card_areas(&app.state, app.state.view.sidebar_rect);
+        // Keep each tab to its name row so all three workspace/tab pairs fit
+        // above the player and footer in this viewport. This test is about
+        // the bottom drop slot, not minimap sizing.
+        for ws in &mut app.state.workspaces {
+            for tab in &mut ws.tabs {
+                tab.layout_preview_hidden = true;
+            }
+        }
+        crate::ui::compute_view(
+            &mut app.state,
+            Rect::new(0, 0, 106, 40 + crate::ui::player::PLAYER_COLLAPSED_ROWS),
+        );
+        app.state.view.sidebar_rect =
+            Rect::new(0, 0, 26, 40 + crate::ui::player::PLAYER_COLLAPSED_ROWS);
+        let (cards, tabs, agent_rows, folder_rows) =
+            crate::ui::compute_workspace_list_areas(&app.state, app.state.view.sidebar_rect);
+        app.state.view.workspace_card_areas = cards;
+        app.state.view.tab_row_areas = tabs;
+        app.state.view.agent_row_areas = agent_rows;
+        app.state.view.agent_folder_areas = folder_rows;
 
         // These spaces have no attached terminals, so each card is followed
         // only by its tab row, and the end of the list is below the last one:
@@ -2452,8 +2493,16 @@ mod tests {
         )
         .unwrap();
 
-        let last_tab = app.state.view.tab_row_areas.last().unwrap().rect;
-        assert!(last_tab.y > cards.last().unwrap().rect.y);
+        let last_card = cards.last().unwrap();
+        let last_tab = app
+            .state
+            .view
+            .tab_row_areas
+            .iter()
+            .find(|tab| tab.ws_idx == last_card.ws_idx)
+            .expect("the last listed space has a tab row")
+            .rect;
+        assert!(last_tab.y > last_card.rect.y);
         assert_eq!(bottom_slot, last_tab.y + last_tab.height + 2);
         assert!(bottom_slot < app.state.sidebar_footer_rect().y);
     }
@@ -2685,11 +2734,7 @@ mod tests {
 
         let area = Rect::new(32, 0, 90, 45);
         let panes = app.state.workspaces[0].tabs[0].layout.panes(area);
-        let herd = app
-            .state
-            .find_herdplayer_pane()
-            .expect("herdplayer pane")
-            .1;
+        let herd = app.state.find_herdplayer_pane().expect("herdplayer pane").1;
         let herd_rect = panes.iter().find(|pane| pane.id == herd).unwrap().rect;
         let root_rect = panes.iter().find(|pane| pane.id == root).unwrap().rect;
         let right_rect = panes.iter().find(|pane| pane.id == right).unwrap().rect;
@@ -2748,5 +2793,39 @@ mod tests {
         assert_eq!(herd_rect.x, root_rect.x);
         assert!(herd_rect.x < right_rect.x);
         assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(herd));
+    }
+    #[test]
+    fn h24_agent_area_arrow_click_folds_and_reopens_visible_details() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = app_with_agent_rows(&[("one", Agent::Pi), ("two", Agent::Pi)]);
+        let area = Rect::new(0, 0, 160, 50);
+        for compact in [true, false] {
+            crate::ui::compute_view(&mut app.state, area);
+            let row = app.state.view.agent_row_areas[0].rect;
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(&app.state, frame))
+                .unwrap();
+            assert_eq!(
+                terminal.backend().buffer()[(row.x + 1, row.y)].symbol(),
+                if compact { "▾" } else { "▸" }
+            );
+            app.handle_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                row.x + 1,
+                row.y,
+            ));
+            assert_eq!(app.state.agents_compact, compact);
+            crate::ui::compute_view(&mut app.state, area);
+            terminal
+                .draw(|frame| crate::ui::render(&app.state, frame))
+                .unwrap();
+            let row = app.state.view.agent_row_areas[0].rect;
+            assert_eq!(row.height, if compact { 1 } else { 2 });
+            assert_eq!(
+                terminal.backend().buffer()[(row.x + 1, row.y)].symbol(),
+                if compact { "▸" } else { "▾" }
+            );
+        }
     }
 }

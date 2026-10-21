@@ -1236,6 +1236,22 @@ pub fn model_ok(info: Option<&AgentModelInfo>, pin: Option<&ModelPin>) -> Option
     Some(true)
 }
 
+/// Short sidebar warning when a pinned pane runs another model, e.g.
+/// `⚠ pin Sol medium`. `None` when the pane matches, is not pinned, or no
+/// model is detected yet.
+pub fn pin_warning(info: Option<&AgentModelInfo>, pin: Option<&ModelPin>) -> Option<String> {
+    if model_ok(info, pin) != Some(false) {
+        return None;
+    }
+    let pin = pin?;
+    let mut text = format!("⚠ pin {}", display_model_name(&pin.model));
+    if let Some(effort) = &pin.effort {
+        text.push(' ');
+        text.push_str(effort);
+    }
+    Some(text)
+}
+
 /// Command line flags that start an agent on the pinned model, by program
 /// name. Empty for a program herdr has no flag for.
 pub fn pin_flags(program: &str, pin: &ModelPin) -> Vec<String> {
@@ -2196,5 +2212,21 @@ mod tests {
             .unwrap()
             .with_launch(Some("two words"), &[])
             .is_none());
+    }
+
+    #[test]
+    fn pin_warning_only_on_a_mismatch() {
+        let pin = ModelPin::new("gpt-6.1-sol", Some("medium")).unwrap();
+        let luna = info("gpt-6.1-luna", Some("high"));
+        assert_eq!(
+            pin_warning(Some(&luna), Some(&pin)).as_deref(),
+            Some("⚠ pin GPT-6.1 Sol medium")
+        );
+        assert_eq!(
+            pin_warning(Some(&info("gpt-6.1-sol", Some("medium"))), Some(&pin)),
+            None
+        );
+        assert_eq!(pin_warning(None, Some(&pin)), None);
+        assert_eq!(pin_warning(Some(&luna), None), None);
     }
 }

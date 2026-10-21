@@ -387,6 +387,8 @@ impl Command {
                 let what = match part {
                     ViewPart::Sidebar => "the sidebar".to_string(),
                     ViewPart::Spaces => "the spaces section".to_string(),
+                    ViewPart::AgentDetails => "full sidebar agent details".to_string(),
+                    ViewPart::Tasks => "the tasks column".to_string(),
                     ViewPart::AgentTable => "the agent table".to_string(),
                     ViewPart::SpaceAgents => of("the agents"),
                     ViewPart::SpaceGroup => of("the worktree group"),

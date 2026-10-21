@@ -522,6 +522,8 @@ pub(crate) enum NavigateAction {
     OpenComposer,
     OpenCommander,
     ToggleSidebar,
+    ToggleTasks,
+    ToggleAgents,
     ToggleAgentTable,
 }
 
@@ -625,6 +627,8 @@ fn action_for_key(
         (&kb.composer, NavigateAction::OpenComposer),
         (&kb.commander, NavigateAction::OpenCommander),
         (&kb.toggle_sidebar, NavigateAction::ToggleSidebar),
+        (&kb.toggle_tasks, NavigateAction::ToggleTasks),
+        (&kb.toggle_agents, NavigateAction::ToggleAgents),
         (&kb.toggle_agent_table, NavigateAction::ToggleAgentTable),
         (&kb.new_tab, NavigateAction::NewTab),
         (&kb.rename_tab, NavigateAction::RenameTab),
@@ -874,6 +878,13 @@ pub(super) fn execute_navigate_action_in_context(
             if !state.close_tab() {
                 leave_navigate_mode(state);
             }
+        }
+        NavigateAction::ToggleAgents => {
+            state.toggle_shown(&crate::app::view::Fold::AgentDetails);
+        }
+        NavigateAction::ToggleTasks => {
+            state.toggle_shown(&crate::app::view::Fold::Tasks);
+            leave_navigate_mode(state);
         }
         NavigateAction::ToggleSidebar => {
             state.toggle_shown(&crate::app::view::Fold::Sidebar);

@@ -907,7 +907,9 @@ mod tests {
         assert!(handle_player_link_key(&mut state, key(KeyCode::Enter)));
         let posts = crate::ui::player::take_test_posts();
         assert!(
-            posts.iter().any(|(path, body)| path == "/playlist/add" && body.contains("https://x.test/t")),
+            posts
+                .iter()
+                .any(|(path, body)| path == "/playlist/add" && body.contains("https://x.test/t")),
             "Enter must POST /playlist/add, got {posts:?}"
         );
         assert!(

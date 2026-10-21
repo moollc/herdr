@@ -17,6 +17,8 @@ pub struct PaneDetail {
     #[allow(dead_code)]
     pub agent: Option<Agent>,
     pub model_info: Option<crate::agent_model::AgentModelInfo>,
+    /// Sidebar warning when the pane is pinned to another model.
+    pub model_pin_warning: Option<String>,
     pub state: AgentState,
     pub seen: bool,
     /// Whether this agent has finished a run since it last worked.
@@ -74,6 +76,10 @@ impl Tab {
                     agent_label,
                     agent: terminal.effective_known_agent(),
                     model_info: terminal.model_info.clone(),
+                    model_pin_warning: crate::agent_model::pin_warning(
+                        terminal.model_info.as_ref(),
+                        terminal.model_pin.as_ref(),
+                    ),
                     state: terminal.state,
                     seen: pane.seen,
                     completed: pane.completed,

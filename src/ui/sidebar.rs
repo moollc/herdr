@@ -220,6 +220,9 @@ fn agent_location_header_rows(
     pane_id: crate::layout::PaneId,
     prev: Option<&WorkspaceListEntry>,
 ) -> u16 {
+    if app.agents_compact {
+        return 0;
+    }
     let Some(
         WorkspaceListEntry::Agent {
             ws_idx: prev_ws_idx,
@@ -337,7 +340,7 @@ fn entry_row_height(
             tab_idx,
             pane_id,
         } => Some(
-            agent_leading_gap(prev)
+            agent_leading_gap(app, prev)
                 + agent_location_header_rows(app, *ws_idx, *tab_idx, *pane_id, prev)
                 + agent_entry_content_rows(app, *ws_idx, *pane_id, body_width)
                 + space_group_trailing_rows(*ws_idx, next),
@@ -360,8 +363,8 @@ fn entry_row_height(
 
 /// Rows the layout preview under a tab's name takes. It spans the row between
 /// the tab name's indent and a matching margin on the right, so it widens and
-/// narrows with the sidebar, and it is as tall as that width needs to keep the
-/// shape of the area the tab's panes fill. A folded preview takes none.
+/// narrows with the sidebar. Each stacked pane band takes two rows, separated
+/// by a clear row. A folded preview takes none.
 fn tab_minimap_rows(app: &AppState, ws_idx: usize, tab_idx: usize, row_width: u16) -> u16 {
     let Some(tab) = app
         .workspaces
@@ -373,7 +376,10 @@ fn tab_minimap_rows(app: &AppState, ws_idx: usize, tab_idx: usize, row_width: u1
     if tab.layout_preview_hidden {
         return 0;
     }
-    super::minimap::minimap_rows(tab_minimap_width(row_width), app.view.terminal_area)
+    if tab_minimap_width(row_width) == 0 {
+        return 0;
+    }
+    super::minimap::block_rows(tab.layout.root())
 }
 
 /// Where a tab row draws its layout preview: every row below the name, inset
@@ -446,6 +452,9 @@ fn agent_entry_content_rows(
     pane_id: crate::layout::PaneId,
     body_width: u16,
 ) -> u16 {
+    if app.agents_compact {
+        return 1;
+    }
     AGENT_PANEL_ENTRY_CONTENT_ROWS
         + agent_status_detail_lines(app, ws_idx, pane_id, body_width).len() as u16
 }
@@ -453,7 +462,10 @@ fn agent_entry_content_rows(
 /// Blank rows above an agent's content. Agents are separated from whatever
 /// entry sits above them by one, but the first entry under a tab needs none:
 /// the tab row already sits above it.
-fn agent_leading_gap(prev: Option<&WorkspaceListEntry>) -> u16 {
+fn agent_leading_gap(app: &AppState, prev: Option<&WorkspaceListEntry>) -> u16 {
+    if app.agents_compact {
+        return 0;
+    }
     u16::from(matches!(
         prev,
         Some(WorkspaceListEntry::Agent { .. } | WorkspaceListEntry::Pane { .. })
@@ -870,7 +882,12 @@ fn workspace_list_layout(app: &AppState, area: Rect) -> WorkspaceListLayout {
                             .unwrap_or_default(),
                         tab_idx: *tab_idx,
                         pane_id: *pane_id,
-                        rect: Rect::new(body.x, row_y + agent_leading_gap(prev), body.width, 1),
+                        rect: Rect::new(
+                            body.x,
+                            row_y + agent_leading_gap(app, prev),
+                            body.width,
+                            1,
+                        ),
                     });
                 }
                 agent_rows.push(crate::app::state::AgentRowArea {
@@ -880,7 +897,7 @@ fn workspace_list_layout(app: &AppState, area: Rect) -> WorkspaceListLayout {
                     location_header: header_rows > 0,
                     rect: Rect::new(
                         body.x,
-                        row_y + agent_leading_gap(prev) + header_rows,
+                        row_y + agent_leading_gap(app, prev) + header_rows,
                         body.width,
                         agent_entry_content_rows(app, *ws_idx, *pane_id, body.width),
                     ),
@@ -1265,7 +1282,7 @@ fn render_workspace_rows(
 
     let outlined = outlined_space_group(app, &cards, &tab_rows, &agent_rows, &pane_rows);
 
-    render_tab_rows(app, frame, &tab_rows);
+    render_tab_rows(app, terminal_runtimes, frame, &tab_rows);
     render_agent_rows(app, terminal_runtimes, frame, &agent_rows);
     render_pane_rows(app, terminal_runtimes, frame, &pane_rows);
     for folder in folder_rows.iter().chain(&layout.pane_folder_rows) {
@@ -1353,7 +1370,13 @@ fn outlined_space_group(
     ))
 }
 
-fn render_tab_rows(app: &AppState, frame: &mut Frame, tab_rows: &[crate::app::state::TabRowArea]) {
+fn render_tab_rows(
+    app: &AppState,
+    runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+    tab_rows: &[crate::app::state::TabRowArea],
+) {
+    let entries = all_agent_panel_entries_from(app, runtimes);
     for row in tab_rows {
         let Some(ws) = app.workspaces.get(row.ws_idx) else {
             continue;
@@ -1399,14 +1422,47 @@ fn render_tab_rows(app: &AppState, frame: &mut Frame, tab_rows: &[crate::app::st
         let Some(preview) = tab_preview_rect(row.rect) else {
             continue;
         };
-        // Only the tab you are in has a pane you are typing into, and that
-        // one takes the accent.
-        super::minimap::render_minimap(
+        // Only the active tab has a focused block. State colors stay in the
+        // same hue; unfocused blocks are dimmer.
+        super::minimap::render_blocks(
             tab.layout.root(),
-            active.then(|| tab.layout.focused()),
             preview,
-            Style::default().fg(tab_minimap_pane_color(app)),
-            Style::default().fg(focus_accent(app)),
+            |pane| {
+                let focused = active && pane == tab.layout.focused();
+                let state_color = entries
+                    .iter()
+                    .find(|entry| {
+                        entry.ws_idx == row.ws_idx
+                            && entry.tab_idx == row.tab_idx
+                            && entry.pane_id == pane
+                    })
+                    .filter(|_| app.state_colors)
+                    .map(|entry| sidebar_state_color(app, entry));
+                let color = state_color
+                    .map(|color| {
+                        if focused {
+                            color
+                        } else {
+                            fade_toward_background(color, 0.45, app)
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        if focused {
+                            focus_accent(app)
+                        } else {
+                            tab_minimap_pane_color(app)
+                        }
+                    });
+                let style = Style::default().fg(color);
+                if state_color.is_some()
+                    && !focused
+                    && super::panes::color_to_rgb(app.palette.panel_bg).is_none()
+                {
+                    style.add_modifier(Modifier::DIM)
+                } else {
+                    style
+                }
+            },
             frame.buffer_mut(),
         );
     }
@@ -1894,6 +1950,20 @@ fn render_agent_folder_row(
     );
 }
 
+fn sidebar_state_color(app: &AppState, entry: &AgentPanelEntry) -> Color {
+    super::agent_table::agent_status_marker(
+        app,
+        super::agent_table::AgentStatusMarks {
+            state: entry.state,
+            seen: entry.seen,
+            completed: entry.completed,
+            landing: entry.landing,
+            land_failed: entry.land_failed,
+        },
+    )
+    .map_or(app.palette.overlay0, |(_, color)| color)
+}
+
 fn render_agent_rows(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -1919,7 +1989,7 @@ fn render_agent_rows(
             continue;
         };
         let rect = row.rect;
-        if rect.width < 4 || rect.height < AGENT_PANEL_ENTRY_CONTENT_ROWS {
+        if rect.width < 4 || rect.height == 0 {
             continue;
         }
         let is_focused_pane = focused_agent.is_some_and(|(ws_idx, tab_idx, pane_id)| {
@@ -1927,19 +1997,40 @@ fn render_agent_rows(
         });
         let title = agent_entry_title(entry);
         let status_line = agent_status_line(entry);
-        let color = match entry.state {
-            AgentState::Working => app.palette.yellow,
-            AgentState::Blocked => app.palette.red,
-            AgentState::Idle if !entry.seen => app.palette.green,
-            AgentState::Idle => app.palette.overlay0,
-            AgentState::Unknown => app.palette.overlay0,
+        let color = if app.state_colors {
+            sidebar_state_color(app, entry)
+        } else {
+            app.palette.overlay0
         };
-        // The pane you are typing into wears the same accent as the space
-        // outline and the folder above it, as text rather than as a fill, so
-        // the name stays readable on the sidebar. The status bar is left in
-        // its own state color. The accent mutes with the pane borders while
-        // the terminal window itself is unfocused, so the sidebar does not go
-        // on claiming input that the window is not receiving.
+        let arrow = if app.agents_compact { "▸" } else { "▾" };
+        if app.agents_compact {
+            let label = format!(
+                "{:indent$}{}",
+                "",
+                truncate_chars(&entry.name, agent_row_label_width(rect.width) as usize),
+                indent = AGENT_ROW_LABEL_X as usize
+            );
+            render_sidebar_line(
+                frame,
+                rect,
+                Line::styled(
+                    label,
+                    Style::default().fg(if app.state_colors {
+                        color
+                    } else {
+                        app.palette.overlay1
+                    }),
+                ),
+            );
+            // The fold arrow is outside the name's text inset.
+            frame.buffer_mut()[(rect.x + 1, rect.y)]
+                .set_symbol(arrow)
+                .set_fg(app.palette.overlay0);
+            continue;
+        }
+        // In the neutral presentation, focused labels share the space's
+        // accent. With state colors enabled, names share the margin's color.
+        // Neither presentation fills the name's background.
         // Status is shown as a vertical bar running down the entry's left edge
         // instead of a bullet. It is inset by two so it clears the space
         // outline's edge with a column to spare. On live entries the lit cell
@@ -1955,12 +2046,15 @@ fn render_agent_rows(
             )
         };
         let text_width = agent_row_label_width(rect.width) as usize;
-        let (title_fg, status_fg) = if is_focused_pane {
+        let (mut title_fg, status_fg) = if is_focused_pane {
             let accent = focus_accent(app);
             (accent, accent)
         } else {
             (app.palette.overlay1, app.palette.overlay0)
         };
+        if app.state_colors {
+            title_fg = color;
+        }
         let mut title_spans = vec![bar(0)];
         title_spans.push(Span::styled(
             truncate_chars(&title, text_width),
@@ -1971,6 +2065,9 @@ fn render_agent_rows(
             Rect::new(rect.x, rect.y, rect.width, 1),
             Line::from(title_spans),
         );
+        frame.buffer_mut()[(rect.x + 1, rect.y)]
+            .set_symbol(arrow)
+            .set_style(Style::default().fg(app.palette.overlay0));
         render_sidebar_line(
             frame,
             Rect::new(rect.x, rect.y + 1, rect.width, 1),
@@ -2239,9 +2336,12 @@ pub(crate) fn agent_entry_title(entry: &AgentPanelEntry) -> String {
 /// `Fable 5 high · idle`, or just the state when no model is known.
 pub(crate) fn agent_status_line(entry: &AgentPanelEntry) -> String {
     let status = agent_panel_status_key(entry.state, entry.seen);
-    match &entry.model_info {
-        Some(info) => format!("{} · {status}", info.display_label()),
-        None => status.to_string(),
+    match (&entry.model_info, &entry.model_pin_warning) {
+        (Some(info), Some(warning)) => {
+            format!("{} {warning} · {status}", info.display_label())
+        }
+        (Some(info), None) => format!("{} · {status}", info.display_label()),
+        (None, _) => status.to_string(),
     }
 }
 
@@ -2397,6 +2497,8 @@ mod tests {
         app.terminals.get_mut(&terminal_id).unwrap().detected_agent = Some(Agent::Claude);
         app.active = Some(0);
         app.selected = 0;
+        // These legacy focus fixtures exercise the neutral presentation.
+        app.state_colors = false;
         prepare(&mut app);
 
         let runtimes = TerminalRuntimeRegistry::new();
@@ -2627,7 +2729,7 @@ mod tests {
 
     #[test]
     fn end_of_list_space_drop_marker_clears_the_last_space_agents() {
-        let area = Rect::new(0, 0, 28, 26);
+        let area = Rect::new(0, 0, 28, 36);
         let (app, terminal) = render_workspace_drag(area, 2);
         let (cards, _tabs, agent_rows, _) = compute_workspace_list_areas(&app, area);
         let last_agent = agent_rows
@@ -3361,7 +3463,7 @@ mod tests {
 
     #[test]
     fn one_folder_in_two_spaces_heads_each_space_separately() {
-        let area = Rect::new(0, 0, 34, 26);
+        let area = Rect::new(0, 0, 34, 36);
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("alpha"), Workspace::test_new("beta")];
         app.ensure_test_terminals();
@@ -3541,6 +3643,7 @@ mod tests {
                 model: "claude-fable-5".into(),
                 effort: Some("high".into()),
             }),
+            model_pin_warning: None,
             location: Some(location("~/lab/herdr", Some("feat/space-done !"))),
             state: AgentState::Idle,
             seen: true,
@@ -3570,6 +3673,13 @@ mod tests {
     fn agent_status_line_combines_model_effort_and_state() {
         let mut entry = test_entry();
         assert_eq!(agent_status_line(&entry), "Fable 5 high · idle");
+
+        entry.model_pin_warning = Some("⚠ pin Sol medium".into());
+        assert_eq!(
+            agent_status_line(&entry),
+            "Fable 5 high ⚠ pin Sol medium · idle"
+        );
+        entry.model_pin_warning = None;
 
         entry.model_info = None;
         assert_eq!(agent_status_line(&entry), "idle");
@@ -3791,7 +3901,9 @@ mod tests {
     fn overflowing_list_pins_the_new_button_to_the_sidebar_floor() {
         let area = Rect::new(0, 0, 26, 30);
         let mut app = app_with_agents(&[3, 4, 3]);
-        let floor = area.y + area.height - WORKSPACE_SECTION_FOOTER_ROWS - player_rows_for_sidebar(&app, area.height);
+        let floor = area.y + area.height
+            - WORKSPACE_SECTION_FOOTER_ROWS
+            - player_rows_for_sidebar(&app, area.height);
         let max = workspace_list_max_scroll(&app, workspace_list_rect(&app, area));
         assert!(max > 0, "this list should overflow the sidebar");
 
@@ -3811,7 +3923,9 @@ mod tests {
     fn short_list_keeps_the_new_button_under_the_last_entry() {
         let area = Rect::new(0, 0, 26, 40);
         let app = app_with_agents(&[1]);
-        let floor = area.y + area.height - WORKSPACE_SECTION_FOOTER_ROWS - player_rows_for_sidebar(&app, area.height);
+        let floor = area.y + area.height
+            - WORKSPACE_SECTION_FOOTER_ROWS
+            - player_rows_for_sidebar(&app, area.height);
         let rows = compute_workspace_list_areas(&app, area).2;
         let last = rows.last().expect("the space lists its agent").rect;
 
@@ -3843,10 +3957,7 @@ mod tests {
         let expanded = sidebar_player_rect(&app, area);
         let expected = crate::ui::player::player_rows_for_sidebar(&app, area.height);
         assert_eq!(expanded.height, expected);
-        assert_eq!(
-            expanded.y,
-            area.y + area.height - expected
-        );
+        assert_eq!(expanded.y, area.y + area.height - expected);
         let button_expanded = new_workspace_button_rect(&app, area);
         assert!(
             button_expanded.y + button_expanded.height <= expanded.y,
@@ -3943,17 +4054,16 @@ mod tests {
             Workspace::test_new("notes"),
         ];
         app.collapsed_space_keys.insert("repo-key".into());
+        // This fixture measures display-entry scrolling, independently of previews.
+        for ws in &mut app.workspaces {
+            ws.tabs[0].layout_preview_hidden = true;
+        }
         app.active = None;
         app.mode = Mode::Terminal;
 
         // Same packing as before the player: one card in the viewport, one
         // notch of scroll. Extra rows are the collapsed player under + new.
-        let ws_area = Rect::new(
-            0,
-            0,
-            30,
-            8 + crate::ui::player::PLAYER_COLLAPSED_ROWS,
-        );
+        let ws_area = Rect::new(0, 0, 30, 8 + crate::ui::player::PLAYER_COLLAPSED_ROWS);
         let metrics = workspace_list_scroll_metrics(&app, ws_area);
 
         // The collapsed group shows its parent card and the notes card, each
@@ -3978,8 +4088,10 @@ mod tests {
         app.mode = Mode::Terminal;
         app.workspace_scroll = 1;
 
-        let (cards, _tabs, headers, _) =
-            compute_workspace_list_areas(&app, Rect::new(0, 0, 30, 12));
+        let (cards, _tabs, headers, _) = compute_workspace_list_areas(
+            &app,
+            Rect::new(0, 0, 30, 12 + crate::ui::player::PLAYER_COLLAPSED_ROWS),
+        );
 
         assert!(headers.is_empty());
         assert_eq!(cards.len(), 1);
@@ -4375,14 +4487,14 @@ mod tests {
     #[test]
     fn a_split_tab_previews_its_layout_at_the_sidebar_width() {
         let mut app = app_with_agents(&[2]);
+        app.state_colors = false;
         app.view.terminal_area = Rect::new(0, 0, 120, 36);
 
-        // The preview spans the row inside a two-column inset and keeps the
-        // 120x36 shape, so dragging the sidebar wider makes it taller.
+        // Width follows the sidebar; both side-by-side panes stay two rows tall.
         let tab_row =
             |width: u16| compute_workspace_list_areas(&app, Rect::new(0, 0, width, 40)).1[0];
-        assert_eq!(tab_row(26).rect.height, 1 + 6);
-        assert_eq!(tab_row(36).rect.height, 1 + 9);
+        assert_eq!(tab_row(26).rect.height, 1 + 2);
+        assert_eq!(tab_row(36).rect.height, 1 + 2);
 
         let area = Rect::new(0, 0, 26, 40);
         let row = tab_row(26);
@@ -4399,7 +4511,7 @@ mod tests {
         let preview_row: String = (first_x..=last_x)
             .map(|x| buf[(x, rect.y + 1)].symbol())
             .collect();
-        assert_eq!(preview_row, "██████████▌██████████");
+        assert_eq!(preview_row, "██████████ ██████████");
 
         // The arrow sits over the preview's last column, and the pane you are
         // in takes the accent while the other stays muted.
@@ -4451,7 +4563,7 @@ mod tests {
         app.view.terminal_area = Rect::new(0, 0, 120, 36);
         let area = Rect::new(0, 0, 26, 40);
         let row = compute_workspace_list_areas(&app, area).1[0];
-        assert_eq!(row.rect.height, 1 + 6);
+        assert_eq!(row.rect.height, 1 + 2);
         assert!(tab_preview_toggle_rect(&app, &row).is_some());
 
         let runtimes = TerminalRuntimeRegistry::new();
@@ -4465,6 +4577,258 @@ mod tests {
         for y in preview.y..preview.y + preview.height {
             for x in preview.x..preview.x + preview.width {
                 assert_eq!(buf[(x, y)].symbol(), "█", "({x}, {y}) is inside the pane");
+            }
+        }
+    }
+    fn h24_draw(app: &AppState, area: Rect) -> ratatui::buffer::Buffer {
+        let runtimes = TerminalRuntimeRegistry::new();
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| render_workspace_rows(app, &runtimes, frame, area))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn h24_colors_and_compact_rows_match_margin_and_fold_controls() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        app.state = app_with_agents(&[2]);
+        let area = Rect::new(0, 0, 28, 60);
+        app.state.view.sidebar_rect = area;
+        let panes = app.state.workspaces[0].tabs[0].layout.pane_ids();
+        for state in [
+            AgentState::Working,
+            AgentState::Blocked,
+            AgentState::Idle,
+            AgentState::Unknown,
+        ] {
+            for seen in [false, true] {
+                for pane in &panes {
+                    let tab = &mut app.state.workspaces[0].tabs[0];
+                    tab.panes.get_mut(pane).unwrap().seen = seen;
+                    let terminal = tab.terminal_id(*pane).unwrap();
+                    app.state.terminals.get_mut(terminal).unwrap().state = state;
+                }
+                for compact in [false, true] {
+                    for colors in [false, true] {
+                        app.state.agents_compact = compact;
+                        app.state.state_colors = colors;
+                        let buf = h24_draw(&app.state, area);
+                        let (_, tabs, rows, folders) =
+                            compute_workspace_list_areas(&app.state, area);
+                        assert_eq!(rows.len(), 2);
+                        if compact {
+                            assert!(folders.is_empty());
+                            assert_eq!(rows[0].rect.height, 1);
+                            assert_eq!(rows[1].rect.y, rows[0].rect.y + 1);
+                        }
+                        let entries = all_agent_panel_entries_from(
+                            &app.state,
+                            &TerminalRuntimeRegistry::new(),
+                        );
+                        for row in rows {
+                            let entry = entries.iter().find(|e| e.pane_id == row.pane_id).unwrap();
+                            let expected = if colors {
+                                sidebar_state_color(&app.state, entry)
+                            } else if !compact
+                                && row.pane_id == app.state.workspaces[0].tabs[0].layout.focused()
+                            {
+                                focus_accent(&app.state)
+                            } else {
+                                app.state.palette.overlay1
+                            };
+                            assert_eq!(
+                                buf[(row.rect.x + AGENT_ROW_LABEL_X, row.rect.y)].fg,
+                                expected
+                            );
+                            assert_eq!(
+                                buf[(row.rect.x + 1, row.rect.y)].symbol(),
+                                if compact { "▸" } else { "▾" }
+                            );
+                        }
+                        let preview = tab_preview_rect(tabs[0].rect).unwrap();
+                        let focused = app.state.workspaces[0].tabs[0].layout.focused();
+                        for x in preview.x..preview.right() {
+                            let Some(pane) = super::super::minimap::minimap_pane_at(
+                                app.state.workspaces[0].tabs[0].layout.root(),
+                                preview,
+                                x,
+                                preview.y,
+                            ) else {
+                                continue;
+                            };
+                            let entry = entries.iter().find(|e| e.pane_id == pane).unwrap();
+                            let expected = if colors {
+                                let color = sidebar_state_color(&app.state, entry);
+                                if pane == focused {
+                                    color
+                                } else {
+                                    fade_toward_background(color, 0.45, &app.state)
+                                }
+                            } else if pane == focused {
+                                focus_accent(&app.state)
+                            } else {
+                                tab_minimap_pane_color(&app.state)
+                            };
+                            assert_eq!(buf[(x, preview.y)].fg, expected);
+                        }
+                    }
+                }
+            }
+        }
+        app.state.agents_compact = false;
+        for compact in [true, false] {
+            app.state.mode = crate::app::Mode::Prefix;
+            app.handle_prefix_key(crate::input::TerminalKey::new(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+            ));
+            assert_eq!(app.state.agents_compact, compact);
+            let after = h24_draw(&app.state, area);
+            let rows = compute_workspace_list_areas(&app.state, area).2;
+            assert_eq!(
+                rows[0].rect.height,
+                if compact {
+                    1
+                } else {
+                    AGENT_PANEL_ENTRY_CONTENT_ROWS
+                }
+            );
+            assert_eq!(
+                after[(rows[0].rect.x + 1, rows[0].rect.y)].symbol(),
+                if compact { "▸" } else { "▾" }
+            );
+        }
+    }
+
+    #[test]
+    fn h24_spaces_render_example() {
+        let Ok(output) = std::env::var("HERDR_SPACES_RENDER_OUTPUT") else {
+            return;
+        };
+        let mut cells = Vec::new();
+        // Four columns show actual sidebar cards from independent synthetic sessions.
+        for compact in [false, true] {
+            for colors in [true, false] {
+                let caption = format!(
+                    "{} / colors {}",
+                    if compact { "COMPACT" } else { "FULL" },
+                    if colors { "ON" } else { "OFF" }
+                );
+                let mut line = vec![
+                    serde_json::json!({"text":" ","fg":"Rgb(205, 214, 244)","bold":true});
+                    128
+                ];
+                for (x, ch) in caption.chars().enumerate() {
+                    line[x]["text"] = serde_json::json!(ch.to_string());
+                }
+                cells.push(line);
+                let mut buffers = Vec::new();
+                for (count, name) in [
+                    (1, "one pane"),
+                    (2, "two panes"),
+                    (3, "one big + two"),
+                    (8, "eight panes"),
+                ] {
+                    let mut app = app_with_agents(&[count]);
+                    app.workspaces[0].custom_name = Some(name.into());
+                    app.agents_compact = compact;
+                    app.state_colors = colors;
+                    let ids = app.workspaces[0].tabs[0].layout.pane_ids();
+                    fn tree(
+                        ids: &[crate::layout::PaneId],
+                        vertical: bool,
+                    ) -> Box<crate::layout::Node> {
+                        if ids.len() == 1 {
+                            return Box::new(crate::layout::Node::Pane(ids[0]));
+                        }
+                        let middle = ids.len() / 2;
+                        Box::new(crate::layout::Node::Split {
+                            direction: if vertical {
+                                ratatui::layout::Direction::Vertical
+                            } else {
+                                ratatui::layout::Direction::Horizontal
+                            },
+                            ratio: 0.5,
+                            first: tree(&ids[..middle], false),
+                            second: tree(&ids[middle..], false),
+                        })
+                    }
+                    // Install the test split tree through the layout's serialized shape.
+                    let root = if count == 3 {
+                        Box::new(crate::layout::Node::Split {
+                            direction: ratatui::layout::Direction::Horizontal,
+                            ratio: 0.6,
+                            first: tree(&ids[..1], false),
+                            second: tree(&ids[1..], true),
+                        })
+                    } else {
+                        tree(&ids, count == 8)
+                    };
+                    app.workspaces[0].tabs[0].layout =
+                        crate::layout::TileLayout::from_saved(*root, ids[0]);
+                    for (i, pane) in ids.iter().enumerate() {
+                        let tab = &mut app.workspaces[0].tabs[0];
+                        tab.panes.get_mut(pane).unwrap().seen = i % 5 != 3;
+                        let terminal = app
+                            .terminals
+                            .get_mut(tab.terminal_id(*pane).unwrap())
+                            .unwrap();
+                        terminal.set_agent_name(format!("worker{}", i + 1));
+                        terminal.state = match i % 5 {
+                            0 => AgentState::Working,
+                            1 | 2 => AgentState::Blocked,
+                            _ => AgentState::Idle,
+                        };
+                        terminal.session_title = Some("Prepare changes".into());
+                        app.view.agent_locations.insert(
+                            *pane,
+                            AgentLocation {
+                                path: "/sample/project".into(),
+                                git: None,
+                                worktree_state: crate::workspace::GitWorktreeState::default(),
+                                landed: false,
+                            },
+                        );
+                    }
+                    buffers.push(h24_draw(
+                        &app,
+                        Rect::new(0, 0, 32, if compact { 28 } else { 54 }),
+                    ));
+                }
+                for y in 0..buffers[0].area.height {
+                    cells.push(buffers.iter().flat_map(|buf|(0..buf.area.width).map(move|x|{let c=&buf[(x,y)];serde_json::json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bold":c.modifier.contains(Modifier::BOLD)})})).collect::<Vec<_>>());
+                }
+            }
+        }
+        std::fs::write(output, serde_json::to_vec(&cells).unwrap()).unwrap();
+    }
+    #[test]
+    fn h24_terminal_theme_dims_unfocused_state_blocks() {
+        let mut app = app_with_agents(&[2]);
+        app.palette = crate::app::state::Palette::terminal();
+        for terminal in app.terminals.values_mut() {
+            terminal.state = AgentState::Working;
+        }
+        let area = Rect::new(0, 0, 28, 40);
+        let buf = h24_draw(&app, area);
+        let preview = tab_preview_rect(compute_workspace_list_areas(&app, area).1[0].rect).unwrap();
+        let tab = &app.workspaces[0].tabs[0];
+        for x in preview.x..preview.right() {
+            if let Some(pane) =
+                super::super::minimap::minimap_pane_at(tab.layout.root(), preview, x, preview.y)
+            {
+                assert_eq!(
+                    buf[(x, preview.y)].modifier.contains(Modifier::DIM),
+                    pane != tab.layout.focused()
+                );
             }
         }
     }

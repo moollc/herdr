@@ -141,9 +141,15 @@ When one call covers several minimaps, a toggle hides them all if any is shown a
 
 ```bash
 herdr view minimap hide
-herdr view agents --workspace 2
+herdr view agents hide --workspace 2
 herdr view agent-table show
 ```
+
+`herdr view agents compact|full|toggle` controls the remembered detail level
+of all sidebar agents. Compact mode shows one state-colored name per row.
+`herdr view agents show|hide --workspace ID` still shows or hides that space's
+agent area. The API uses `agent_details` with `hide`, `show`, or `toggle` for
+the global compact/full preference; it takes no workspace or tab target.
 
 ## Panes
 

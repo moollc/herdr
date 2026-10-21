@@ -196,9 +196,11 @@ pub enum Tool {
 }
 
 /// Every part of the interface that folds.
-const VIEW_PARTS: [ViewPart; 7] = [
+const VIEW_PARTS: [ViewPart; 9] = [
     ViewPart::Sidebar,
     ViewPart::Spaces,
+    ViewPart::Tasks,
+    ViewPart::AgentDetails,
     ViewPart::AgentTable,
     ViewPart::SpaceAgents,
     ViewPart::SpaceGroup,
@@ -337,6 +339,8 @@ impl Tool {
             Tool::NewWorktree => "make a new git worktree, optionally on a named branch",
             Tool::RemoveWorktree => "remove a worktree and its checkout",
             Tool::LandWorktree => "land or merge a worktree's branch onto its parent branch",
+            Tool::View(ViewPart::AgentDetails) => "fold sidebar agents to compact names or show full details",
+            Tool::View(ViewPart::Tasks) => "fold away or show the Tasks column on the right",
             Tool::View(ViewPart::Sidebar) => "fold away or show the whole sidebar on the left",
             Tool::View(ViewPart::Spaces) => {
                 "fold away or show the list of spaces in the sidebar, all of them at once"

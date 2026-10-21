@@ -127,6 +127,11 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
         help_entry(indexed_label(&kb.switch_tab), "switch tab 1-9"),
         help_entry(keybind_label(&kb.close_tab), "close tab"),
         help_entry(keybind_label(&kb.toggle_sidebar), "toggle sidebar"),
+        help_entry(keybind_label(&kb.toggle_tasks), "toggle Tasks column"),
+        help_entry(
+            keybind_label(&kb.toggle_agents),
+            "compact/full sidebar agents",
+        ),
         help_entry(keybind_label(&kb.toggle_agent_table), "toggle agent table"),
     ];
     groups.push(("spaces / agents", workspace_tab));

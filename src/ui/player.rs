@@ -8,8 +8,10 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::{
     layout::Rect,
@@ -39,6 +41,10 @@ const DAEMON_HOST: &str = "127.0.0.1";
 const DAEMON_PORT: u16 = 8737;
 const POLL_MS: u64 = 750;
 const IO_TIMEOUT: Duration = Duration::from_millis(80);
+const AUTOSTART_WAIT: Duration = Duration::from_secs(5);
+const AUTOSTART_POLL: Duration = Duration::from_millis(100);
+
+static DAEMON_SPAWNING: AtomicBool = AtomicBool::new(false);
 
 const COVER: &str = "♪";
 const PREV: &str = "⏮";
@@ -103,7 +109,9 @@ pub(crate) enum PlayerQueueMode {
     #[default]
     Queue,
     SaveName,
-    SaveOverwrite { name: String },
+    SaveOverwrite {
+        name: String,
+    },
     LoadPicker,
 }
 
@@ -145,13 +153,7 @@ impl Default for PlayerSnapshot {
 
 impl PlayerSnapshot {
     fn playing(&self) -> bool {
-        matches!(
-            self,
-            Self::Online {
-                playing: true,
-                ..
-            }
-        )
+        matches!(self, Self::Online { playing: true, .. })
     }
 
     fn looping(&self) -> bool {
@@ -414,7 +416,9 @@ pub(crate) fn ensure_poller() {
 
 fn refresh_from_daemon() {
     *snapshot_lock() = fetch_snapshot();
-    *playlist_lock() = fetch_playlist();
+    if let Some(playlist) = fetch_playlist_from_daemon() {
+        *playlist_lock() = playlist;
+    }
     apply_settings(fetch_settings_fields());
     *saved_lock() = fetch_saved_names();
 }
@@ -424,8 +428,7 @@ fn fetch_snapshot() -> PlayerSnapshot {
         Some(state) => PlayerSnapshot::Online {
             title: nonempty(state.title),
             artist: nonempty(state.artist),
-            url: nonempty(state.url)
-                .or_else(|| nonempty(state.path)),
+            url: nonempty(state.url).or_else(|| nonempty(state.path)),
             playing: state.playing.unwrap_or(false),
             looping: state
                 .queue
@@ -446,14 +449,18 @@ fn fetch_snapshot() -> PlayerSnapshot {
     }
 }
 
-fn fetch_playlist() -> PlaylistSnapshot {
+fn fetch_playlist_from_daemon() -> Option<PlaylistSnapshot> {
     let Some((status, body)) = daemon_exchange("GET", "/playlist", "") else {
-        return PlaylistSnapshot::default();
+        return None;
     };
     if status != 200 {
-        return PlaylistSnapshot::default();
+        return None;
     }
-    parse_playlist_body(&body)
+    Some(parse_playlist_body(&body))
+}
+
+fn fetch_playlist() -> PlaylistSnapshot {
+    fetch_playlist_from_daemon().unwrap_or_else(PlaylistSnapshot::default)
 }
 
 fn parse_playlist_body(body: &str) -> PlaylistSnapshot {
@@ -524,11 +531,7 @@ fn apply_settings(fields: Vec<SettingsField>) {
     *settings_lock() = fields;
     match found {
         Some(field) => {
-            let value = field
-                .value
-                .as_str()
-                .unwrap_or("comfortable")
-                .to_string();
+            let value = field.value.as_str().unwrap_or("comfortable").to_string();
             *density_key_lock() = Some(field.key);
             *density_value_lock() = value.clone();
             *density_allowed_lock() = field.allowed.unwrap_or_default();
@@ -604,12 +607,97 @@ fn nonempty(value: Option<String>) -> Option<String> {
 }
 
 fn fetch_daemon_state() -> Option<DaemonState> {
-    daemon_http("GET", "/state", "")
-        .and_then(|body| serde_json::from_str(&body).ok())
+    daemon_http("GET", "/state", "").and_then(|body| serde_json::from_str(&body).ok())
 }
 
 fn daemon_http(method: &str, path: &str, body: &str) -> Option<String> {
     daemon_exchange(method, path, body).map(|(_, body)| body)
+}
+
+/// Same resolution pattern as `herdplayer_shell_path` in `sidebar.rs`, but for
+/// `server.js` and `HERDPLAYD_SERVER_PATH`.
+fn herdplay_daemon_server_path() -> Option<std::path::PathBuf> {
+    if let Ok(path) = std::env::var("HERDPLAYD_SERVER_PATH") {
+        return Some(std::path::PathBuf::from(path));
+    }
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        std::path::Path::new(&home)
+            .join("herdplay-workspace")
+            .join("herdplay")
+            .join("daemon")
+            .join("server.js"),
+    )
+}
+
+fn daemon_tcp_reachable() -> bool {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DAEMON_PORT);
+    TcpStream::connect_timeout(&addr, IO_TIMEOUT).is_ok()
+}
+
+fn post_needs_autostart(path: &str) -> bool {
+    matches!(path, "/play" | "/playlist/load")
+}
+
+fn daemon_state_ready() -> bool {
+    daemon_exchange("GET", "/state", "").is_some_and(|(status, _)| status == 200)
+}
+
+fn spawn_herdplay_daemon(server_path: &std::path::Path) -> bool {
+    let Some(cwd) = server_path.parent() else {
+        return false;
+    };
+    Command::new("node")
+        .arg(server_path)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+fn wait_for_daemon_ready() -> bool {
+    let deadline = Instant::now() + AUTOSTART_WAIT;
+    while Instant::now() < deadline {
+        if daemon_state_ready() {
+            return true;
+        }
+        std::thread::sleep(AUTOSTART_POLL);
+    }
+    false
+}
+
+/// Spawn `server.js` once when concurrent play/load POSTs find port 8737 closed.
+fn ensure_daemon_running() -> bool {
+    if daemon_state_ready() {
+        return true;
+    }
+    let Some(server_path) = herdplay_daemon_server_path().filter(|path| path.is_file()) else {
+        return false;
+    };
+    if DAEMON_SPAWNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        let _ = spawn_herdplay_daemon(&server_path);
+        DAEMON_SPAWNING.store(false, Ordering::SeqCst);
+    }
+    wait_for_daemon_ready()
+}
+
+#[cfg(not(test))]
+fn daemon_exchange_with_autostart(method: &str, path: &str, body: &str) -> Option<(u16, String)> {
+    if let Some(response) = daemon_exchange(method, path, body) {
+        return Some(response);
+    }
+    if method != "POST" || !post_needs_autostart(path) || daemon_tcp_reachable() {
+        return None;
+    }
+    if !ensure_daemon_running() {
+        return None;
+    }
+    daemon_exchange(method, path, body)
 }
 
 fn daemon_exchange(method: &str, path: &str, body: &str) -> Option<(u16, String)> {
@@ -671,7 +759,7 @@ fn post_daemon(path: &'static str, body: String) {
         let _ = std::thread::Builder::new()
             .name("herdplay-post".into())
             .spawn(move || {
-                let _ = daemon_http("POST", path, &body);
+                let _ = daemon_exchange_with_autostart("POST", path, &body);
                 refresh_from_daemon();
             });
     }
@@ -696,7 +784,8 @@ fn post_daemon_response(path: &'static str, body: String) -> (u16, String) {
     }
     #[cfg(not(test))]
     {
-        let result = daemon_exchange("POST", path, &body).unwrap_or((0, String::new()));
+        let result =
+            daemon_exchange_with_autostart("POST", path, &body).unwrap_or((0, String::new()));
         refresh_from_daemon();
         result
     }
@@ -775,11 +864,8 @@ pub(crate) fn post_seek_at_bar(bar: Rect, col: u16) {
 }
 
 pub(crate) fn post_playlist_load(index: usize) {
-    let Some(item) = current_playlist().items.get(index).cloned() else {
-        return;
-    };
-    let body = serde_json::json!({ "url": item.url }).to_string();
-    post_daemon("/load", body);
+    let body = serde_json::json!({ "index": index }).to_string();
+    post_daemon("/playlist/play", body);
 }
 
 pub(crate) fn post_playlist_remove(index: usize) {
@@ -1008,8 +1094,6 @@ pub(crate) fn submit_player_add(app: &mut AppState) {
     };
     let body = serde_json::json!({ "url": url }).to_string();
     post_daemon("/playlist/add", body);
-    let title = playlist_title_from_url(&url);
-    playlist_lock().items.push(PlaylistItem { title, url });
     app.player_link.clear();
 }
 
@@ -1035,11 +1119,7 @@ fn looks_like_locator(text: &str) -> bool {
     text.starts_with('/')
         || text.starts_with('\\')
         || text.contains("://")
-        || text
-            .as_bytes()
-            .get(1)
-            .copied()
-            .is_some_and(|b| b == b':' )
+        || text.as_bytes().get(1).copied().is_some_and(|b| b == b':')
             && text
                 .as_bytes()
                 .get(2)
@@ -1241,9 +1321,7 @@ pub(crate) fn player_action_at(app: &AppState, col: u16, row: u16) -> Option<Pla
     if contains(hits.clear, col, row) {
         return Some(PlayerAction::PlaylistClear);
     }
-    if contains(hits.queue, col, row)
-        && !matches!(app.player_queue_mode, PlayerQueueMode::Queue)
-    {
+    if contains(hits.queue, col, row) && !matches!(app.player_queue_mode, PlayerQueueMode::Queue) {
         return Some(PlayerAction::CancelSave);
     }
     if contains(hits.playlist, col, row) {
@@ -1383,14 +1461,12 @@ fn render_too_small_face(frame: &mut Frame, inner: Rect, p: &Palette) {
     let hint_y = inner.y.saturating_add(1);
     if hint_y < inner.y + inner.height {
         frame.render_widget(
-            Paragraph::new(Span::styled(TOO_SMALL_HINT, Style::default().fg(p.overlay0)))
-                .wrap(Wrap { trim: true }),
-            Rect::new(
-                inner.x,
-                hint_y,
-                inner.width,
-                inner.height.saturating_sub(1),
-            ),
+            Paragraph::new(Span::styled(
+                TOO_SMALL_HINT,
+                Style::default().fg(p.overlay0),
+            ))
+            .wrap(Wrap { trim: true }),
+            Rect::new(inner.x, hint_y, inner.width, inner.height.saturating_sub(1)),
         );
     }
 }
@@ -1404,9 +1480,19 @@ fn header_chrome(inner_width: u16) -> (bool, &'static str) {
     let full_w = UnicodeWidthStr::width(full) as u16;
     let short_w = UnicodeWidthStr::width(short) as u16;
     let dens_cost = 1 + density_w;
-    if header_w.saturating_add(dens_cost).saturating_add(1).saturating_add(full_w) <= inner_width {
+    if header_w
+        .saturating_add(dens_cost)
+        .saturating_add(1)
+        .saturating_add(full_w)
+        <= inner_width
+    {
         (true, full)
-    } else if header_w.saturating_add(dens_cost).saturating_add(1).saturating_add(short_w) <= inner_width {
+    } else if header_w
+        .saturating_add(dens_cost)
+        .saturating_add(1)
+        .saturating_add(short_w)
+        <= inner_width
+    {
         (true, short)
     } else {
         (false, full)
@@ -1456,7 +1542,11 @@ fn render_full_face(
         render_link_row(frame, hits, app, p);
     }
 
-    if hits.save.width > 0 || hits.load.width > 0 || hits.clear.width > 0 || hits.overwrite_yes.width > 0 {
+    if hits.save.width > 0
+        || hits.load.width > 0
+        || hits.clear.width > 0
+        || hits.overwrite_yes.width > 0
+    {
         render_queue_chrome(frame, hits, app, p);
     }
 
@@ -1617,10 +1707,7 @@ fn render_volume_row(
             "━".repeat(fill as usize),
             "─".repeat(hits.vol_bar.width.saturating_sub(fill) as usize)
         );
-        frame.render_widget(
-            Paragraph::new(Span::styled(bar, fill_style)),
-            hits.vol_bar,
-        );
+        frame.render_widget(Paragraph::new(Span::styled(bar, fill_style)), hits.vol_bar);
     }
     if hits.vol_up.width > 0 {
         frame.render_widget(
@@ -1636,7 +1723,11 @@ fn render_volume_row(
             Rect::new(pct_x, y, 4, 1),
         );
     }
-    let status_x = hits.volume.x.saturating_add(hits.volume.width).saturating_add(1);
+    let status_x = hits
+        .volume
+        .x
+        .saturating_add(hits.volume.width)
+        .saturating_add(1);
     let status_w = (inner.x + inner.width).saturating_sub(status_x);
     if status_w >= 6 {
         let status = if playing {
@@ -1645,10 +1736,7 @@ fn render_volume_row(
             "paused · via daemon"
         };
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                truncate_width(status, status_w as usize),
-                dim,
-            )),
+            Paragraph::new(Span::styled(truncate_width(status, status_w as usize), dim)),
             Rect::new(status_x, y, status_w, 1),
         );
     }
@@ -1656,7 +1744,10 @@ fn render_volume_row(
 
 fn transport_span(glyph: &'static str, active: bool, p: &Palette) -> Span<'static> {
     if active {
-        Span::styled(glyph, Style::default().fg(p.accent).add_modifier(Modifier::BOLD))
+        Span::styled(
+            glyph,
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        )
     } else {
         Span::styled(glyph, Style::default().fg(p.overlay0))
     }
@@ -1728,7 +1819,9 @@ fn inner_row_x(hits: &PlayerHitAreas) -> u16 {
     } else if hits.queue.width > 0 {
         hits.queue.x
     } else {
-        hits.save.x.saturating_sub(UnicodeWidthStr::width(QUEUE_LABEL) as u16 + 1)
+        hits.save
+            .x
+            .saturating_sub(UnicodeWidthStr::width(QUEUE_LABEL) as u16 + 1)
     }
 }
 
@@ -1742,7 +1835,11 @@ fn inner_row_w(hits: &PlayerHitAreas, row_x: u16) -> u16 {
             .saturating_add(hits.clear.width)
             .max(hits.load.x.saturating_add(hits.load.width))
             .max(hits.save.x.saturating_add(hits.save.width))
-            .max(hits.overwrite_yes.x.saturating_add(hits.overwrite_yes.width));
+            .max(
+                hits.overwrite_yes
+                    .x
+                    .saturating_add(hits.overwrite_yes.width),
+            );
         right.saturating_sub(row_x)
     }
 }
@@ -1761,7 +1858,11 @@ fn render_overwrite_row(
         _ => return,
     };
     let prompt = format!("replace '{name}'?");
-    let trailing = hits.overwrite_no.width.saturating_add(hits.overwrite_yes.width).saturating_add(1);
+    let trailing = hits
+        .overwrite_no
+        .width
+        .saturating_add(hits.overwrite_yes.width)
+        .saturating_add(1);
     let budget = row_w.saturating_sub(trailing.saturating_add(1)) as usize;
     let prompt = truncate_width(&prompt, budget);
     let pad = budget.saturating_sub(UnicodeWidthStr::width(prompt.as_str()));
@@ -1789,7 +1890,10 @@ fn render_playlist(frame: &mut Frame, area: Rect, app: &AppState, p: &Palette) {
         .min(playlist.items.len().saturating_sub(area.height as usize));
     if playlist.items.is_empty() {
         frame.render_widget(
-            Paragraph::new(Span::styled(PLAYLIST_EMPTY, Style::default().fg(p.overlay0))),
+            Paragraph::new(Span::styled(
+                PLAYLIST_EMPTY,
+                Style::default().fg(p.overlay0),
+            )),
             Rect::new(area.x, area.y, area.width, 1),
         );
         return;
@@ -1887,10 +1991,19 @@ fn render_scrub_row(
         frame.render_widget(Paragraph::new(Span::styled(bar, bar_style)), hits.scrub);
     }
     let dur_x = inner.x + inner.width.saturating_sub(SCRUB_TIME_W);
-    if dur_x + 1 < inner.x + inner.width && (hits.scrub.width == 0 || dur_x >= hits.scrub.x + hits.scrub.width) {
-        let duration_text = format!("{:>width$}", fmt_time(duration), width = SCRUB_TIME_W as usize);
+    if dur_x + 1 < inner.x + inner.width
+        && (hits.scrub.width == 0 || dur_x >= hits.scrub.x + hits.scrub.width)
+    {
+        let duration_text = format!(
+            "{:>width$}",
+            fmt_time(duration),
+            width = SCRUB_TIME_W as usize
+        );
         frame.render_widget(
-            Paragraph::new(Span::styled(truncate_width(&duration_text, SCRUB_TIME_W as usize), dim)),
+            Paragraph::new(Span::styled(
+                truncate_width(&duration_text, SCRUB_TIME_W as usize),
+                dim,
+            )),
             Rect::new(dur_x, y, SCRUB_TIME_W, 1),
         );
     }
@@ -1917,7 +2030,8 @@ fn render_link_row(frame: &mut Frame, hits: PlayerHitAreas, app: &AppState, p: &
         typed
     };
     let placeholder = truncate_width(&show, hits.input.width as usize);
-    let pad = (hits.input.width as usize).saturating_sub(UnicodeWidthStr::width(placeholder.as_str()));
+    let pad =
+        (hits.input.width as usize).saturating_sub(UnicodeWidthStr::width(placeholder.as_str()));
     let invalid = saving && !empty && !valid_playlist_name(&app.player_save_name.text());
     let field_fg = if invalid {
         p.peach
@@ -1936,23 +2050,21 @@ fn render_link_row(frame: &mut Frame, hits: PlayerHitAreas, app: &AppState, p: &
         Style::default().fg(field_fg).bg(field_bg),
     )];
     if pad > 0 {
-        spans.push(Span::styled(
-            " ".repeat(pad),
-            Style::default().bg(field_bg),
-        ));
+        spans.push(Span::styled(" ".repeat(pad), Style::default().bg(field_bg)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), hits.input);
     if hits.cancel.width > 0 {
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                CANCEL_LABEL,
-                Style::default().fg(p.overlay0),
-            )),
+            Paragraph::new(Span::styled(CANCEL_LABEL, Style::default().fg(p.overlay0))),
             hits.cancel,
         );
     }
     if hits.add.width > 0 {
-        let label = if saving { SAVE_CONFIRM_LABEL } else { ADD_LABEL };
+        let label = if saving {
+            SAVE_CONFIRM_LABEL
+        } else {
+            ADD_LABEL
+        };
         frame.render_widget(
             Paragraph::new(Span::styled(
                 label,
@@ -1987,12 +2099,7 @@ fn draw_rounded_box(frame: &mut Frame, rect: Rect, border: Style) {
 
 #[cfg(test)]
 fn layout_hits(player_rect: Rect, expanded: bool, snapshot: &PlayerSnapshot) -> PlayerHitAreas {
-    layout_hits_with_mode(
-        player_rect,
-        expanded,
-        snapshot,
-        &PlayerQueueMode::Queue,
-    )
+    layout_hits_with_mode(player_rect, expanded, snapshot, &PlayerQueueMode::Queue)
 }
 
 fn layout_hits_with_mode(
@@ -2177,7 +2284,10 @@ fn layout_full_hits(
             TransportKind::Shuffle,
         ];
         let gap = 2u16;
-        let glyph_w: u16 = glyphs.iter().map(|g| UnicodeWidthStr::width(*g) as u16).sum();
+        let glyph_w: u16 = glyphs
+            .iter()
+            .map(|g| UnicodeWidthStr::width(*g) as u16)
+            .sum();
         let total = glyph_w + gap * (glyphs.len() as u16 - 1);
         let mut x = inner.x + inner.width.saturating_sub(total) / 2;
         for (glyph, kind) in glyphs.into_iter().zip(kinds) {
@@ -2560,10 +2670,7 @@ mod tests {
         assert_eq!(player_rows(&app), PLAYER_COLLAPSED_ROWS);
         assert_eq!(PLAYER_COLLAPSED_ROWS, 3);
         app.player_expanded = true;
-        assert_eq!(
-            player_rows_for_sidebar(&app, 40),
-            full_player_rows(40)
-        );
+        assert_eq!(player_rows_for_sidebar(&app, 40), full_player_rows(40));
         assert!(full_player_rows(40) > PLAYER_COLLAPSED_ROWS);
         assert!(full_player_rows(40) >= PLAYER_FULL_MIN_ROWS);
     }
@@ -2733,7 +2840,8 @@ mod tests {
     fn add_posts_then_clears_the_paste_field() {
         let _guard = lock_test_player();
         let mut app = crate::app::state::AppState::test_new();
-        app.player_link.set_text(" /System/Library/Sounds/Glass.aiff ");
+        app.player_link
+            .set_text(" /System/Library/Sounds/Glass.aiff ");
         take_test_posts();
         submit_player_add(&mut app);
         let posts = take_test_posts();
@@ -2810,8 +2918,14 @@ mod tests {
         let app = expanded_app(Rect::new(0, 10, 32, 20));
         let hits = player_hit_areas(&app);
         assert_eq!(hits.clear, Rect::default());
-        assert!(hits.save.width > 0, "save stays on an empty queue: {hits:?}");
-        assert!(hits.load.width > 0, "load stays on an empty queue: {hits:?}");
+        assert!(
+            hits.save.width > 0,
+            "save stays on an empty queue: {hits:?}"
+        );
+        assert!(
+            hits.load.width > 0,
+            "load stays on an empty queue: {hits:?}"
+        );
         assert_eq!(hits.playlist.y, hits.input.y + 2);
         assert_eq!(
             player_action_at(&app, hits.save.x, hits.save.y),
@@ -2967,9 +3081,9 @@ mod tests {
         take_test_posts();
         post_playlist_load(0);
         let posts = take_test_posts();
-        assert_eq!(posts[0].0, "/load");
+        assert_eq!(posts[0].0, "/playlist/play");
         let body: serde_json::Value = serde_json::from_str(&posts[0].1).unwrap();
-        assert_eq!(body["url"], "/System/Library/Sounds/Glass.aiff");
+        assert_eq!(body["index"], 0);
 
         take_test_posts();
         post_playlist_remove(1);
@@ -3016,7 +3130,10 @@ mod tests {
             seekable: false,
         });
         post_seek_at_bar(bar, 19);
-        assert!(take_test_posts().is_empty(), "unseekable must not POST /seek");
+        assert!(
+            take_test_posts().is_empty(),
+            "unseekable must not POST /seek"
+        );
     }
 
     #[test]
@@ -3212,7 +3329,10 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&posts[0].1).unwrap();
         assert_eq!(body["key"], "density");
         assert_eq!(body["value"], "large-text");
-        assert!(body["value"].is_string(), "settings value must be JSON string");
+        assert!(
+            body["value"].is_string(),
+            "settings value must be JSON string"
+        );
 
         set_test_settings(vec![SettingsField {
             key: "density".into(),
@@ -3307,6 +3427,39 @@ mod tests {
         let names = parse_saved_names(r#"{"names":["gym","wave3-test"]}"#);
         assert_eq!(names, vec!["gym", "wave3-test"]);
         assert!(parse_saved_names(r#"{"names":[]}"#).is_empty());
+    }
+
+    #[test]
+    fn post_needs_autostart_only_play_and_load() {
+        assert!(post_needs_autostart("/play"));
+        assert!(post_needs_autostart("/playlist/load"));
+        assert!(!post_needs_autostart("/pause"));
+        assert!(!post_needs_autostart("/playlist/play"));
+        assert!(!post_needs_autostart("/volume"));
+        assert!(!post_needs_autostart("/playlist/add"));
+    }
+
+    #[test]
+    fn herdplay_daemon_server_path_resolves_default_layout() {
+        if std::env::var("HERDPLAYD_SERVER_PATH").is_ok() {
+            return;
+        }
+        let Some(home) = std::env::var_os("HOME") else {
+            assert!(herdplay_daemon_server_path().is_none());
+            return;
+        };
+        let path = herdplay_daemon_server_path().expect("HOME should be available");
+        assert!(path.starts_with(home));
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("server.js")
+        );
+        assert!(
+            path.to_string_lossy()
+                .contains("herdplay-workspace/herdplay/daemon"),
+            "{}",
+            path.display()
+        );
     }
 
     fn expanded_app_mode(

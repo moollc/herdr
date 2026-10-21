@@ -976,6 +976,7 @@ pub struct ViewState {
     pub composer: crate::ui::ComposerLayout,
     /// Left column of space cards and the agents under them.
     pub sidebar_rect: Rect,
+    pub tasks_rect: Rect,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
     pub tab_row_areas: Vec<TabRowArea>,
     pub agent_row_areas: Vec<AgentRowArea>,
@@ -1018,6 +1019,7 @@ impl Default for ViewState {
             layout: ViewLayout::Desktop,
             composer: crate::ui::ComposerLayout::default(),
             sidebar_rect: Rect::default(),
+            tasks_rect: Rect::default(),
             workspace_card_areas: Vec::new(),
             tab_row_areas: Vec::new(),
             agent_row_areas: Vec::new(),
@@ -1984,6 +1986,12 @@ pub struct AppState {
     pub usage_config: crate::config::UsageDisplayConfig,
     /// The latest allowance readings, drawn in pane headers and the sidebar.
     pub usage_snapshot: Option<crate::usage::UsageSnapshot>,
+    /// Pure snapshot of the optional file-backed Tasks panel.
+    pub board: crate::board::BoardSnapshot,
+    pub tasks: crate::tasks::TasksSnapshot,
+    pub tasks_collapsed: bool,
+    pub agents_compact: bool,
+    pub state_colors: bool,
     /// Epoch seconds the countdowns are worked from. Set once per frame by
     /// `compute_view`, so drawing reads no clock.
     pub usage_now: u64,
@@ -2445,6 +2453,11 @@ impl AppState {
             pane_header: PaneHeaderConfig::default(),
             usage_config: crate::config::UsageDisplayConfig::default(),
             usage_snapshot: None,
+            board: crate::board::BoardSnapshot::default(),
+            tasks: crate::tasks::TasksSnapshot::default(),
+            tasks_collapsed: false,
+            agents_compact: false,
+            state_colors: true,
             usage_now: 0,
             pane_history_persistence: false,
             refresh_summary_with_grok: false,

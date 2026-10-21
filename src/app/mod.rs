@@ -148,6 +148,8 @@ pub struct App {
     pub(crate) copy_feedback_deadline: Option<Instant>,
     pub(crate) last_git_remote_status_refresh: Instant,
     pub(crate) last_player_poll: Instant,
+    pub(crate) board_watcher: crate::board::BoardWatcher,
+    pub(crate) tasks_watcher: crate::tasks::TasksWatcher,
     pub(crate) last_player_snapshot: crate::ui::player::PlayerSnapshot,
     pub(crate) last_player_playlist: crate::ui::player::PlaylistSnapshot,
     pub(crate) last_player_density: crate::ui::player::PlayerDensity,
@@ -348,6 +350,8 @@ impl App {
         let mut restored_sidebar_collapsed = false;
         let mut restored_agent_table_collapsed = false;
         let mut restored_spaces_collapsed = false;
+        let mut restored_tasks_collapsed = false;
+        let mut restored_agents_compact = false;
         let mut restored_usage_hidden = false;
         let (workspaces, active, selected) = if no_session {
             (Vec::new(), None, 0)
@@ -362,6 +366,8 @@ impl App {
             restored_sidebar_collapsed = snap.sidebar_collapsed;
             restored_agent_table_collapsed = snap.agent_table_collapsed;
             restored_spaces_collapsed = snap.spaces_collapsed;
+            restored_tasks_collapsed = snap.tasks_collapsed;
+            restored_agents_compact = snap.agents_compact;
             restored_usage_hidden = snap.usage_hidden;
             let history = config
                 .experimental
@@ -576,6 +582,11 @@ impl App {
             pane_header: config.ui.pane_header,
             usage_config: config.ui.usage.clone(),
             usage_snapshot: None,
+            board: crate::board::BoardSnapshot::default(),
+            tasks: crate::tasks::TasksSnapshot::default(),
+            tasks_collapsed: restored_tasks_collapsed,
+            agents_compact: restored_agents_compact,
+            state_colors: config.ui.state_colors,
             usage_now: 0,
             pane_history_persistence: config.experimental.pane_history,
             refresh_summary_with_grok: config.ui.refresh_summary_with_grok,
@@ -663,6 +674,12 @@ impl App {
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
             last_player_poll: Instant::now() - PLAYER_POLL_INTERVAL,
+            tasks_watcher: crate::tasks::TasksWatcher::new(crate::tasks::configured_path(
+                config.tasks_file.as_deref(),
+            )),
+            board_watcher: crate::board::BoardWatcher::new(crate::board::configured_path(
+                config.board_file.as_deref(),
+            )),
             last_player_snapshot: crate::ui::player::PlayerSnapshot::default(),
             last_player_playlist: crate::ui::player::PlaylistSnapshot::default(),
             last_player_density: crate::ui::player::PlayerDensity::default(),
@@ -777,6 +794,8 @@ impl App {
         app.state.sidebar_collapsed = snapshot.sidebar_collapsed;
         app.state.agent_table_collapsed = snapshot.agent_table_collapsed;
         app.state.spaces_collapsed = snapshot.spaces_collapsed;
+        app.state.tasks_collapsed = snapshot.tasks_collapsed;
+        app.state.agents_compact = snapshot.agents_compact;
         app.state.usage_hidden = snapshot.usage_hidden;
         app.state.mode = if app.state.active.is_some() {
             state::Mode::Terminal
@@ -1282,6 +1301,15 @@ impl App {
         let invalid_section =
             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
 
+        if !invalid_section("tasks_file") {
+            self.tasks_watcher
+                .set_path(crate::tasks::configured_path(config.tasks_file.as_deref()));
+        }
+        if !invalid_section("board_file") {
+            self.board_watcher
+                .set_path(crate::board::configured_path(config.board_file.as_deref()));
+        }
+
         if !invalid_section("keys") {
             match config.live_keybinds() {
                 Ok(live) => {
@@ -1334,6 +1362,7 @@ impl App {
                 config.ui.show_agent_labels_on_pane_borders;
             self.state.pane_header = config.ui.pane_header;
             self.state.usage_config = config.ui.usage.clone();
+            self.state.state_colors = config.ui.state_colors;
             self.state.accent = crate::config::parse_color(&config.ui.accent);
             if !self.state.local_sound_playback && self.state.sound != config.ui.sound {
                 self.state.request_client_config_reload = true;
@@ -4729,5 +4758,51 @@ last_pane = "prefix+tab"
         assert!(app.state.config_diagnostic.is_none());
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+    }
+    #[test]
+    fn board_config_reload_enables_and_disables_the_runtime_snapshot() {
+        let mut app = test_app();
+        let mut config = crate::config::Config {
+            board_file: Some(
+                std::env::temp_dir()
+                    .join(format!("absent-board-{}.json", rand::random::<u64>()))
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..Default::default()
+        };
+        app.apply_live_config(&config, &[], &[], false);
+        assert!(app.poll_board_if_due(Instant::now()));
+        assert!(app.state.board.configured);
+        assert!(app.state.board.error.is_some());
+        // Invalid path settings keep the current watcher during live reload.
+        config.board_file = None;
+        app.apply_live_config(&config, &[], &["board_file".into()], false);
+        assert!(app.board_watcher.deadline().is_some());
+        app.apply_live_config(&config, &[], &[], false);
+        assert!(app.poll_board_if_due(Instant::now()));
+        assert!(!app.state.board.configured);
+        assert!(app.board_watcher.deadline().is_none());
+    }
+    #[test]
+    fn tasks_config_reload_enables_removes_and_preserves_invalid_path() {
+        let mut app = test_app();
+        let path =
+            std::env::temp_dir().join(format!("tasks-config-{}.json", rand::random::<u64>()));
+        std::fs::write(&path, r#"{"rows":[]}"#).unwrap();
+        let mut config = Config {
+            tasks_file: Some(path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        app.apply_live_config(&config, &[], &[], false);
+        assert!(app.poll_board_if_due(Instant::now()));
+        assert!(app.state.tasks.configured);
+        config.tasks_file = None;
+        app.apply_live_config(&config, &[], &["tasks_file".into()], false);
+        assert!(app.tasks_watcher.deadline().is_some());
+        app.apply_live_config(&config, &[], &[], false);
+        assert!(app.poll_board_if_due(Instant::now()));
+        assert!(!app.state.tasks.configured);
+        assert!(app.tasks_watcher.deadline().is_none());
     }
 }
