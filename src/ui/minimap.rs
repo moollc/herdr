@@ -3,11 +3,11 @@ use crate::layout::{Node, PaneId};
 use ratatui::{
     buffer::Buffer,
     layout::{Direction, Rect},
-    style::Style,
+    style::{Color, Modifier, Style},
 };
 
-/// Each pane starts with two text rows. A pane beside stacked panes spans
-/// their rows and gaps, just as it does in the full layout.
+/// Each pane starts with two rows. Neighbours have a full-cell gutter
+/// matching the card background, horizontally and vertically.
 pub(crate) fn block_rows(root: &Node) -> u16 {
     minimum_span(root, Direction::Vertical)
 }
@@ -86,6 +86,18 @@ fn blocks(root: &Node, area: Rect, visit: &mut impl FnMut(PaneId, Rect)) {
     blocks(second, two, visit);
 }
 
+/// Convert faint foregrounds to a dimmer fill too: SGR DIM affects text,
+/// but terminals do not dim cell backgrounds. Keep the original hue.
+fn fill_color(style: Style) -> Color {
+    let color = style.fg.unwrap_or(Color::Reset);
+    if style.add_modifier.contains(Modifier::DIM) {
+        if let Some((r, g, b)) = super::panes::color_to_rgb(color) {
+            return Color::Rgb(r / 2, g / 2, b / 2);
+        }
+    }
+    color
+}
+
 pub(crate) fn render_blocks(
     root: &Node,
     area: Rect,
@@ -93,11 +105,13 @@ pub(crate) fn render_blocks(
     buf: &mut Buffer,
 ) {
     blocks(root, area, &mut |id, rect| {
-        let pane_style = style(id);
+        let color = fill_color(style(id));
         for y in rect.y..rect.bottom() {
             for x in rect.x..rect.right() {
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_symbol("█").set_style(pane_style);
+                    // Background spaces cover the complete cell, including
+                    // font leading. Gutters retain the card's own background.
+                    cell.set_symbol(" ").set_style(Style::default().bg(color));
                 }
             }
         }
@@ -117,7 +131,6 @@ pub(crate) fn minimap_pane_at(root: &Node, area: Rect, col: u16, row: u16) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::style::Color;
     fn pane(id: u32) -> Box<Node> {
         Box::new(Node::Pane(PaneId::from_raw(id)))
     }
@@ -128,6 +141,13 @@ mod tests {
             first,
             second,
         })
+    }
+    fn solid(buf: &Buffer, x: u16, y: u16) -> &str {
+        if buf[(x, y)].bg != Color::Reset {
+            "█"
+        } else {
+            " "
+        }
     }
     fn draw(root: &Node, width: u16) -> Buffer {
         let area = Rect::new(0, 0, width, block_rows(root));
@@ -156,7 +176,7 @@ mod tests {
         let buf = draw(&root, 11);
         assert_eq!(buf.area.height, 5);
         let rows: Vec<String> = (0..5)
-            .map(|y| (0..11).map(|x| buf[(x, y)].symbol()).collect())
+            .map(|y| (0..11).map(|x| solid(&buf, x, y)).collect())
             .collect();
         assert_eq!(
             rows,
@@ -171,10 +191,14 @@ mod tests {
         for y in 0..5 {
             for x in 0..11 {
                 let id = minimap_pane_at(&root, buf.area, x, y);
-                assert_eq!(id.is_some(), buf[(x, y)].symbol() == "█");
+                assert_eq!(id.is_some(), solid(&buf, x, y) != " ");
                 if let Some(id) = id {
                     assert_eq!(
-                        buf[(x, y)].fg,
+                        if buf[(x, y)].bg == Color::Reset {
+                            buf[(x, y)].fg
+                        } else {
+                            buf[(x, y)].bg
+                        },
                         if id.raw() == 0 {
                             Color::Yellow
                         } else {
@@ -211,6 +235,126 @@ mod tests {
             }
         }
         assert_eq!(ids.len(), 8);
-        assert!((0..21).all(|x| buf[(x, 2)].symbol() == " "));
+        assert!((0..21).all(|x| solid(&buf, x, 2) == " "));
+    }
+    #[test]
+    fn h25_stacked_background_blocks_have_full_row_gutters_and_offset_hits() {
+        let root = split(
+            Direction::Vertical,
+            pane(0),
+            split(Direction::Vertical, pane(1), pane(2)),
+        );
+        let area = Rect::new(3, 7, 9, block_rows(&root));
+        assert_eq!(area.height, 8);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 20));
+        render_blocks(
+            &root,
+            area,
+            |id| Style::default().fg(Color::Rgb(40 + id.raw() as u8, 80, 120)),
+            &mut buf,
+        );
+        let mut rects = Vec::new();
+        blocks(&root, area, &mut |id, rect| rects.push((id, rect)));
+        for pair in rects.windows(2) {
+            assert_eq!(pair[1].1.y - pair[0].1.bottom(), 1);
+            for x in area.x..area.right() {
+                assert_eq!(buf[(x, pair[0].1.bottom())].bg, Color::Reset);
+                assert_eq!(minimap_pane_at(&root, area, x, pair[0].1.bottom()), None);
+            }
+        }
+        for (id, rect) in rects {
+            for y in rect.y..rect.bottom() {
+                let cell = &buf[(area.x, y)];
+                assert_eq!(cell.symbol(), " ");
+                assert_eq!(cell.bg, Color::Rgb(40 + id.raw() as u8, 80, 120));
+                assert_eq!(minimap_pane_at(&root, area, area.x, y), Some(id));
+            }
+        }
+        assert_eq!(minimap_pane_at(&root, area, area.x, area.y - 1), None);
+        assert_eq!(minimap_pane_at(&root, area, area.x, area.bottom()), None);
+    }
+
+    #[test]
+    fn h25_clipped_and_narrow_previews_target_only_painted_cells() {
+        let roots = [
+            pane(0),
+            split(Direction::Horizontal, pane(0), pane(1)),
+            split(
+                Direction::Horizontal,
+                pane(0),
+                split(Direction::Vertical, pane(1), pane(2)),
+            ),
+            split(
+                Direction::Vertical,
+                split(Direction::Horizontal, pane(0), pane(1)),
+                split(
+                    Direction::Horizontal,
+                    pane(2),
+                    split(Direction::Horizontal, pane(3), pane(4)),
+                ),
+            ),
+        ];
+        for root in roots {
+            for width in 0..24 {
+                for height in 0..8 {
+                    let area = Rect::new(2, 3, width, height);
+                    let mut buf = Buffer::empty(Rect::new(0, 0, 30, 15));
+                    render_blocks(
+                        &root,
+                        area,
+                        |id| Style::default().fg(Color::Rgb(id.raw() as u8 + 1, 80, 120)),
+                        &mut buf,
+                    );
+                    for y in 0..15 {
+                        for x in 0..30 {
+                            let c = &buf[(x, y)];
+                            let color = if c.bg != Color::Reset { c.bg } else { c.fg };
+                            let hit = minimap_pane_at(&root, area, x, y);
+                            assert_eq!(
+                                hit.map(|id| Color::Rgb(id.raw() as u8 + 1, 80, 120)),
+                                (color != Color::Reset).then_some(color),
+                                "at {x},{y} in {area:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn h25_gutters_keep_the_card_background_and_every_cell_is_a_space() {
+        let root = split(
+            Direction::Horizontal,
+            pane(0),
+            split(Direction::Vertical, pane(1), pane(2)),
+        );
+        let area = Rect::new(0, 0, 11, block_rows(&root));
+        for background in [Color::Reset, Color::Rgb(24, 24, 37)] {
+            let mut buf = Buffer::filled(
+                area,
+                ratatui::buffer::Cell::default().set_bg(background).clone(),
+            );
+            render_blocks(
+                &root,
+                area,
+                |_| Style::default().fg(Color::Yellow),
+                &mut buf,
+            );
+            for y in 0..area.height {
+                for x in 0..area.width {
+                    let cell = &buf[(x, y)];
+                    assert_eq!(cell.symbol(), " ");
+                    assert_eq!(cell.modifier, Modifier::empty());
+                    assert_eq!(
+                        cell.bg,
+                        if minimap_pane_at(&root, area, x, y).is_some() {
+                            Color::Yellow
+                        } else {
+                            background
+                        }
+                    );
+                }
+            }
+        }
     }
 }

@@ -17,25 +17,23 @@ pub(super) fn tab_attention_priority(state: crate::detect::AgentState, seen: boo
 }
 
 fn parse_api_key(key: &str) -> Option<crossterm::event::KeyEvent> {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    let normalized = key.trim();
-    match normalized {
-        "Enter" | "enter" => Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())),
-        "Tab" | "tab" => Some(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty())),
-        "Esc" | "esc" => Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
-        "Backspace" | "backspace" => Some(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty())),
-        "Up" | "up" => Some(KeyEvent::new(KeyCode::Up, KeyModifiers::empty())),
-        "Down" | "down" => Some(KeyEvent::new(KeyCode::Down, KeyModifiers::empty())),
-        "Left" | "left" => Some(KeyEvent::new(KeyCode::Left, KeyModifiers::empty())),
-        "Right" | "right" => Some(KeyEvent::new(KeyCode::Right, KeyModifiers::empty())),
-        "C-c" | "c-c" | "ctrl+c" => Some(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-        _ if normalized.len() == 1 => normalized
-            .chars()
-            .next()
-            .map(|ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty())),
-        _ => None,
+    let (code, mut modifiers) = crate::input::parse_key_combo(key)?;
+    // Binding matching normalizes Shift+Tab to BackTab without Shift; the
+    // terminal encoder needs the physical modifier restored.
+    if code == crossterm::event::KeyCode::BackTab {
+        modifiers.insert(crossterm::event::KeyModifiers::SHIFT);
     }
+    Some(crossterm::event::KeyEvent::new(code, modifiers))
+}
+
+fn invalid_api_key(key: &str) -> String {
+    format!(
+        "{key:?}; accepted forms: a character or named key (Enter/Return, Esc/Escape, \
+         Tab, BackTab, Backspace, arrows, Home, End, PageUp, PageDown, Insert, Delete, \
+         F1-F35, space, plus, minus, punctuation aliases, left/right modifier keys), \
+         with ctrl/control/C, alt/option/meta, shift, cmd/command/super or hyper \
+         modifiers joined by + or - (case-insensitive), e.g. ctrl+enter, C-Enter, alt-shift-x"
+    )
 }
 
 pub(super) fn encode_api_text(runtime: &crate::terminal::TerminalRuntime, text: &str) -> Vec<u8> {
@@ -373,9 +371,16 @@ pub(super) fn encode_api_keys(
     let mut encoded_keys = Vec::with_capacity(keys.len());
     for key in keys {
         let Some(key_event) = parse_api_key(key) else {
-            return Err(key.clone());
+            return Err(invalid_api_key(key));
         };
-        encoded_keys.push(runtime.encode_terminal_key(key_event.into()));
+        let encoded = runtime.encode_terminal_key(key_event.into());
+        if encoded.is_empty() {
+            return Err(format!(
+                "{}; this key has no encoding in the pane's active terminal mode",
+                invalid_api_key(key)
+            ));
+        }
+        encoded_keys.push(encoded);
     }
     Ok(encoded_keys)
 }
@@ -427,6 +432,172 @@ pub(super) fn normalize_custom_status(status: Option<String>) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn api_keys_encode_for_live_terminal_modes() {
+        let (runtime, _) = test_runtime();
+        for (mode, enter) in [
+            (b"".as_slice(), b"\x1b[27;5;13~".as_slice()),
+            (b"\x1b[>1u".as_slice(), b"\x1b[13;5u".as_slice()),
+        ] {
+            runtime.test_process_pty_bytes(mode);
+            for form in [
+                "ctrl+enter",
+                "ctrl+Enter",
+                "C-Enter",
+                "ctrl-enter",
+                "CTRL+ENTER",
+            ] {
+                assert_eq!(
+                    encode_api_keys(&runtime, &[form.into()]).unwrap(),
+                    vec![enter.to_vec()],
+                    "{form}"
+                );
+            }
+            for (form, expected) in [
+                ("Tab", b"\t".as_slice()),
+                (
+                    "Escape",
+                    if mode.is_empty() {
+                        b"\x1b".as_slice()
+                    } else {
+                        b"\x1b[27u".as_slice()
+                    },
+                ),
+                ("Return", b"\r"),
+                (
+                    "C-c",
+                    if mode.is_empty() {
+                        b"\x03".as_slice()
+                    } else {
+                        b"\x1b[99;5u".as_slice()
+                    },
+                ),
+                ("alt+up", b"\x1b[1;3A"),
+                (
+                    "alt-shift-x",
+                    if mode.is_empty() {
+                        b"\x1bX".as_slice()
+                    } else {
+                        b"\x1b[120;4u".as_slice()
+                    },
+                ),
+                (
+                    "shift+tab",
+                    if mode.is_empty() {
+                        b"\x1b[Z".as_slice()
+                    } else {
+                        b"\x1b[9;2u".as_slice()
+                    },
+                ),
+                ("A", b"A"),
+                ("+", b"+"),
+                ("-", b"-"),
+                ("ö", "ö".as_bytes()),
+            ] {
+                assert_eq!(
+                    encode_api_keys(&runtime, &[form.into()]).unwrap(),
+                    vec![expected.to_vec()],
+                    "{form}"
+                );
+            }
+        }
+        assert_eq!(
+            encode_api_keys(&runtime, &["ctrl+m".into()]).unwrap(),
+            vec![b"\x1b[109;5u".to_vec()]
+        );
+        assert_eq!(
+            encode_api_keys(&runtime, &["cmd+enter".into()]).unwrap(),
+            vec![b"\x1b[13;9u".to_vec()]
+        );
+        runtime.test_process_pty_bytes(b"\x1b[<u");
+        assert_eq!(
+            encode_api_keys(&runtime, &["ctrl+m".into()]).unwrap(),
+            vec![b"\r".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn api_keys_encode_modifier_combinations_and_functional_keys() {
+        let (runtime, _) = test_runtime();
+        runtime.test_process_pty_bytes(b"\x1b[>1u");
+        for bits in 0..16 {
+            let mut form = String::new();
+            for (bit, name) in [(1, "shift"), (2, "alt"), (4, "ctrl"), (8, "super")] {
+                if bits & bit != 0 {
+                    form.push_str(name);
+                    form.push('+');
+                }
+            }
+            form.push('x');
+            let expected = match bits {
+                0 => b"x".to_vec(),
+                1 => b"X".to_vec(),
+                _ => format!("\x1b[120;{}u", bits + 1).into_bytes(),
+            };
+            assert_eq!(
+                encode_api_keys(&runtime, &[form.clone()]).unwrap(),
+                vec![expected],
+                "{form}"
+            );
+        }
+        for (form, expected) in [
+            ("ctrl+F35", b"\x1b[57398;5u".as_slice()),
+            ("F13", b"\x1b[57376;1u"),
+            ("ctrl+capslock", b"\x1b[57358;5u"),
+            ("right_alt", b"\x1b[57449;1u"),
+        ] {
+            assert_eq!(
+                encode_api_keys(&runtime, &[form.into()]).unwrap(),
+                vec![expected.to_vec()],
+                "{form}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_message_control_from_captured_screen() {
+        // Captured bottom-buffer control rows, with the queued message redacted.
+        let screen = include_str!("../../tests/fixtures/queued-message-control.txt");
+        let control = screen
+            .lines()
+            .find_map(|line| line.trim().strip_suffix(" to send now"))
+            .unwrap();
+        let runtime =
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, screen.as_bytes());
+        runtime.test_process_pty_bytes(b"\x1b[>1u");
+        assert_eq!(
+            encode_api_keys(&runtime, &[control.into()]).unwrap(),
+            vec![b"\x1b[13;5u".to_vec()]
+        );
+        // The other queue control is an ordinary Tab in either protocol.
+        assert_eq!(
+            encode_api_keys(&runtime, &["Tab".into()]).unwrap(),
+            vec![b"\t".to_vec()]
+        );
+    }
+
+    #[tokio::test]
+    async fn api_keys_validate_entire_batch_and_explain_forms() {
+        let (runtime, mut rx) = test_runtime();
+        let error = encode_api_keys(&runtime, &["Enter".into(), "not-a-key".into()]).unwrap_err();
+        for form in [
+            "not-a-key",
+            "accepted forms",
+            "ctrl+enter",
+            "C-Enter",
+            "F1-F35",
+        ] {
+            assert!(error.contains(form), "{error}");
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "no input may be written before all keys validate"
+        );
+        assert!(encode_api_keys(&runtime, &["F35".into()])
+            .unwrap_err()
+            .contains("active terminal mode"));
+    }
 
     /// Holds `HERDR_SUBMIT_DELAY_MS` for this thread. Other threads keep the
     /// default delay so a parallel test does not observe this override.

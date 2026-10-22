@@ -39,6 +39,7 @@ pub enum AppEvent {
         pane_id: PaneId,
         agent: Option<Agent>,
         state: AgentState,
+        blocked_reason: Option<&'static str>,
         visible_blocker: bool,
         visible_idle: bool,
         visible_working: bool,

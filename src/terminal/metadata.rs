@@ -364,6 +364,11 @@ impl TerminalState {
         now: Instant,
         enforce_ttl: bool,
     ) -> Option<String> {
+        if state == AgentState::Blocked {
+            if let Some(reason) = self.blocked_reason {
+                return Some(reason.to_string());
+            }
+        }
         if let Some(custom_status) = self.newest_metadata_custom_status(now, enforce_ttl) {
             return Some(custom_status);
         }

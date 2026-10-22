@@ -3010,6 +3010,7 @@ impl AppState {
                 pane_id,
                 agent,
                 state,
+                blocked_reason,
                 visible_blocker,
                 visible_idle,
                 visible_working,
@@ -3017,9 +3018,15 @@ impl AppState {
                 observed_at,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    Some(terminal.set_detected_state_with_screen_signals_at(
+                    let reason = if process_exited {
+                        Some("agent exited")
+                    } else {
+                        blocked_reason
+                    };
+                    Some(terminal.set_detected_state_with_reason_at(
                         agent,
                         state,
+                        reason,
                         visible_blocker,
                         visible_idle,
                         visible_working,
@@ -4708,6 +4715,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Working,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -4756,6 +4764,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Pi),
             state: reported,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -4828,6 +4837,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Working,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -4844,6 +4854,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -4875,6 +4886,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -4909,6 +4921,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -4933,6 +4946,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -4993,6 +5007,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -5031,6 +5046,147 @@ mod tests {
     }
 
     #[test]
+    fn stopped_errors_override_hooks_show_reason_and_clear_on_work() {
+        let mut state = app_with_workspaces(&["active"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        state.handle_app_event(AppEvent::HookStateReported {
+            pane_id,
+            source: "test:hook".into(),
+            agent_label: "codex".into(),
+            state: AgentState::Idle,
+            message: None,
+            custom_status: Some("old task".into()),
+            seq: Some(1),
+            session_ref: None,
+        });
+        for (screen, expected, reason) in [
+            (
+                "■ Selected model is at capacity. Please try a different model.\n› ",
+                AgentState::Blocked,
+                Some("model at capacity"),
+            ),
+            (
+                "• Working (2s • esc to interrupt)\n› ",
+                AgentState::Working,
+                None,
+            ),
+            ("• Finished.\n› ", AgentState::Idle, None),
+        ] {
+            let detection = crate::detect::detect_agent(Some(Agent::Codex), screen);
+            state.handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Codex),
+                state: detection.state,
+                blocked_reason: crate::detect::stopped_error_reason(Some(Agent::Codex), screen),
+                visible_blocker: detection.visible_blocker,
+                visible_idle: detection.visible_idle,
+                visible_working: detection.visible_working,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
+            });
+            let terminal = &state.terminals[&terminal_id];
+            assert_eq!(terminal.state, expected);
+            assert_eq!(terminal.blocked_reason, reason);
+            if let Some(reason) = reason {
+                assert_eq!(
+                    terminal.effective_presentation().custom_status.as_deref(),
+                    Some(reason)
+                );
+            } else {
+                assert_ne!(
+                    terminal.effective_presentation().custom_status.as_deref(),
+                    Some("model at capacity")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unidentified_foreground_job_is_not_a_confirmed_agent_exit() {
+        let mut state = app_with_workspaces(&["active"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(Some(Agent::Codex), AgentState::Working);
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: None,
+            state: AgentState::Unknown,
+            blocked_reason: None,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        let terminal = &state.terminals[&terminal_id];
+        assert_eq!(terminal.state, AgentState::Unknown);
+        assert_eq!(terminal.blocked_reason, None);
+    }
+
+    #[test]
+    fn agent_exit_stays_blocked_at_shell_until_a_new_agent_works() {
+        let mut state = app_with_workspaces(&["active"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        for (agent, raw, exited, expected) in [
+            (
+                Some(Agent::Codex),
+                AgentState::Working,
+                false,
+                AgentState::Working,
+            ),
+            (
+                Some(Agent::Codex),
+                AgentState::Idle,
+                true,
+                AgentState::Blocked,
+            ),
+            (None, AgentState::Unknown, false, AgentState::Blocked),
+            (None, AgentState::Unknown, false, AgentState::Blocked),
+            (
+                Some(Agent::Codex),
+                AgentState::Working,
+                false,
+                AgentState::Working,
+            ),
+        ] {
+            state.handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent,
+                state: raw,
+                blocked_reason: None,
+                visible_blocker: false,
+                visible_idle: false,
+                visible_working: raw == AgentState::Working,
+                process_exited: exited,
+                observed_at: std::time::Instant::now(),
+            });
+            let terminal = &state.terminals[&terminal_id];
+            assert_eq!(terminal.state, expected);
+            if expected == AgentState::Blocked {
+                assert_eq!(terminal.effective_agent_label(), Some("codex"));
+                assert_eq!(
+                    terminal.effective_custom_status().as_deref(),
+                    Some("agent exited")
+                );
+            } else {
+                assert_eq!(terminal.blocked_reason, None);
+            }
+        }
+    }
+
+    #[test]
     fn visible_blocker_overrides_hook_working_and_notifies() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.active = Some(0);
@@ -5047,6 +5203,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -5067,6 +5224,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Codex),
             state: AgentState::Blocked,
+            blocked_reason: None,
             visible_blocker: true,
             visible_idle: false,
             visible_working: false,
@@ -5098,6 +5256,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Claude),
             state: AgentState::Working,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -5123,6 +5282,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Claude),
             state: AgentState::Idle,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: true,
             visible_working: false,
@@ -5150,6 +5310,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Claude),
             state: AgentState::Working,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: true,
@@ -5220,6 +5381,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Droid),
             state: AgentState::Idle,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -5250,6 +5412,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -5277,6 +5440,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -5301,6 +5465,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -5323,6 +5488,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -5353,6 +5519,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -5377,6 +5544,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,

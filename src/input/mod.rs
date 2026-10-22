@@ -11,3 +11,5 @@ pub use model::{
     MouseProtocolEncoding, MouseProtocolMode, TerminalKey,
 };
 pub use parse::parse_terminal_key_sequence;
+
+pub(crate) use parse::{modifier_key_name, parse_key_combo, parse_modifier_token};

@@ -590,7 +590,14 @@ fn cell_texts(app: &AppState, entry: &AgentPanelEntry) -> [String; COLUMNS] {
             .as_ref()
             .map(|location| location.folder())
             .unwrap_or_default(),
-        if entry.landing {
+        if entry.state == AgentState::Blocked
+            && app
+                .terminals
+                .get(&entry.terminal_id)
+                .is_some_and(|terminal| terminal.blocked_reason.is_some())
+        {
+            agent_status_detail_text(app, &entry.terminal_id).unwrap_or_default()
+        } else if entry.landing {
             "landing".to_string()
         } else if entry.land_failed {
             "land failed".to_string()
@@ -996,7 +1003,13 @@ fn agent_status_detail_text(
     app: &AppState,
     terminal_id: &crate::terminal::TerminalId,
 ) -> Option<String> {
-    let presentation = app.terminals.get(terminal_id)?.effective_presentation();
+    let terminal = app.terminals.get(terminal_id)?;
+    if terminal.state == AgentState::Blocked {
+        if let Some(reason) = terminal.blocked_reason {
+            return Some(reason.to_string());
+        }
+    }
+    let presentation = terminal.effective_presentation();
     let parts: Vec<&str> = [
         presentation.title.as_deref(),
         presentation.custom_status.as_deref(),
@@ -1711,6 +1724,36 @@ mod tests {
             }
         }
         (state, set_down)
+    }
+
+    #[test]
+    fn stopped_reason_is_the_task_for_docked_and_hidden_agents() {
+        let (mut state, _) = state_with_a_docked_and_a_set_down_agent();
+        for terminal in state.terminals.values_mut() {
+            terminal.state = AgentState::Blocked;
+            terminal.blocked_reason = Some("model at capacity");
+            terminal.session_title = Some("A long previous task that would hide the error".into());
+        }
+        let entries = agent_panel_entries(&state);
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            assert_eq!(cell_texts(&state, entry)[COL_SUMMARY], "model at capacity");
+            assert_eq!(
+                agent_status_marker(
+                    &state,
+                    AgentStatusMarks {
+                        state: entry.state,
+                        seen: entry.seen,
+                        completed: entry.completed,
+                        landing: false,
+                        land_failed: false,
+                    }
+                )
+                .unwrap()
+                .1,
+                mute_when_host_unfocused(&state, state.palette.red)
+            );
+        }
     }
 
     #[test]

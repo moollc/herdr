@@ -62,6 +62,7 @@ pub struct TerminalState {
     pub cwd: PathBuf,
     pub detected_agent: Option<Agent>,
     pub fallback_state: AgentState,
+    pub blocked_reason: Option<&'static str>,
     fallback_visible_blocker: bool,
     fallback_visible_idle: bool,
     fallback_visible_working: bool,
@@ -134,6 +135,7 @@ impl TerminalState {
             cwd,
             detected_agent: None,
             fallback_state: AgentState::Unknown,
+            blocked_reason: None,
             fallback_visible_blocker: false,
             fallback_visible_idle: false,
             fallback_visible_working: false,
@@ -277,10 +279,44 @@ impl TerminalState {
         process_exited: bool,
         now: Instant,
     ) -> TerminalStateMutation {
+        self.set_detected_state_with_reason_at(
+            agent,
+            fallback_state,
+            None,
+            visible_blocker,
+            visible_idle,
+            visible_working,
+            process_exited,
+            now,
+        )
+    }
+
+    pub fn set_detected_state_with_reason_at(
+        &mut self,
+        mut agent: Option<Agent>,
+        mut fallback_state: AgentState,
+        mut blocked_reason: Option<&'static str>,
+        mut visible_blocker: bool,
+        visible_idle: bool,
+        visible_working: bool,
+        process_exited: bool,
+        now: Instant,
+    ) -> TerminalStateMutation {
         let previous_agent_label = self.effective_agent_label().map(str::to_string);
         let previous_known_agent = self.effective_known_agent();
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
+        // A shell replacing a detected harness is an exit, not a completed turn.
+        // Keep its identity and blocker until a harness starts again or is released.
+        if blocked_reason == Some("agent exited")
+            || (agent.is_none() && self.blocked_reason == Some("agent exited"))
+        {
+            agent = agent.or(self.detected_agent);
+            blocked_reason = Some("agent exited");
+            fallback_state = AgentState::Blocked;
+            visible_blocker = true;
+        }
+        self.blocked_reason = blocked_reason;
         let previous_detected_agent = self.detected_agent;
         let previous_session = self.current_session_identity_for_persistence();
         self.detected_agent = agent;
@@ -713,6 +749,7 @@ impl TerminalState {
         let previous_session = self.current_session_identity_for_persistence();
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
+        self.blocked_reason = None;
         self.fallback_visible_blocker = false;
         self.fallback_visible_idle = false;
         self.fallback_visible_working = false;
@@ -885,6 +922,7 @@ impl TerminalState {
         self.orientation_offer = None;
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
+        self.blocked_reason = None;
         self.fallback_visible_blocker = false;
         self.fallback_visible_idle = false;
         self.fallback_visible_working = false;

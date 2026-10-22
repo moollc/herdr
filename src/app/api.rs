@@ -685,13 +685,13 @@ impl App {
                 return self.handle_workspace_create(request.id, params);
             }
             Method::WorkspaceFocus(target) => {
-                return self.handle_workspace_focus(request.id, target)
+                return self.handle_workspace_focus(request.id, target);
             }
             Method::WorkspaceRename(params) => {
                 return self.handle_workspace_rename(request.id, params);
             }
             Method::WorkspaceClose(target) => {
-                return self.handle_workspace_close(request.id, target)
+                return self.handle_workspace_close(request.id, target);
             }
             Method::WorktreeList(params) => return self.handle_worktree_list(request.id, params),
             Method::WorktreeCreate(params) => {
@@ -703,7 +703,7 @@ impl App {
             }
             Method::WorktreeLand(params) => return self.handle_worktree_land(request.id, params),
             Method::AgentWorktreeLand(params) => {
-                return self.handle_agent_worktree_land(request.id, params)
+                return self.handle_agent_worktree_land(request.id, params);
             }
             Method::TabList(params) => return self.handle_tab_list(request.id, params),
             Method::TabGet(target) => return self.handle_tab_get(request.id, target),
@@ -748,7 +748,7 @@ impl App {
             }
             Method::PaneSendText(params) => return self.handle_pane_send_text(request.id, params),
             Method::PaneSendInput(params) => {
-                return self.handle_pane_send_input(request.id, params)
+                return self.handle_pane_send_input(request.id, params);
             }
             Method::PaneClose(target) => return self.handle_pane_close(request.id, target),
             Method::PaneSendKeys(params) => return self.handle_pane_send_keys(request.id, params),
@@ -849,6 +849,7 @@ mod tests {
             pane_id: root,
             agent: Some(Agent::Codex),
             state: AgentState::Working,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -859,6 +860,7 @@ mod tests {
             pane_id: root,
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -956,6 +958,7 @@ mod tests {
             pane_id: root,
             agent: Some(Agent::Codex),
             state: AgentState::Working,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
@@ -976,6 +979,7 @@ mod tests {
             pane_id: root,
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
+            blocked_reason: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,

@@ -124,6 +124,7 @@ async fn publish_state_changed_event(
     pane_id: PaneId,
     agent: Option<Agent>,
     state: AgentState,
+    blocked_reason: Option<&'static str>,
     visible_blocker: bool,
     visible_idle: bool,
     visible_working: bool,
@@ -138,6 +139,7 @@ async fn publish_state_changed_event(
             pane_id,
             agent,
             state,
+            blocked_reason,
             visible_blocker,
             visible_idle,
             visible_working,
@@ -589,6 +591,7 @@ fn spawn_basic_detection_task(
             release_was_active = suppressed_agent.is_some();
             let pid = child_pid.load(Ordering::Acquire);
             let mut agent_changed = false;
+            let mut process_exited = false;
             let mut agent = agent_presence.current_agent();
             let content = terminal.detection_text();
             let content_changed = content != last_detection_text;
@@ -653,10 +656,19 @@ fn spawn_basic_detection_task(
                 if agent_presence.observe_process_probe(new_agent) {
                     agent = agent_presence.current_agent();
                     agent_changed = previous_agent != agent;
+                    process_exited = previous_agent.is_some()
+                        && agent.is_none()
+                        && probe.foreground_is_pane_shell;
+                    // Publish the old identity once so a confirmed return to
+                    // the shell can keep a named blocker until the next launch.
+                    if process_exited {
+                        agent = previous_agent;
+                    }
                 }
             }
 
-            let Some(detection) = detection_update_for_publish(agent, &content, false) else {
+            let Some(detection) = detection_update_for_publish(agent, &content, process_exited)
+            else {
                 continue;
             };
             // Panes handed to a fresh build run this loop instead of the full
@@ -666,7 +678,7 @@ fn spawn_basic_detection_task(
                 agent,
                 state,
                 detection,
-                false,
+                process_exited,
                 now,
                 &mut last_claude_working_at,
             );
@@ -697,7 +709,7 @@ fn spawn_basic_detection_task(
                 previous_publish,
                 next_publish,
                 agent_changed,
-                false,
+                process_exited,
                 stable_refresh_due,
             ) {
                 state = new_state;
@@ -714,10 +726,11 @@ fn spawn_basic_detection_task(
                     pane_id,
                     agent,
                     new_state,
+                    crate::detect::stopped_error_reason(agent, &content),
                     visible_blocker,
                     visible_idle,
                     visible_working,
-                    false,
+                    process_exited,
                     now,
                 )
                 .await;
@@ -2009,6 +2022,7 @@ impl PaneRuntime {
                             pane_id,
                             agent,
                             new_state,
+                            crate::detect::stopped_error_reason(agent, &content),
                             visible_blocker,
                             visible_idle,
                             visible_working,
@@ -3529,6 +3543,7 @@ mod tests {
             pane_id,
             Some(Agent::Pi),
             AgentState::Idle,
+            None,
             false,
             false,
             false,
@@ -3568,6 +3583,7 @@ mod tests {
                 pane_id: delivered_pane,
                 agent: Some(Agent::Pi),
                 state: AgentState::Idle,
+                blocked_reason: None,
                 visible_blocker: false,
                 visible_idle: false,
                 visible_working: false,

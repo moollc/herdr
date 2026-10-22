@@ -2,6 +2,168 @@ use crossterm::event::{KeyCode, KeyModifiers, MediaKeyCode, ModifierKeyCode};
 
 use super::TerminalKey;
 
+/// The modifier keys a binding can name on their own, such as `right_alt`.
+/// Most terminals never report a modifier key pressed alone; one that does
+/// sends it as its own key, the way the kitty keyboard protocol numbers them.
+const MODIFIER_KEY_NAMES: &[(ModifierKeyCode, &str)] = &[
+    (ModifierKeyCode::LeftShift, "left_shift"),
+    (ModifierKeyCode::RightShift, "right_shift"),
+    (ModifierKeyCode::LeftControl, "left_ctrl"),
+    (ModifierKeyCode::RightControl, "right_ctrl"),
+    (ModifierKeyCode::LeftAlt, "left_alt"),
+    (ModifierKeyCode::RightAlt, "right_alt"),
+    (ModifierKeyCode::LeftSuper, "left_super"),
+    (ModifierKeyCode::RightSuper, "right_super"),
+];
+
+pub(crate) fn modifier_key_name(key: ModifierKeyCode) -> Option<&'static str> {
+    MODIFIER_KEY_NAMES
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, name)| *name)
+}
+
+fn modifier_key_from_name(name: &str) -> Option<ModifierKeyCode> {
+    let name = name.replace('-', "_");
+    MODIFIER_KEY_NAMES
+        .iter()
+        .find(|(_, n)| *n == name)
+        .map(|(k, _)| *k)
+}
+
+pub(crate) fn parse_modifier_token(token: &str) -> Option<KeyModifiers> {
+    match token.to_lowercase().as_str() {
+        "ctrl" | "control" => Some(KeyModifiers::CONTROL),
+        "shift" => Some(KeyModifiers::SHIFT),
+        "alt" | "option" | "meta" => Some(KeyModifiers::ALT),
+        "cmd" | "command" | "super" => Some(KeyModifiers::SUPER),
+        "hyper" => Some(KeyModifiers::HYPER),
+        _ => None,
+    }
+}
+
+/// Parse a logical key name shared by configuration and the socket API.
+/// Modifier prefixes accept either separator; punctuation keys can be named
+/// literally or with aliases such as `plus` and `minus`.
+pub(crate) fn parse_key_combo(s: &str) -> Option<(KeyCode, KeyModifiers)> {
+    let mut rest = if s == " " { s } else { s.trim() };
+    let mut modifiers = KeyModifiers::empty();
+    while let Some(index) = rest.find(['+', '-']) {
+        let token = rest[..index].trim();
+        let modifier = if token.eq_ignore_ascii_case("c") {
+            Some(KeyModifiers::CONTROL)
+        } else {
+            parse_modifier_token(token)
+        };
+        let Some(modifier) = modifier else { break };
+        modifiers |= modifier;
+        rest = rest[index + 1..].trim();
+    }
+    let parts: Vec<&str> = if matches!(rest, "+" | " ") {
+        vec![rest]
+    } else {
+        rest.split('+').collect()
+    };
+    let mut key_str: Option<&str> = None;
+
+    for part in &parts {
+        let trimmed = if *part == " " { *part } else { part.trim() };
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Some(modifier) = parse_modifier_token(trimmed) {
+            modifiers |= modifier;
+        } else if key_str.is_some() {
+            return None;
+        } else {
+            key_str = Some(trimmed);
+        }
+    }
+
+    let key_str = key_str?;
+    let single_char = single_key_char(key_str);
+    let lower = key_str.to_lowercase();
+    let code = match lower.as_str() {
+        "space" | " " => KeyCode::Char(' '),
+        "enter" | "return" => KeyCode::Enter,
+        "esc" | "escape" => KeyCode::Esc,
+        "tab" if modifiers.contains(KeyModifiers::SHIFT) => {
+            modifiers.remove(KeyModifiers::SHIFT);
+            KeyCode::BackTab
+        }
+        "tab" => KeyCode::Tab,
+        "backspace" | "bs" => KeyCode::Backspace,
+        "backtab" => KeyCode::BackTab,
+        "capslock" | "caps_lock" => KeyCode::CapsLock,
+        "scrolllock" | "scroll_lock" => KeyCode::ScrollLock,
+        "numlock" | "num_lock" => KeyCode::NumLock,
+        "printscreen" | "print_screen" => KeyCode::PrintScreen,
+        "pause" => KeyCode::Pause,
+        "menu" => KeyCode::Menu,
+        "keypadbegin" | "keypad_begin" => KeyCode::KeypadBegin,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "pageup" | "page_up" | "page-up" | "pgup" => KeyCode::PageUp,
+        "pagedown" | "page_down" | "page-down" | "pgdn" => KeyCode::PageDown,
+        "insert" | "ins" => KeyCode::Insert,
+        "delete" | "del" => KeyCode::Delete,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "minus" => KeyCode::Char('-'),
+        "comma" => KeyCode::Char(','),
+        "period" => KeyCode::Char('.'),
+        "slash" => KeyCode::Char('/'),
+        "backslash" => KeyCode::Char('\\'),
+        "quote" => KeyCode::Char('\''),
+        "double_quote" | "double-quote" => KeyCode::Char('"'),
+        "semicolon" => KeyCode::Char(';'),
+        "colon" => KeyCode::Char(':'),
+        "percent" => KeyCode::Char('%'),
+        "ampersand" => KeyCode::Char('&'),
+        "backtick" => KeyCode::Char('`'),
+        "plus" => KeyCode::Char('+'),
+        name if modifier_key_from_name(name).is_some() => {
+            KeyCode::Modifier(modifier_key_from_name(name)?)
+        }
+        _ if single_char.is_some() => {
+            let ch = single_char?;
+            if ch.is_ascii_uppercase() {
+                modifiers |= KeyModifiers::SHIFT;
+                KeyCode::Char(ch.to_ascii_lowercase())
+            } else {
+                KeyCode::Char(ch)
+            }
+        }
+        s if s.starts_with('f') => s[1..]
+            .parse::<u8>()
+            .ok()
+            .filter(|n| (1..=35).contains(n))
+            .map(KeyCode::F)?,
+        _ => return None,
+    };
+
+    if matches!(code, KeyCode::Modifier(_) | KeyCode::BackTab) {
+        modifiers.remove(if matches!(code, KeyCode::BackTab) {
+            KeyModifiers::SHIFT
+        } else {
+            KeyModifiers::all()
+        });
+    }
+    Some((code, modifiers))
+}
+
+fn single_key_char(s: &str) -> Option<char> {
+    let mut chars = s.chars();
+    let ch = chars.next()?;
+    if chars.next().is_none() {
+        Some(ch)
+    } else {
+        None
+    }
+}
+
 #[allow(dead_code)] // Next step: raw stdin parser will feed TerminalKey directly through this path.
 pub fn parse_terminal_key_sequence(data: &str) -> Option<TerminalKey> {
     parse_kitty_key_sequence(data)
@@ -279,6 +441,26 @@ fn kitty_codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
     }
 }
 
+/// Functional keys without a legacy representation use their Kitty codepoint.
+pub(super) fn kitty_functional_codepoint(code: KeyCode) -> Option<u32> {
+    if !matches!(
+        code,
+        KeyCode::F(13..=35)
+            | KeyCode::CapsLock
+            | KeyCode::ScrollLock
+            | KeyCode::NumLock
+            | KeyCode::PrintScreen
+            | KeyCode::Pause
+            | KeyCode::Menu
+            | KeyCode::KeypadBegin
+            | KeyCode::Media(_)
+            | KeyCode::Modifier(_)
+    ) {
+        return None;
+    }
+    (57358..=57454).find(|&point| kitty_codepoint_to_keycode(point) == Some(code))
+}
+
 fn is_kitty_functional_codepoint(codepoint: u32) -> bool {
     (57358..=57454).contains(&codepoint)
 }
@@ -385,6 +567,82 @@ mod tests {
             "repeat" => crossterm::event::KeyEventKind::Repeat,
             "release" => crossterm::event::KeyEventKind::Release,
             other => panic!("unsupported fixture kind: {other}"),
+        }
+    }
+
+    #[test]
+    fn logical_key_names_share_modifier_and_alias_grammar() {
+        for form in [
+            "ctrl+enter",
+            "ctrl+Enter",
+            "C-Enter",
+            "ctrl-enter",
+            "CTRL+ENTER",
+            " control-RETURN ",
+        ] {
+            assert_eq!(
+                parse_key_combo(form),
+                Some((KeyCode::Enter, KeyModifiers::CONTROL)),
+                "{form}"
+            );
+        }
+        for (form, code, modifiers) in [
+            ("Escape", KeyCode::Esc, KeyModifiers::empty()),
+            ("Return", KeyCode::Enter, KeyModifiers::empty()),
+            ("ctrl+m", KeyCode::Char('m'), KeyModifiers::CONTROL),
+            ("c", KeyCode::Char('c'), KeyModifiers::empty()),
+            ("A", KeyCode::Char('a'), KeyModifiers::SHIFT),
+            (
+                "CTRL-ALT+SHIFT-cmd+F12",
+                KeyCode::F(12),
+                KeyModifiers::CONTROL
+                    | KeyModifiers::ALT
+                    | KeyModifiers::SHIFT
+                    | KeyModifiers::SUPER,
+            ),
+            ("super-Home", KeyCode::Home, KeyModifiers::SUPER),
+            ("SHIFT-Tab", KeyCode::BackTab, KeyModifiers::empty()),
+            ("ctrl+-", KeyCode::Char('-'), KeyModifiers::CONTROL),
+            ("ctrl++", KeyCode::Char('+'), KeyModifiers::CONTROL),
+            ("+", KeyCode::Char('+'), KeyModifiers::empty()),
+            (" ", KeyCode::Char(' '), KeyModifiers::empty()),
+            ("alt+é", KeyCode::Char('é'), KeyModifiers::ALT),
+            (
+                "ctrl-double-quote",
+                KeyCode::Char('"'),
+                KeyModifiers::CONTROL,
+            ),
+            (
+                "right-alt",
+                KeyCode::Modifier(ModifierKeyCode::RightAlt),
+                KeyModifiers::empty(),
+            ),
+        ] {
+            assert_eq!(parse_key_combo(form), Some((code, modifiers)), "{form}");
+        }
+        for form in [
+            "",
+            "ctrl+",
+            "ctrl--enter",
+            "unknown",
+            "ctrl+banana",
+            "a+b",
+            "F0",
+            "F36",
+            "F255",
+        ] {
+            assert_eq!(parse_key_combo(form), None, "{form}");
+        }
+        for form in [
+            "End",
+            "PageUp",
+            "page-down",
+            "Insert",
+            "Delete",
+            "F35",
+            "BackTab",
+        ] {
+            assert!(parse_key_combo(form).is_some(), "{form}");
         }
     }
 

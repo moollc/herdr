@@ -1,5 +1,7 @@
 use super::super::{has_confirmation_prompt, has_selection_prompt, AgentState};
 
+const SPINNER_CHARS: &str = "·✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❀❁❂❃❇❈❉❊❋✢✣✤✥✦✧✨⊛⊕⊙◉◎◍⁂⁕※⍟☼★☆";
+
 /// Claude Code detection. The most complex — it has a structured prompt box UI.
 ///
 /// Screen layout:
@@ -68,13 +70,81 @@ pub(super) fn has_visible_blocker(content: &str) -> bool {
                 || lower.contains("ctrl+e to explain"))
 }
 
-pub(super) fn has_working_chrome(content: &str) -> bool {
-    let above = content_above_prompt_box(content);
+pub(in crate::detect) fn has_working_chrome(content: &str) -> bool {
+    let mut above = content_above_prompt_box(content);
+    // A completed turn bounds the activity search. Older spinner/interrupt
+    // rows can remain in the terminal tail; only activity after this footer
+    // belongs to the current turn. Keep scanning the suffix so a new turn
+    // still wins over a previous completion, including long-running turns.
+    if has_empty_prompt_box(content) {
+        let mut offset = 0;
+        let mut completed_end = 0;
+        for line in above.split_inclusive('\n') {
+            offset += line.len();
+            if is_completed_turn_line(line) {
+                completed_end = offset;
+            }
+        }
+        above = &above[completed_end..];
+    }
     let above_lower = above.to_lowercase();
     above_lower.contains("esc to interrupt")
         || above_lower.contains("ctrl+c to interrupt")
         || has_running_status_line(above)
         || has_spinner_activity(above)
+}
+
+fn has_empty_prompt_box(content: &str) -> bool {
+    let lines: Vec<&str> = content.lines().collect();
+    let Some(top) = claude_prompt_box_top_border_index(&lines) else {
+        return false;
+    };
+    let prompt: String = lines[top + 1..]
+        .iter()
+        .take_while(|line| !is_horizontal_rule(line))
+        .map(|line| line.trim())
+        .collect();
+    prompt == "❯"
+}
+
+fn is_completed_turn_line(line: &str) -> bool {
+    let mut chars = line.trim().chars();
+    let Some(glyph) = chars.next() else {
+        return false;
+    };
+    if !SPINNER_CHARS.contains(glyph) && glyph != '*' {
+        return false;
+    }
+    let Some((summary, done)) = chars.as_str().split_once(" · done ") else {
+        return false;
+    };
+    let Some((verb, duration)) = summary.trim().split_once(" for ") else {
+        return false;
+    };
+    if verb.is_empty()
+        || !verb.chars().all(char::is_alphabetic)
+        || !duration.chars().next().is_some_and(|c| c.is_ascii_digit())
+        || !duration
+            .chars()
+            .all(|c| c.is_ascii_digit() || " hms".contains(c))
+    {
+        return false;
+    }
+    let mut clock = done
+        .split(" · ")
+        .next()
+        .unwrap_or_default()
+        .split_whitespace();
+    let Some((hour, minute)) = clock.next().and_then(|time| time.split_once(':')) else {
+        return false;
+    };
+    hour.parse::<u8>().is_ok_and(|hour| hour < 24)
+        && minute.len() == 2
+        && minute.parse::<u8>().is_ok_and(|minute| minute < 60)
+        && clock
+            .next()
+            .is_none_or(|period| period == "AM" || period == "PM")
+        && clock.next().is_none()
 }
 
 pub(super) fn is_transcript_viewer(content: &str) -> bool {
@@ -198,7 +268,6 @@ fn has_claude_yes_no_choice(content: &str) -> bool {
 /// on the spinner glyph + trailing ellipsis rather than specific wording.
 /// Include Claude's narrow-pane middle-dot frame too.
 pub(in crate::detect) fn has_spinner_activity(content: &str) -> bool {
-    const SPINNER_CHARS: &str = "·✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❀❁❂❃❇❈❉❊❋✢✣✤✥✦✧✨⊛⊕⊙◉◎◍⁂⁕※⍟☼★☆";
     for line in content.lines() {
         let trimmed = line.trim();
         if is_ascii_star_spinner_frame(trimmed) {
@@ -337,6 +406,38 @@ mod tests {
         format!(
             "{content_above_prompt}\n────────────────────────────────\n❯ \n────────────────────────────────\n"
         )
+    }
+
+    #[test]
+    fn completion_boundary_requires_a_summary_and_clock() {
+        for line in [
+            "✻ Brewed for 5m 9s · done 9:12 AM · 2 shells still running",
+            "✻ Worked for 4s · done 21:12",
+        ] {
+            assert!(is_completed_turn_line(line), "{line}");
+        }
+        for line in [
+            "The task is done 9:12 AM",
+            "✻ Brewing… (5m 9s · done 9:12 AM)",
+            "✻ Brewed for 5m 9s · done soon",
+            "✻ Brewed for 5m 9s · done 9:99 AM",
+            "✻ Brewed for 5m 9s · done 29:12 AM",
+            "✻ Brewed for 5m 9s · done 9:12 AM then resumed",
+        ] {
+            assert!(!is_completed_turn_line(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn completion_boundary_needs_an_empty_live_prompt() {
+        let done = include_str!("../fixtures/claude-done-shells.txt");
+        for screen in [
+            done.replace("❯", "❯ queued input"),
+            done.split('─').next().expect("summary").to_owned(),
+        ] {
+            let screen = format!("✻ Brewing… (esc to interrupt)\n{screen}");
+            assert!(has_working_chrome(&screen));
+        }
     }
 
     #[test]

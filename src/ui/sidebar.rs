@@ -364,7 +364,7 @@ fn entry_row_height(
 /// Rows the layout preview under a tab's name takes. It spans the row between
 /// the tab name's indent and a matching margin on the right, so it widens and
 /// narrows with the sidebar. Each stacked pane band takes two rows, separated
-/// by a clear row. A folded preview takes none.
+/// by a full row in the card background. A folded preview takes none.
 fn tab_minimap_rows(app: &AppState, ws_idx: usize, tab_idx: usize, row_width: u16) -> u16 {
     let Some(tab) = app
         .workspaces
@@ -2355,10 +2355,13 @@ fn agent_status_detail_text(
     pane_id: crate::layout::PaneId,
 ) -> Option<String> {
     let pane = app.workspaces.get(ws_idx)?.pane_state(pane_id)?;
-    let presentation = app
-        .terminals
-        .get(&pane.attached_terminal_id)?
-        .effective_presentation();
+    let terminal = app.terminals.get(&pane.attached_terminal_id)?;
+    if terminal.state == AgentState::Blocked {
+        if let Some(reason) = terminal.blocked_reason {
+            return Some(reason.to_string());
+        }
+    }
+    let presentation = terminal.effective_presentation();
     let parts: Vec<&str> = [
         presentation.title.as_deref(),
         presentation.custom_status.as_deref(),
@@ -4375,6 +4378,26 @@ mod tests {
     }
 
     #[test]
+    fn stopped_reason_precedes_old_title_in_agent_list() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces
+            .push(crate::workspace::Workspace::test_new("test"));
+        app.ensure_test_terminals();
+        let pane = app.workspaces[0].tabs[0].root_pane;
+        let id = app.workspaces[0].tabs[0].panes[&pane]
+            .attached_terminal_id
+            .clone();
+        let terminal = app.terminals.get_mut(&id).unwrap();
+        terminal.state = AgentState::Blocked;
+        terminal.blocked_reason = Some("model at capacity");
+        terminal.session_title = Some("A long previous task that would hide the error".into());
+        assert_eq!(
+            agent_status_detail_text(&app, 0, pane).as_deref(),
+            Some("model at capacity")
+        );
+    }
+
+    #[test]
     fn wrap_chars_wraps_on_word_boundaries_and_splits_long_words() {
         assert_eq!(wrap_chars("fix the sidebar", 7), vec!["fix the", "sidebar"]);
         assert_eq!(
@@ -4511,7 +4534,8 @@ mod tests {
         let preview_row: String = (first_x..=last_x)
             .map(|x| buf[(x, rect.y + 1)].symbol())
             .collect();
-        assert_eq!(preview_row, "██████████ ██████████");
+        assert_eq!(preview_row, "                     ");
+        assert_eq!(buf[(first_x + 10, rect.y + 1)].bg, Color::Reset);
 
         // The arrow sits over the preview's last column, and the pane you are
         // in takes the accent while the other stays muted.
@@ -4526,11 +4550,11 @@ mod tests {
             (last_x, first_x)
         };
         assert_eq!(
-            buf[(focused_x, rect.y + 1)].style().fg,
+            buf[(focused_x, rect.y + 1)].style().bg,
             Some(focus_accent(&app))
         );
         assert_eq!(
-            buf[(other_x, rect.y + 1)].style().fg,
+            buf[(other_x, rect.y + 1)].style().bg,
             Some(app.palette.surface0)
         );
     }
@@ -4576,7 +4600,11 @@ mod tests {
         let preview = tab_preview_rect(row.rect).unwrap();
         for y in preview.y..preview.y + preview.height {
             for x in preview.x..preview.x + preview.width {
-                assert_eq!(buf[(x, y)].symbol(), "█", "({x}, {y}) is inside the pane");
+                assert_ne!(
+                    buf[(x, y)].bg,
+                    ratatui::style::Color::Reset,
+                    "({x}, {y}) is inside the pane"
+                );
             }
         }
     }
@@ -4677,7 +4705,7 @@ mod tests {
                             } else {
                                 tab_minimap_pane_color(&app.state)
                             };
-                            assert_eq!(buf[(x, preview.y)].fg, expected);
+                            assert_eq!(buf[(x, preview.y)].bg, expected);
                         }
                     }
                 }
@@ -4826,8 +4854,12 @@ mod tests {
                 super::super::minimap::minimap_pane_at(tab.layout.root(), preview, x, preview.y)
             {
                 assert_eq!(
-                    buf[(x, preview.y)].modifier.contains(Modifier::DIM),
-                    pane != tab.layout.focused()
+                    buf[(x, preview.y)].bg,
+                    if pane == tab.layout.focused() {
+                        Color::Yellow
+                    } else {
+                        Color::Rgb(64, 64, 0)
+                    }
                 );
             }
         }

@@ -147,7 +147,8 @@ fn try_encode_csi_u(key: &TerminalKey, flags: u16) -> Option<Vec<u8>> {
     let mods = key.modifiers;
 
     // Unmodified keys use legacy encoding (more compatible)
-    if mods.is_empty() {
+    let functional = super::parse::kitty_functional_codepoint(key.code);
+    if mods.is_empty() && functional.is_none() {
         return None;
     }
 
@@ -166,7 +167,7 @@ fn try_encode_csi_u(key: &TerminalKey, flags: u16) -> Option<Vec<u8>> {
         | KeyCode::PageDown
         | KeyCode::Insert
         | KeyCode::Delete
-        | KeyCode::F(_) => {
+        | KeyCode::F(1..=12) => {
             return None; // let legacy handle these
         }
         _ => {}
@@ -182,7 +183,7 @@ fn try_encode_csi_u(key: &TerminalKey, flags: u16) -> Option<Vec<u8>> {
         KeyCode::Tab => (9, None),
         KeyCode::Backspace => (127, None),
         KeyCode::Esc => (27, None),
-        _ => return None, // fall back to legacy for unhandled keys
+        _ => (functional?, None),
     };
 
     let modifier = kitty_modifier(mods);
@@ -401,6 +402,11 @@ fn encode_legacy_inner(key: KeyEvent) -> Vec<u8> {
                     _ => vec![ch as u8],
                 }
             } else {
+                let ch = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    ch.to_ascii_uppercase()
+                } else {
+                    ch
+                };
                 let mut buf = [0u8; 4];
                 ch.encode_utf8(&mut buf).as_bytes().to_vec()
             }
@@ -461,6 +467,23 @@ mod tests {
         assert_eq!(actual.modifiers, modifiers);
         assert_eq!(actual.kind, kind);
         assert_eq!(actual.shifted_codepoint, shifted_codepoint);
+    }
+
+    #[test]
+    fn kitty_unmodified_basic_keys_keep_legacy_fallback() {
+        for (code, bytes) in [
+            (KeyCode::Enter, b"\r".as_slice()),
+            (KeyCode::Tab, b"\t"),
+            (KeyCode::Esc, b"\x1b"),
+        ] {
+            assert_eq!(
+                encode_key(
+                    KeyEvent::new(code, KeyModifiers::empty()),
+                    KeyboardProtocol::Kitty { flags: 1 }
+                ),
+                bytes
+            );
+        }
     }
 
     #[test]

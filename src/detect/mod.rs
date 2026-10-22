@@ -4,6 +4,9 @@
 //! against known agent output patterns to determine state.
 
 mod agents;
+mod stopped;
+
+pub use stopped::stopped_error_reason;
 
 /// The detected state of a terminal pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1014,6 +1017,67 @@ mod tests {
     // ---- Claude Code ----
 
     #[test]
+    fn claude_captured_completion_and_activity_frames() {
+        for (screen, expected) in [
+            (
+                include_str!("fixtures/claude-done-shells.txt"),
+                AgentState::Idle,
+            ),
+            (
+                include_str!("fixtures/claude-done-agents.txt"),
+                AgentState::Idle,
+            ),
+            (
+                include_str!("fixtures/claude-working.txt"),
+                AgentState::Working,
+            ),
+            (
+                include_str!("fixtures/claude-long-working-shells.txt"),
+                AgentState::Working,
+            ),
+        ] {
+            let detection = detect_agent(Some(Agent::Claude), screen);
+            assert_eq!(detection.state, expected, "{screen}");
+            assert_eq!(detection.visible_idle, expected == AgentState::Idle);
+            assert_eq!(detection.visible_working, expected == AgentState::Working);
+            assert!(!detection.ambiguous);
+            assert!(!detection.visible_blocker);
+        }
+    }
+
+    #[test]
+    fn claude_completed_turn_bounds_stale_activity() {
+        let done = include_str!("fixtures/claude-done-shells.txt");
+        for stale in [
+            "✢ Imagining… (3s · thinking with high effort)",
+            "✻ Brewing… (esc to interrupt) · 2 shells still running",
+            "ctrl+c to interrupt",
+        ] {
+            let screen = format!("{stale}\n{done}");
+            let detection = detect_agent(Some(Agent::Claude), &screen);
+            assert_eq!(detection.state, AgentState::Idle, "{screen}");
+            assert!(detection.visible_idle);
+            assert!(!detection.visible_working);
+        }
+    }
+
+    #[test]
+    fn claude_new_activity_after_completion_stays_working() {
+        let done = include_str!("fixtures/claude-done-shells.txt");
+        for live in [
+            "✻ Brewing… (esc to interrupt) · 2 shells still running",
+            "✢ Imagining… (1h 30m 9s · thinking with high effort)",
+            "Waiting for 2 background agents to finish",
+        ] {
+            let screen = done.replacen("────────────────", &format!("{live}\n────────────────"), 1);
+            let detection = detect_agent(Some(Agent::Claude), &screen);
+            assert_eq!(detection.state, AgentState::Working, "{screen}");
+            assert!(detection.visible_working);
+            assert!(!detection.visible_idle);
+        }
+    }
+
+    #[test]
     fn claude_working_esc_to_interrupt() {
         let screen = "Reading file src/main.rs\nesc to interrupt\n─────────\n❯ \n─────────";
         assert_eq!(detect_claude(screen), AgentState::Working);
@@ -1124,8 +1188,7 @@ mod tests {
 
     #[test]
     fn claude_waiting_ask_user_question_menu() {
-        let screen =
-            "Which approach should I take?\n❯ 1. Minimal change\n  2. Bigger refactor\n3. Chat about this\n\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel";
+        let screen = "Which approach should I take?\n❯ 1. Minimal change\n  2. Bigger refactor\n3. Chat about this\n\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel";
         assert_eq!(detect_claude(screen), AgentState::Blocked);
     }
 

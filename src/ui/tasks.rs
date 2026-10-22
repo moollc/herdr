@@ -6,29 +6,71 @@ use crate::{
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::Rect,
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
     Frame,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const MIN_PANE_WIDTH: u16 = 60;
+/// Narrowest a pane may get before the open column folds itself. Twenty cells
+/// still fits a prompt line and a short status, anything less is unusable.
+const MIN_PANE_WIDTH: u16 = 20;
 
-fn summary(app: &AppState) -> (usize, bool) {
-    app.tasks.tasks.as_ref().map_or((0, false), |tasks| {
-        tasks.rows.iter().fold((0, false), |(count, running), row| {
-            (
-                count + usize::from(row.mark != Mark::Done),
-                running || row.mark == Mark::Run,
-            )
-        })
+/// Open count, whether any row is running, and rows waiting on the user.
+fn summary(app: &AppState) -> (usize, bool, usize) {
+    app.tasks.tasks.as_ref().map_or((0, false, 0), |tasks| {
+        tasks
+            .rows
+            .iter()
+            .fold((0, false, 0), |(count, running, waiting), row| {
+                (
+                    count + usize::from(row.mark != Mark::Done),
+                    running || row.mark == Mark::Run,
+                    waiting + usize::from(row.mark == Mark::Approve),
+                )
+            })
     })
 }
 
-fn folded_width(app: &AppState, available: u16) -> u16 {
-    // Divider, count, gap and running circle. Keep pane space first.
-    (summary(app).0.to_string().len() as u16 + 3).min(available.saturating_sub(MIN_PANE_WIDTH))
+/// Match the one-cell folded Spaces sidebar, independent of task counts.
+fn folded_width(available: u16) -> u16 {
+    1.min(available.saturating_sub(MIN_PANE_WIDTH))
+}
+
+/// Counts read downward when they need more than one digit. The waiting mark
+/// and its count share the accent, while the open count stays muted.
+fn folded_lines(app: &AppState) -> Vec<Line<'static>> {
+    let (count, running, waiting) = summary(app);
+    let accent = Style::default().fg(app.palette.accent);
+    let mut lines = vec![Line::from(Span::styled(
+        "‹",
+        accent.add_modifier(Modifier::BOLD),
+    ))];
+    for digit in count.to_string().chars() {
+        lines.push(Line::from(Span::styled(
+            digit.to_string(),
+            Style::default().fg(app.palette.overlay0),
+        )));
+    }
+    if waiting > 0 {
+        lines.push(Line::from(Span::styled("◆", accent)));
+        for digit in waiting.to_string().chars() {
+            lines.push(Line::from(Span::styled(digit.to_string(), accent)));
+        }
+    }
+    if running {
+        lines.push(Line::from(Span::styled(
+            super::spinner_frame(app.spinner_tick),
+            Style::default().fg(app.palette.green),
+        )));
+    }
+    lines
+}
+
+fn desired_width(app: &AppState) -> u16 {
+    app.sidebar_width
+        .clamp(app.sidebar_min_width, app.sidebar_max_width)
 }
 
 pub(super) fn column_width(app: &AppState, available: u16) -> u16 {
@@ -36,11 +78,10 @@ pub(super) fn column_width(app: &AppState, available: u16) -> u16 {
         return 0;
     }
     if app.tasks_collapsed {
-        return folded_width(app, available);
+        return folded_width(available);
     }
-    let desired = app
-        .sidebar_width
-        .clamp(app.sidebar_min_width, app.sidebar_max_width);
+    // An open column keeps its full width, the panes shrink to make room.
+    let desired = desired_width(app);
     let remaining = available.saturating_sub(desired);
     let panes_fit = app
         .active
@@ -57,16 +98,12 @@ pub(super) fn column_width(app: &AppState, available: u16) -> u16 {
     if remaining >= MIN_PANE_WIDTH && panes_fit {
         desired
     } else {
-        folded_width(app, available)
+        folded_width(available)
     }
 }
 
 fn folded(app: &AppState, area: Rect) -> bool {
-    app.tasks_collapsed
-        || area.width
-            < app
-                .sidebar_width
-                .clamp(app.sidebar_min_width, app.sidebar_max_width)
+    app.tasks_collapsed || area.width < desired_width(app)
 }
 
 pub(crate) fn has_animation(app: &AppState) -> bool {
@@ -75,8 +112,8 @@ pub(crate) fn has_animation(app: &AppState) -> bool {
         return false;
     }
     if folded(app, area) {
-        let (count, running) = summary(app);
-        return running && area.width >= count.to_string().len() as u16 + 3;
+        let running = summary(app).1;
+        return running && area.height as usize >= folded_lines(app).len();
     }
     app.tasks.tasks.as_ref().is_some_and(|tasks| {
         tasks
@@ -184,20 +221,7 @@ pub(super) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
         }
     }
     if folded(app, area) {
-        let (count, running) = summary(app);
-        let mut spans = vec![Span::styled(count.to_string(), dim)];
-        if running {
-            spans.push(Span::styled(
-                format!(" {}", super::spinner_frame(app.spinner_tick)),
-                Style::default().fg(app.palette.green),
-            ));
-        }
-        let content = if area.width > 1 {
-            Rect::new(area.x + 1, area.y, area.width - 1, 1)
-        } else {
-            Rect::new(area.x, area.y, 1, 1)
-        };
-        frame.render_widget(Paragraph::new(Line::from(spans)), content);
+        frame.render_widget(Paragraph::new(folded_lines(app)), area);
         return;
     }
     let content = Rect::new(area.x + 1, area.y, area.width - 1, area.height);
@@ -300,26 +324,115 @@ mod tests {
     fn text(buf: &ratatui::buffer::Buffer) -> String {
         buf.content.iter().map(|c| c.symbol()).collect()
     }
+    fn strip_text(buf: &ratatui::buffer::Buffer, area: Rect) -> String {
+        (area.y..area.bottom())
+            .map(|y| buf[(area.x, y)].symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
     #[test]
-    fn tasks_column_layout_folds_before_panes_shrink_and_recovers() {
+    fn folded_tasks_match_sidebar_and_return_width_to_five_panes() {
+        let mut app = state();
+        app.sidebar_collapsed = true;
+        for direction in [
+            ratatui::layout::Direction::Vertical,
+            ratatui::layout::Direction::Horizontal,
+            ratatui::layout::Direction::Horizontal,
+            ratatui::layout::Direction::Vertical,
+        ] {
+            app.workspaces[0].test_split(direction);
+        }
+        draw(&mut app, 240, 40);
+        let open_tasks_width = app.view.tasks_rect.width;
+        let open_panes_width = app.view.terminal_area.width;
+        app.tasks_collapsed = true;
+        draw(&mut app, 240, 40);
+        assert_eq!(app.view.pane_infos.len(), 5);
+        assert_eq!(app.view.tasks_rect.width, app.view.sidebar_rect.width);
+        assert_eq!(app.view.tasks_rect.width, 1);
+        assert_eq!(app.view.tasks_rect.right(), 240);
+        assert_eq!(app.view.terminal_area.right(), app.view.tasks_rect.x);
+        assert_eq!(
+            app.view.terminal_area.width,
+            open_panes_width + open_tasks_width - 1
+        );
+        assert_eq!(column_width(&app, MIN_PANE_WIDTH), 0);
+        assert_eq!(column_width(&app, MIN_PANE_WIDTH + 1), 1);
+    }
+
+    #[test]
+    fn folded_tasks_click_target_covers_only_the_strip() {
+        for at_bottom in [false, true] {
+            let mut app = state();
+            app.tasks_collapsed = true;
+            draw(&mut app, 160, 40);
+            let area = app.view.tasks_rect;
+            let event = |column, row| MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            };
+            assert!(!mouse(&mut app, event(area.x - 1, area.y)));
+            assert!(!mouse(&mut app, event(area.right(), area.y)));
+            assert!(!mouse(&mut app, event(area.x, area.bottom())));
+            assert!(app.tasks_collapsed);
+            let row = if at_bottom { area.bottom() - 1 } else { area.y };
+            assert!(mouse(&mut app, event(area.x, row)));
+            assert!(!app.tasks_collapsed);
+            assert!(text(&draw(&mut app, 160, 40)).contains("Task 0"));
+        }
+    }
+
+    #[test]
+    fn folded_tasks_preserve_large_counts_and_clip_short_windows() {
+        let mut app = state();
+        let rows = &mut app.tasks.tasks.as_mut().unwrap().rows;
+        rows.extend((0..12).map(|i| Row {
+            mark: Mark::Approve,
+            title: format!("Extra {i}"),
+            who: String::new(),
+        }));
+        app.tasks_collapsed = true;
+        let buf = draw(&mut app, 160, 40);
+        assert_eq!(strip_text(&buf, app.view.tasks_rect), "‹17◆13◐");
+        assert_eq!(app.view.tasks_rect.width, 1);
+        assert!(has_animation(&app));
+        app.view.tasks_rect.height = 6;
+        assert!(!has_animation(&app));
+        for height in 1..8 {
+            draw(&mut app, 160, height);
+        }
+    }
+
+    #[test]
+    fn tasks_column_stays_open_until_panes_would_be_unusable() {
         let mut app = state();
         draw(&mut app, 160, 40);
         assert_eq!(app.view.tasks_rect.width, app.view.sidebar_rect.width);
         assert_eq!(app.view.tasks_rect.right(), 160);
-        assert!(app.view.terminal_area.width >= MIN_PANE_WIDTH);
+        // A narrow window still shows the full column, the pane shrinks.
         draw(&mut app, 100, 40);
-        assert_eq!(app.view.tasks_rect.width, 4);
+        assert_eq!(app.view.tasks_rect.width, app.view.sidebar_rect.width);
         assert!(app.view.terminal_area.width >= MIN_PANE_WIDTH);
+        // Three panes side by side used to fold it at 160 columns.
+        app.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         app.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
         draw(&mut app, 160, 40);
-        assert_eq!(app.view.tasks_rect.width, 4);
-        draw(&mut app, 240, 40);
-        assert!(app.view.tasks_rect.width > 1);
+        assert_eq!(app.view.tasks_rect.width, app.view.sidebar_rect.width);
         assert!(app
             .view
             .pane_infos
             .iter()
             .all(|p| p.rect.width >= MIN_PANE_WIDTH));
+        // Only when a pane would drop under the floor does it fold.
+        draw(&mut app, 130, 40);
+        assert!(app.view.tasks_rect.width < app.view.sidebar_rect.width);
+        assert_eq!(app.view.tasks_rect.width, 1);
+        draw(&mut app, 240, 40);
+        assert_eq!(app.view.tasks_rect.width, app.view.sidebar_rect.width);
         app.tasks = TasksSnapshot::default();
         draw(&mut app, 160, 40);
         assert!(app.view.tasks_rect.is_empty());
@@ -347,13 +460,14 @@ mod tests {
             }
         ));
         let folded = draw(&mut app, 160, 40);
-        assert_eq!(app.view.tasks_rect.width, 4);
+        assert_eq!(app.view.tasks_rect.width, 1);
         assert!(!text(&folded).contains("Task 0"));
         assert!(has_animation(&app));
-        let folded_header: String = (app.view.tasks_rect.x + 1..app.view.tasks_rect.right())
-            .map(|x| folded[(x, 0)].symbol())
-            .collect();
-        assert_eq!(folded_header, "5 ◐");
+        assert_eq!(strip_text(&folded, app.view.tasks_rect), "‹5◆1◐");
+        assert_eq!(folded[(app.view.tasks_rect.x, 0)].fg, app.palette.accent);
+        assert!(folded[(app.view.tasks_rect.x, 0)]
+            .modifier
+            .contains(Modifier::BOLD));
         let area = app.view.tasks_rect;
         assert!(mouse(
             &mut app,
@@ -405,10 +519,7 @@ mod tests {
         let strip = draw(&mut app.state, 160, 40);
         assert!(!text(&strip).contains("Task 0"));
         let area = app.state.view.tasks_rect;
-        let header: String = (area.x + 1..area.right())
-            .map(|x| strip[(x, 0)].symbol())
-            .collect();
-        assert_eq!(header, "5 ◐");
+        assert_eq!(strip_text(&strip, area), "‹5◆1◐");
         app.state.mode = crate::app::Mode::Prefix;
         app.handle_prefix_key(crate::input::TerminalKey::new(
             crossterm::event::KeyCode::Char('t'),
@@ -427,10 +538,7 @@ mod tests {
             .for_each(|r| r.mark = Mark::Done);
         let quiet = draw(&mut app.state, 160, 40);
         let area = app.state.view.tasks_rect;
-        let header: String = (area.x + 1..area.right())
-            .map(|x| quiet[(x, 0)].symbol())
-            .collect();
-        assert_eq!(header, "0  ");
+        assert_eq!(strip_text(&quiet, area), "‹0");
         assert!(!has_animation(&app.state));
     }
     #[test]

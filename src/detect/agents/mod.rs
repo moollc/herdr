@@ -19,7 +19,7 @@ pub(super) mod qodercli;
 use super::{Agent, AgentDetection, AgentState};
 
 pub(super) fn detect(agent: Agent, screen_content: &str) -> AgentDetection {
-    let state = match agent {
+    let mut state = match agent {
         Agent::Pi => pi::detect(screen_content),
         Agent::Claude => claude_code::detect(screen_content),
         Agent::Codex => codex::detect(screen_content),
@@ -51,11 +51,15 @@ pub(super) fn detect(agent: Agent, screen_content: &str) -> AgentDetection {
         };
     }
 
+    let stopped = super::stopped_error_reason(Some(agent), screen_content).is_some();
+    if stopped {
+        state = AgentState::Blocked;
+    }
     AgentDetection {
         state,
         skip_state_update: false,
-        ambiguous: is_ambiguous(agent, screen_content),
-        visible_blocker: has_visible_blocker(agent, screen_content, state),
+        ambiguous: !stopped && is_ambiguous(agent, screen_content),
+        visible_blocker: stopped || has_visible_blocker(agent, screen_content, state),
         visible_idle: has_visible_idle(agent, screen_content, state),
         visible_working: has_visible_working(agent, screen_content, state),
     }

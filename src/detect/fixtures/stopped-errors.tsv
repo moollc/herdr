@@ -1,0 +1,23 @@
+# agent<TAB>reason<TAB>captured or source-rendered error rows; provenance in BUILD-27
+codex	model at capacity	■ Selected model is at capacity. Please try a different model.\n› 
+codex	model at capacity	■ Flex capacity unavailable.\n› 
+codex	usage limit	■ You’ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits\n› 
+codex	usage limit	■ Quota exceeded. Check your plan and billing details.\n› 
+codex	login expired	■ Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again.\n› 
+codex	server error	■ stream disconnected before completion: \n› 
+codex	server error	■ Error while reading the server response: \n› 
+codex	server error	■ Connection failed: \n› 
+codex	server error	■ exceeded retry limit, last status: \n› 
+claude	usage limit	⎿ You've hit your weekly limit · resets Jan 1 at 12pm (UTC)\n────────\n❯ \n────────
+claude	login expired	⎿ Login expired · Please run /login\n────────\n❯ \n────────
+claude	server error	⎿ API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)\n────────\n❯ \n────────
+claude	server error	⎿ API Error: Your computer went to sleep mid-response. The response above may be incomplete.\n────────\n❯ \n────────
+cursor	server error	Error: Connection failed
+cursor	server error	Error: Connection stalled
+cursor	server error	Error: Something went wrong. Please try again.
+cursor	server error	Error: Something went wrong communicating with the server. Please try again.
+cursor	server error	Error: Can't resolve the Cursor API host — DNS lookup failed (ENOTFOUND). Check your network/VPN/DNS.
+cursor	server error	Error: Can't reach the Cursor API — network unreachable (ENETUNREACH). Check your network/VPN/DNS.
+cursor	login expired	Authentication failed: your Cursor credentials or API key are invalid or expired.
+cursor	login expired	Your stored authentication is invalid. Please log in again.
+codex	model at capacity	■ Selected model is at capacity. Please try a\n  different model.\n› 

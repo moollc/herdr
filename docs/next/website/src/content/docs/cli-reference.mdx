@@ -179,6 +179,14 @@ herdr pane send-keys <pane_id> <key> [key ...]
 herdr pane run <pane_id> <command>
 ```
 
+`pane send-keys` uses the keybinding configuration's key names. Modifiers (`ctrl`,
+`alt`, `shift`, `cmd`/`super`) accept `+` or `-` in any case: `ctrl+enter`,
+`C-Enter`, `alt-shift-x`. Named keys include `Escape`/`Esc`, `Return`/`Enter`,
+`Tab`, arrows, navigation keys and `F1`–`F35`; use `plus` or `minus` for
+punctuation in combinations. Keys use the pane's negotiated keyboard protocol.
+For a queued message, send `ctrl+enter` when the application offers “send now”;
+`Tab` remains available for applications that offer “tab to queue”.
+
 `pane run` submits text plus Enter atomically. Prefer it over `send-text` plus `send-keys Enter` for commands.
 
 Report agent state from custom hooks:

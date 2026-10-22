@@ -1857,7 +1857,7 @@ mod tests {
         app.sync_animation_timer(Instant::now());
         assert!(app.next_animation_tick.is_some());
         app.state.tasks_collapsed = true;
-        app.state.view.tasks_rect.width = 4;
+        app.state.view.tasks_rect.width = 14;
         app.sync_animation_timer(Instant::now());
         assert!(
             app.next_animation_tick.is_some(),
