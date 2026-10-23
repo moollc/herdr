@@ -885,8 +885,21 @@ pub struct PaneTitleHitArea {
     pub rect: Rect,
 }
 
+/// One pane to open in its own window, over the cells it occupies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanePopOutRequest {
+    /// Public id of the pane's terminal.
+    pub terminal_id: String,
+    /// The pane's name as its title shows it.
+    pub title: String,
+    /// The pane's outer rect, border included, in client screen cells.
+    pub rect: Rect,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PaneChromeAction {
+    /// Open the pane in its own window in the host terminal.
+    PopOut,
     Focus,
     Close,
     /// The finished agent's dot or check on the title: turns one into the other.
@@ -1188,13 +1201,15 @@ pub(crate) enum ExperimentSetting {
     SwitchAsciiInputSourceInPrefix,
     RefreshSummaryWithGrok,
     HideAttachedAgents,
+    AcknowledgeOnPaneFocus,
 }
 
 impl ExperimentSetting {
-    pub(crate) const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::PaneHistory,
         Self::SwitchAsciiInputSourceInPrefix,
         Self::HideAttachedAgents,
+        Self::AcknowledgeOnPaneFocus,
         Self::RefreshSummaryWithGrok,
     ];
 
@@ -1206,6 +1221,7 @@ impl ExperimentSetting {
             }
             Self::RefreshSummaryWithGrok => "refresh summary with grok",
             Self::HideAttachedAgents => "agent list: only agents not in a space",
+            Self::AcknowledgeOnPaneFocus => "acknowledge completion on pane focus",
         }
     }
 
@@ -1217,6 +1233,7 @@ impl ExperimentSetting {
             }
             Self::RefreshSummaryWithGrok => state.refresh_summary_with_grok(),
             Self::HideAttachedAgents => state.hide_attached_agents(),
+            Self::AcknowledgeOnPaneFocus => state.acknowledge_on_pane_focus,
         }
     }
 }
@@ -1814,6 +1831,12 @@ pub struct AppState {
         std::collections::HashMap<PaneId, crate::workspace::WorkspaceGitStatusSnapshot>,
     /// Terminal ids whose size is currently owned by a direct attach client.
     pub direct_attach_resize_locks: std::collections::HashSet<crate::terminal::TerminalId>,
+    /// Whether the terminal the foreground client runs in can open a pane in
+    /// its own window. Pane titles show a POP control only while this holds.
+    pub host_pops_out_panes: bool,
+    /// A pane the person asked to pop out, waiting for the server to send it
+    /// to the client that asked.
+    pub pending_pane_pop_out: Option<PanePopOutRequest>,
     pub(crate) pane_id_aliases: std::collections::HashMap<u32, PaneId>,
     pub workspaces: Vec<Workspace>,
     pub active: Option<usize>,
@@ -1959,6 +1982,9 @@ pub struct AppState {
     pub update_dismissed: bool,
     pub config_diagnostic: Option<String>,
     pub toast: Option<ToastNotification>,
+    pub(crate) pending_agent_notifications:
+        std::collections::HashMap<PaneId, super::notifications::PendingAgentNotification>,
+    pub(crate) ready_agent_notifications: Vec<super::notifications::AgentNotificationDelivery>,
     pub copy_feedback: Option<CopyFeedback>,
     /// Last reported focus state for the outer terminal hosting herdr.
     /// None means unsupported or not yet reported, which preserves active-pane suppression.
@@ -1979,6 +2005,9 @@ pub struct AppState {
     pub mouse_scroll_lines: usize,
     pub confirm_close: bool,
     pub prompt_new_tab_name: bool,
+    pub acknowledge_on_pane_focus: bool,
+    /// Initial sidebar preview state for new tabs; restored tabs keep their saved state.
+    pub minimap_collapsed_by_default: bool,
     pub nerd_font: bool,
     pub show_agent_labels_on_pane_borders: bool,
     pub pane_header: PaneHeaderConfig,
@@ -2336,6 +2365,8 @@ impl AppState {
             detached_agents: Vec::new(),
             detached_git_statuses: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
+            host_pops_out_panes: false,
+            pending_pane_pop_out: None,
             pane_id_aliases: std::collections::HashMap::new(),
             workspaces: Vec::new(),
             active: None,
@@ -2435,6 +2466,8 @@ impl AppState {
             update_dismissed: false,
             config_diagnostic: None,
             toast: None,
+            pending_agent_notifications: Default::default(),
+            ready_agent_notifications: Vec::new(),
             copy_feedback: None,
             outer_terminal_focus: None,
             prefix_code: KeyCode::Char('b'),
@@ -2448,6 +2481,8 @@ impl AppState {
             mouse_scroll_lines: crate::config::DEFAULT_MOUSE_SCROLL_LINES,
             confirm_close: true,
             prompt_new_tab_name: true,
+            acknowledge_on_pane_focus: false,
+            minimap_collapsed_by_default: false,
             nerd_font: false,
             show_agent_labels_on_pane_borders: true,
             pane_header: PaneHeaderConfig::default(),

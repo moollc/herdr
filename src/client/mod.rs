@@ -334,6 +334,13 @@ fn setup_terminal_with_capabilities(
         io::stdout().flush()?;
     }
 
+    // herdr opens a URL Ctrl+clicked in a pane itself, so Black Box is told
+    // to leave those clicks alone instead of opening the link a second time.
+    if enable_client_protocols && crate::black_box::is_host() {
+        io::stdout().write_all(crate::black_box::CLAIM_LINK_CLICKS.as_bytes())?;
+        io::stdout().flush()?;
+    }
+
     Ok(TerminalGuard {
         reset_modify_other_keys: modify_other_keys_mode.is_some(),
     })
@@ -360,6 +367,10 @@ fn set_mouse_capture(enabled: bool) -> io::Result<()> {
 
 fn restore_terminal_state(reset_modify_other_keys: bool) {
     let _ = clear_received_kitty_graphics(&mut io::stdout());
+
+    if crate::black_box::is_host() {
+        let _ = io::stdout().write_all(crate::black_box::RELEASE_LINK_CLICKS.as_bytes());
+    }
 
     // Reset modifyOtherKeys if we enabled it.
     if reset_modify_other_keys {
@@ -440,6 +451,7 @@ fn do_handshake(
         } else {
             ClientLaunchMode::App
         },
+        host_terminal_program: std::env::var("TERM_PROGRAM").ok(),
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -882,6 +894,26 @@ async fn run_client_loop(
                     forward_clipboard(&data);
                     let _ = io::stdout().flush();
                 }
+                ServerMessage::PopOutPane {
+                    terminal_id,
+                    title,
+                    column,
+                    row,
+                    columns,
+                    rows,
+                } => {
+                    let request = crate::black_box::pop_out_sequence(
+                        &terminal_id,
+                        &title,
+                        column,
+                        row,
+                        columns,
+                        rows,
+                    );
+                    let mut stdout = io::stdout();
+                    let _ = stdout.write_all(request.as_bytes());
+                    let _ = stdout.flush();
+                }
                 ServerMessage::ReloadSoundConfig => {
                     reload_local_client_config(
                         &mut state.sound_config,
@@ -1301,6 +1333,7 @@ fn init_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
 

@@ -642,7 +642,7 @@ fn restore_pane(
     let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
     let saved_agent_timing = saved_pane.and_then(|p| p.agent_timing.as_ref());
     let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
-    let mut startup = {
+    let startup = {
         let mut agent_restore = AgentRestoreState {
             enabled: runtime_context.resume_agents_on_restore,
             resumed_sessions: resumed_agent_sessions,

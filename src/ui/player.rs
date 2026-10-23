@@ -6,11 +6,18 @@
 //! playlist, and seek talk to the localhost daemon. The daemon is polled on a
 //! background thread so a down or slow localhost never stalls the UI.
 
+#[cfg(not(test))]
 use std::io::{Read, Write};
+#[cfg(not(test))]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+#[cfg(not(test))]
 use std::process::{Command, Stdio};
+#[cfg(not(test))]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+#[cfg(not(test))]
+use std::sync::OnceLock;
+#[cfg(not(test))]
 use std::time::{Duration, Instant};
 
 use ratatui::{
@@ -37,13 +44,20 @@ pub(crate) const PLAYER_FULL_MIN_WIDTH: u16 = 22;
 /// Rows kept above the full player for the spaces header, a remnant list, and `+ new`.
 const FULL_KEEP_ABOVE: u16 = 9;
 
+#[cfg(not(test))]
 const DAEMON_HOST: &str = "127.0.0.1";
+#[cfg(not(test))]
 const DAEMON_PORT: u16 = 8737;
+#[cfg(not(test))]
 const POLL_MS: u64 = 750;
+#[cfg(not(test))]
 const IO_TIMEOUT: Duration = Duration::from_millis(80);
+#[cfg(not(test))]
 const AUTOSTART_WAIT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
 const AUTOSTART_POLL: Duration = Duration::from_millis(100);
 
+#[cfg(not(test))]
 static DAEMON_SPAWNING: AtomicBool = AtomicBool::new(false);
 
 const COVER: &str = "♪";
@@ -74,8 +88,9 @@ const PLAYLIST_MAX_ROWS: u16 = 8;
 const TOO_SMALL_HINT: &str = "widen this pane for full player view";
 const HEADER_LABEL: &str = "♪ PLAYER";
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) enum PlayerSnapshot {
+    #[default]
     Offline,
     Online {
         title: Option<String>,
@@ -145,12 +160,6 @@ impl PlayerDensity {
     }
 }
 
-impl Default for PlayerSnapshot {
-    fn default() -> Self {
-        Self::Offline
-    }
-}
-
 impl PlayerSnapshot {
     fn playing(&self) -> bool {
         matches!(self, Self::Online { playing: true, .. })
@@ -183,6 +192,7 @@ impl PlayerSnapshot {
     }
 }
 
+#[cfg(not(test))]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DaemonState {
@@ -211,6 +221,7 @@ struct DaemonPlaylistItem {
     title: Option<String>,
 }
 
+#[cfg(not(test))]
 #[derive(Debug, Deserialize)]
 struct DaemonQueue {
     #[serde(rename = "loop")]
@@ -249,6 +260,7 @@ static DENSITY: Mutex<PlayerDensity> = Mutex::new(PlayerDensity::Comfortable);
 static DENSITY_KEY: Mutex<Option<String>> = Mutex::new(None);
 static DENSITY_VALUE: Mutex<String> = Mutex::new(String::new());
 static DENSITY_ALLOWED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+#[cfg(not(test))]
 static POLLER: OnceLock<()> = OnceLock::new();
 #[cfg(test)]
 static TEST_POSTS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
@@ -403,6 +415,7 @@ pub(crate) fn playlist_changed(last: &mut PlaylistSnapshot) -> bool {
     }
 }
 
+#[cfg(not(test))]
 pub(crate) fn ensure_poller() {
     POLLER.get_or_init(|| {
         let _ = std::thread::Builder::new()
@@ -414,6 +427,7 @@ pub(crate) fn ensure_poller() {
     });
 }
 
+#[cfg(not(test))]
 fn refresh_from_daemon() {
     *snapshot_lock() = fetch_snapshot();
     if let Some(playlist) = fetch_playlist_from_daemon() {
@@ -423,6 +437,7 @@ fn refresh_from_daemon() {
     *saved_lock() = fetch_saved_names();
 }
 
+#[cfg(not(test))]
 fn fetch_snapshot() -> PlayerSnapshot {
     match fetch_daemon_state() {
         Some(state) => PlayerSnapshot::Online {
@@ -449,18 +464,13 @@ fn fetch_snapshot() -> PlayerSnapshot {
     }
 }
 
+#[cfg(not(test))]
 fn fetch_playlist_from_daemon() -> Option<PlaylistSnapshot> {
-    let Some((status, body)) = daemon_exchange("GET", "/playlist", "") else {
-        return None;
-    };
+    let (status, body) = daemon_exchange("GET", "/playlist", "")?;
     if status != 200 {
         return None;
     }
     Some(parse_playlist_body(&body))
-}
-
-fn fetch_playlist() -> PlaylistSnapshot {
-    fetch_playlist_from_daemon().unwrap_or_else(PlaylistSnapshot::default)
 }
 
 fn parse_playlist_body(body: &str) -> PlaylistSnapshot {
@@ -496,6 +506,7 @@ fn parse_playlist_body(body: &str) -> PlaylistSnapshot {
     PlaylistSnapshot { items, index }
 }
 
+#[cfg(not(test))]
 fn fetch_settings_fields() -> Vec<SettingsField> {
     #[cfg(test)]
     {
@@ -606,10 +617,12 @@ fn nonempty(value: Option<String>) -> Option<String> {
     })
 }
 
+#[cfg(not(test))]
 fn fetch_daemon_state() -> Option<DaemonState> {
     daemon_http("GET", "/state", "").and_then(|body| serde_json::from_str(&body).ok())
 }
 
+#[cfg(not(test))]
 fn daemon_http(method: &str, path: &str, body: &str) -> Option<String> {
     daemon_exchange(method, path, body).map(|(_, body)| body)
 }
@@ -630,6 +643,7 @@ fn herdplay_daemon_server_path() -> Option<std::path::PathBuf> {
     )
 }
 
+#[cfg(not(test))]
 fn daemon_tcp_reachable() -> bool {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DAEMON_PORT);
     TcpStream::connect_timeout(&addr, IO_TIMEOUT).is_ok()
@@ -639,10 +653,12 @@ fn post_needs_autostart(path: &str) -> bool {
     matches!(path, "/play" | "/playlist/load")
 }
 
+#[cfg(not(test))]
 fn daemon_state_ready() -> bool {
     daemon_exchange("GET", "/state", "").is_some_and(|(status, _)| status == 200)
 }
 
+#[cfg(not(test))]
 fn spawn_herdplay_daemon(server_path: &std::path::Path) -> bool {
     let Some(cwd) = server_path.parent() else {
         return false;
@@ -657,6 +673,7 @@ fn spawn_herdplay_daemon(server_path: &std::path::Path) -> bool {
         .is_ok()
 }
 
+#[cfg(not(test))]
 fn wait_for_daemon_ready() -> bool {
     let deadline = Instant::now() + AUTOSTART_WAIT;
     while Instant::now() < deadline {
@@ -669,6 +686,7 @@ fn wait_for_daemon_ready() -> bool {
 }
 
 /// Spawn `server.js` once when concurrent play/load POSTs find port 8737 closed.
+#[cfg(not(test))]
 fn ensure_daemon_running() -> bool {
     if daemon_state_ready() {
         return true;
@@ -700,6 +718,7 @@ fn daemon_exchange_with_autostart(method: &str, path: &str, body: &str) -> Optio
     daemon_exchange(method, path, body)
 }
 
+#[cfg(not(test))]
 fn daemon_exchange(method: &str, path: &str, body: &str) -> Option<(u16, String)> {
     if method != "GET" {
         if let Ok(log_path) = std::env::var("HERDPLAY_POST_LOG") {
@@ -731,6 +750,7 @@ fn daemon_exchange(method: &str, path: &str, body: &str) -> Option<(u16, String)
     parse_http_response(&buf)
 }
 
+#[cfg(not(test))]
 fn parse_http_response(buf: &str) -> Option<(u16, String)> {
     let (head, body) = buf
         .split_once("\r\n\r\n")
@@ -751,8 +771,7 @@ fn post_daemon(path: &'static str, body: String) {
         TEST_POSTS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push((path.to_string(), body.clone()));
-        return;
+            .push((path.to_string(), body));
     }
     #[cfg(not(test))]
     {

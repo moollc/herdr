@@ -692,6 +692,9 @@ impl AppState {
                         }
                         self.focus_pane(control.pane_id);
                         match control.action {
+                            crate::app::state::PaneChromeAction::PopOut => {
+                                self.request_pane_pop_out(control.pane_id);
+                            }
                             crate::app::state::PaneChromeAction::Focus => self.toggle_zoom(),
                             crate::app::state::PaneChromeAction::Close => {
                                 self.close_pane();
@@ -2333,6 +2336,35 @@ impl AppState {
         })
     }
 
+    /// Leaves a request for the server to open `pane_id` in its own window in
+    /// the host terminal, over the cells the pane occupies now.
+    fn request_pane_pop_out(&mut self, pane_id: crate::layout::PaneId) {
+        let Some(ws_idx) = self.active else {
+            return;
+        };
+        let Some(rect) = self
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == pane_id)
+            .map(|info| info.rect)
+        else {
+            return;
+        };
+        let Some(terminal_id) = self.terminal_id_for_pane(ws_idx, pane_id) else {
+            return;
+        };
+        let Some(ws) = self.workspaces.get(ws_idx) else {
+            return;
+        };
+        let title = crate::ui::pane_pop_out_title(self, ws, pane_id);
+        self.pending_pane_pop_out = Some(crate::app::state::PanePopOutRequest {
+            terminal_id: terminal_id.to_string(),
+            title,
+            rect,
+        });
+    }
+
     pub(super) fn focus_pane(&mut self, pane_id: crate::layout::PaneId) {
         if let Some(ws_idx) = self.active {
             self.focus_pane_in_workspace(ws_idx, pane_id);
@@ -2727,6 +2759,22 @@ fn apply_scroll(scroll: &mut usize, delta: i16, max_scroll: usize) {
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
     use ratatui::layout::{Direction, Rect};
+
+    #[test]
+    fn the_drag_and_release_of_a_url_click_do_not_reach_the_pane() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let event = |kind| super::super::mouse(kind, 5, 5);
+        let mut app = app_for_mouse_test();
+        app.url_click_in_progress = true;
+
+        assert!(app.handle_modified_url_click(event(MouseEventKind::Drag(MouseButton::Left))));
+        assert!(app.handle_modified_url_click(event(MouseEventKind::Up(MouseButton::Left))));
+        assert!(!app.url_click_in_progress);
+        assert!(
+            !app.handle_modified_url_click(event(MouseEventKind::Up(MouseButton::Left))),
+            "a later release is an ordinary one again"
+        );
+    }
 
     use super::super::{
         app_for_mouse_test, capture_snapshot, handle_context_menu_key, mouse, numbered_lines_bytes,
@@ -3196,6 +3244,8 @@ mod tests {
     #[test]
     fn clicking_agent_toast_focuses_target_pane() {
         let mut app = app_for_mouse_test();
+        // This test exercises clicking an already-delivered toast.
+        app.state.toast_config.delay_seconds = 0;
         let active = Workspace::test_new("active");
         let mut background = Workspace::test_new("background");
         let first_pane = background.tabs[0].root_pane;
@@ -4826,6 +4876,53 @@ mod tests {
         ));
         assert!(!app.state.workspaces[0].tabs[0].panes[&finished].seen);
         assert!(app.state.workspaces[0].tabs[0].panes[&finished].completed);
+    }
+
+    #[test]
+    fn acknowledge_on_focus_clicking_an_already_focused_pane_confirms_completion() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("space")];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        app.state.acknowledge_on_pane_focus = true;
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_detected_state(
+                Some(crate::detect::Agent::Codex),
+                crate::detect::AgentState::Idle,
+            );
+        let pane = app.state.workspaces[0].pane_state_mut(pane_id).unwrap();
+        pane.seen = false;
+        pane.completed = true;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let rect = app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == pane_id)
+            .unwrap()
+            .inner_rect;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            rect.x + 2,
+            rect.y + 2,
+        ));
+        assert!(app.state.workspaces[0].pane_state(pane_id).unwrap().seen);
+        assert!(
+            app.state.workspaces[0]
+                .pane_state(pane_id)
+                .unwrap()
+                .completed
+        );
     }
 
     #[test]
@@ -6540,7 +6637,7 @@ mod tests {
             .and_then(|(_, body)| serde_json::from_str::<serde_json::Value>(body).ok())
             .and_then(|v| v["level"].as_f64())
             .unwrap();
-        assert!(level >= 0.0 && level <= 1.0, "level {level}");
+        assert!((0.0..=1.0).contains(&level), "level {level}");
         assert!(
             level < 0.3,
             "leftmost bar cell should be quiet, got {level}"

@@ -5,12 +5,24 @@
 ### Changed
 
 - Fresh structured agent launches now use `--conversation new`, keeping their model-conversation intent separate from `--session`, which selects a named Herdr instance. This prevents an external launcher targeting a named instance from accidentally losing its first-task orientation.
+- A finished agent's dot in its pane header blinks until its completion is acknowledged, using the same rhythm as an inactive tab's attention indicator. It used to stay solid even while waiting for acknowledgement. Pending completions keep the animation clock running without another agent working.
 
 ### Fixed
 
 - Agents started by typing their command into a pane, such as Claude Code or a Codex wrapper, now receive the Herdr orientation as soon as they are ready for input, with no hook needed. Each agent gets it once. An agent that exits and starts again in the same pane, including after a cold restart, gets it again; live handoffs do not. Typing into the agent before it is ready cancels it, and agents already oriented by a hook or a Herdr launch are skipped.
 - Codex startup orientation now uses durable receipts across hook processes, retries failed socket requests, and reports delivery failures instead of silently sending tasks without context. Integration install and status include existing provider homes and check profile hook overrides, so wrapper-selected Codex homes can receive the startup hook.
 - Preserve a fresh agent's Herdr-managed identity when a sandboxed command environment does not inherit `HERDR_ENV`, and allow agents to inspect and coordinate with counterparts through the local socket API without that variable.
+- Agent sounds and popups wait one second before delivery and are canceled if work resumes, reducing premature completion alerts. Configure the delay with `ui.toast.delay_seconds` (`0` restores immediate delivery).
+- Codex activity detection recognizes animated or hidden bullets, dynamic activity labels, custom or unbound interrupt keys, and queued-input controls in current Codex versions.
+- Ctrl+clicking a URL in a pane opens it once from herdr. The release of that click used to reach the pane, so a program in the pane that opens links on click, such as Claude Code, opened the same URL a second time.
+- In Black Box, a Ctrl+clicked URL also stopped opening a third time from Black Box itself. herdr sets Black Box's `vte.ext.blackbox.app-opens-links` terminal property while it runs and clears it on exit, and Black Box leaves Ctrl+clicked links to herdr while it is set.
+
+### Added
+- `[ui] acknowledge_on_pane_focus = true` confirms a finished agent when its pane is clicked or focused. The default is `false`, preserving manual confirmation. Settings → experiments toggles the same preference as `acknowledge completion on pane focus`. Focusing one pane leaves other agents' pending completions alone, and repeated focus never undoes a confirmation.
+- `[ui] minimap_collapsed_by_default = true` starts new tabs with their sidebar layout previews folded, including the first tab of a new space. Previews used to always start open. Each tab can still be unfolded with its arrow, and restored tabs keep their saved choice.
+- In Black Box, a pane title shows `⧉ POP` to the left of `⛶ FOCUS`. Clicking it opens the pane in its own Black Box window that stays above other windows and sits exactly over the pane: same position on screen, same width and height. The window is a direct attach to the pane's terminal, so closing it returns the pane to the layout at its usual size. The client tells the server which terminal it runs in when it connects, from `TERM_PROGRAM`, and POP appears only for a client running in Black Box. The window is opened through Black Box's `vte.ext.blackbox.pop-out` terminal properties, which carry the pane's terminal id and cells, never a command. This changes the client protocol, so the client and server must both be updated.
+
+## [0.14.0] - 2026-10-04
 
 ### Added
 - Pane headers and the sidebar show how much of each provider's allowance is left: five hour and weekly for Claude and GPT, monthly for Cursor, with a countdown to the reset. Settings → pane labels has a `usage` toggle after git status, `[ui.usage]` has `sidebar` and `alerts`, and opt-in alerts speak once per window at 10% left. `herdr usage cursor-login` imports a browser login on macOS after consent; account paths and the alert command are configurable.
@@ -23,10 +35,12 @@
 - `herdr view <part> [show|hide|toggle]` and the socket method `view.set` fold away or show the parts of the interface that only a click or a key reached before: the sidebar, its spaces section, the agent table, the agents under a space's card, a space's worktree group, and the minimaps under tab names. The Commander uses the same method, so `hide the minimaps` or `collapse the agent table` works there, and a line can mix these with other commands. Clicks, keys, the context menu, the API, and the Commander now change these parts through one place, so each fold is saved with the session the same way whichever of them did it.
 
 ### Changed
+- A pane whose name is already taken gets the next unused name from the word list, so a second `Olivia` becomes another name rather than `Olivia-2`. Panes claim names in a stable order, so a pane keeps its name when a new one appears, and a name set by hand counts as taken. A numeric suffix appears only once every name in the list is in use. Two panes used to share a base name and differ only by a number, which made them hard to tell apart.
 - A space's card in the spaces sidebar shows only its name. The agent count on the right of the name row, such as `2 agents` or `no agents`, is gone; the rows listed under the card already show which agents the space holds.
 
 ### Fixed
 - A pane title's `hostname` names the machine an `ssh` in the pane is connected to, so `ssh aaron@king` or `tailscale ssh king` shows `Olivia@king`. It used to name the local machine no matter where the pane's shell was, so every pane said the same host. The name comes from ssh's command line; a Tailscale name keeps only its machine part, and the title returns to the local hostname when ssh exits.
+- Clicking the done dot or check in a pane title lands. The click target now covers the mark and the cell after it, because many fonts draw the dot wider than one cell, so a click on the visible part of the dot used to miss.
 
 ## [0.13.0] - 2026-09-29
 

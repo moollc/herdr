@@ -57,6 +57,7 @@ use self::mobile::{
 use self::navigator::render_navigator_overlay;
 pub(crate) use self::onboarding::onboarding_welcome_continue_rect;
 use self::onboarding::render_onboarding_overlay;
+pub(crate) use self::panes::pane_pop_out_title;
 use self::panes::{compute_pane_infos, render_panes, resize_tab_panes};
 use self::player::render_player;
 pub(crate) use self::release_notes::{
@@ -131,6 +132,11 @@ const SPINNER_FRAME_MS: u128 = 120;
 pub(super) fn spinner_frame(tick: u32) -> &'static str {
     let elapsed = tick as u128 * crate::app::ANIMATION_INTERVAL.as_millis();
     SPINNERS[(elapsed / SPINNER_FRAME_MS) as usize % SPINNERS.len()]
+}
+
+/// Shared phase for pending-completion attention in tabs and pane headers.
+pub(super) fn completion_blink_on(tick: u32) -> bool {
+    (tick / 4).is_multiple_of(2)
 }
 
 /// Compute view geometry and reconcile pane sizes.
