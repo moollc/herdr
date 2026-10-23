@@ -92,6 +92,16 @@ pub enum Method {
     PaneSendInput(PaneSendInputParams),
     #[serde(rename = "pane.read")]
     PaneRead(PaneReadParams),
+    #[serde(rename = "pane.report_turn")]
+    PaneReportTurn(PaneReportTurnParams),
+    #[serde(rename = "overseer.escalate")]
+    OverseerEscalate(OverseerEscalateParams),
+    #[serde(rename = "overseer.message")]
+    OverseerMessage(OverseerMessageParams),
+    #[serde(rename = "pane.set_job_marker")]
+    PaneSetJobMarker(PaneSetJobMarkerParams),
+    #[serde(rename = "pane.job_marker")]
+    PaneJobMarker(PaneJobMarkerParams),
     #[serde(rename = "pane.report_agent")]
     PaneReportAgent(PaneReportAgentParams),
     #[serde(rename = "pane.report_agent_session")]
@@ -474,6 +484,43 @@ pub struct PaneReadParams {
     pub strip_ansi: bool,
 }
 
+/// A space overseer passes one line up to the chief overseer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverseerEscalateParams {
+    pub caller_pane_id: String,
+    pub text: String,
+    /// Only explicitly informational lines may skip delivery.
+    #[serde(default = "default_true")]
+    pub wake: bool,
+}
+
+/// The chief overseer sends one line to a space overseer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverseerMessageParams {
+    pub caller_pane_id: String,
+    pub to: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneReportTurnParams {
+    pub pane_id: String,
+    pub agent: String,
+    pub event: crate::turn_reporting::TurnEvent,
+    pub seq: u64,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSetJobMarkerParams {
+    pub pane_id: String,
+    pub path: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneJobMarkerParams {
+    pub pane_id: String,
+    pub caller_pane_id: String,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneReportAgentParams {
     pub pane_id: String,
@@ -494,6 +541,8 @@ pub struct PaneReportAgentParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneReportAgentSessionParams {
+    #[serde(default)]
+    pub turn_reporting: bool,
     /// SessionStart provenance: only `startup` establishes a fresh conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_source: Option<String>,
@@ -667,6 +716,7 @@ pub struct IntegrationUninstallParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegrationTarget {
+    Cursor,
     Pi,
     Omp,
     Claude,
@@ -899,6 +949,9 @@ pub enum ResponseResult {
     ViewSet {
         parts: Vec<ViewPartInfo>,
     },
+    JobMarker {
+        path: Option<String>,
+    },
     OrientationContext {
         context: String,
         nonce: String,
@@ -1010,6 +1063,9 @@ pub struct AgentInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneInfo {
+    /// "space" or "chief" while the pane holds an overseer role; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overseer: Option<String>,
     pub pane_id: String,
     /// Assigned human name ("Olivia", "Olivia-2"); accepted as a pane target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1289,6 +1345,7 @@ mod tests {
         let request = Request {
             id: "req_session".into(),
             method: Method::PaneReportAgentSession(PaneReportAgentSessionParams {
+                turn_reporting: false,
                 startup_source: None,
                 pane_id: "1-1".into(),
                 source: "herdr:claude".into(),
@@ -1638,6 +1695,7 @@ mod tests {
                     agent_status: AgentStatus::Unknown,
                 },
                 root_pane: PaneInfo {
+                    overseer: None,
                     pane_id: "w_1-1".into(),
                     name: None,
                     terminal_id: "term_1".into(),
@@ -1697,6 +1755,7 @@ mod tests {
                     agent_status: AgentStatus::Unknown,
                 },
                 root_pane: PaneInfo {
+                    overseer: None,
                     pane_id: "w_1-3".into(),
                     name: None,
                     terminal_id: "term_example".into(),

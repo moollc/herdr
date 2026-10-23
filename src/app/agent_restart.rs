@@ -162,6 +162,10 @@ impl App {
                 tracing::warn!(terminal = %terminal_id, reason, "agent restart abandoned");
                 if let Some(terminal) = app.state.terminals.get_mut(&terminal_id) {
                     terminal.pending_restart = None;
+                    terminal.overseer.restart_argv = None;
+                    if let Some(notice) = terminal.overseer.notices.front_mut() {
+                        notice.detail = format!("Permission profile relaunch did not finish: {reason}. The pane was left running.");
+                    }
                 }
             };
             if now.duration_since(restart.started) > RESTART_TIMEOUT {
@@ -205,6 +209,15 @@ impl App {
             }
             if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                 terminal.pending_restart = None;
+                terminal.overseer.restart_argv = None;
+                if terminal
+                    .overseer
+                    .notices
+                    .front()
+                    .is_some_and(|notice| !notice.active)
+                {
+                    terminal.overseer.profile_base = None;
+                }
                 // The old agent is gone; the new one reports itself afresh.
                 terminal.clear_agent_runtime_identity_after_respawn();
             }

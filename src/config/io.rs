@@ -175,6 +175,22 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
 
     load_live_section(
         table,
+        "allowance_guard",
+        "allowance guard config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.allowance_guard = section,
+    );
+    load_live_section(
+        table,
+        "overseer",
+        "overseer config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.overseer = section,
+    );
+    load_live_section(
+        table,
         "theme",
         "theme config",
         &mut diagnostics,

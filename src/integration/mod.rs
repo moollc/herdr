@@ -1,3 +1,4 @@
+mod turns;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -22,7 +23,7 @@ const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/herdr-agent-state.sh
 const CLAUDE_STATUSLINE_INSTALL_NAME: &str = "herdr-statusline.sh";
 const CLAUDE_STATUSLINE_ASSET: &str = include_str!("assets/claude/herdr-statusline.sh");
 const CLAUDE_STATUSLINE_DELEGATE_NAME: &str = "herdr-statusline-delegate.json";
-const CLAUDE_INTEGRATION_VERSION: u32 = 6;
+const CLAUDE_INTEGRATION_VERSION: u32 = 7;
 const CLAUDE_CONFIG_DIR_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
 const CODEX_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
 const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/herdr-agent-state.sh");
@@ -278,6 +279,7 @@ pub(crate) fn install_target(
     target: crate::api::schema::IntegrationTarget,
 ) -> io::Result<Vec<String>> {
     let messages = match target {
+        crate::api::schema::IntegrationTarget::Cursor => turns::install_cursor()?,
         crate::api::schema::IntegrationTarget::Pi => {
             let path = install_pi()?;
             vec![format!("installed pi integration to {}", path.display())]
@@ -445,6 +447,7 @@ pub(crate) fn uninstall_target(
     target: crate::api::schema::IntegrationTarget,
 ) -> io::Result<Vec<String>> {
     let messages = match target {
+        crate::api::schema::IntegrationTarget::Cursor => turns::uninstall_cursor()?,
         crate::api::schema::IntegrationTarget::Pi => {
             let result = uninstall_pi()?;
             if result.removed_extension {
@@ -739,6 +742,7 @@ pub(crate) fn integration_target_label(
     target: crate::api::schema::IntegrationTarget,
 ) -> &'static str {
     match target {
+        crate::api::schema::IntegrationTarget::Cursor => "cursor",
         crate::api::schema::IntegrationTarget::Pi => "pi",
         crate::api::schema::IntegrationTarget::Omp => "omp",
         crate::api::schema::IntegrationTarget::Claude => "claude",
@@ -755,6 +759,7 @@ pub(crate) fn integration_target_label(
 
 fn integration_target_command(target: crate::api::schema::IntegrationTarget) -> &'static str {
     match target {
+        crate::api::schema::IntegrationTarget::Cursor => "cursor-agent",
         crate::api::schema::IntegrationTarget::Pi => "pi",
         crate::api::schema::IntegrationTarget::Omp => "omp",
         crate::api::schema::IntegrationTarget::Claude => "claude",
@@ -841,6 +846,11 @@ fn integration_specs() -> Vec<(
     u32,
 )> {
     let mut specs = vec![
+        (
+            crate::api::schema::IntegrationTarget::Cursor,
+            turns::cursor_dir().map(|dir| dir.join("herdr-agent-state.sh")),
+            1,
+        ),
         (
             crate::api::schema::IntegrationTarget::Pi,
             pi_extension_dir().map(|dir| dir.join(PI_EXTENSION_INSTALL_NAME)),
@@ -951,7 +961,10 @@ fn integration_status_at(
     path: PathBuf,
     expected_version: u32,
 ) -> IntegrationStatus {
-    if !path.is_file() {
+    if !path.is_file()
+        || (target == crate::api::schema::IntegrationTarget::Cursor
+            && !turns::cursor_registered(&path))
+    {
         return IntegrationStatus {
             target,
             path,
@@ -1056,6 +1069,11 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
     let hook_path = hooks_dir.join(CLAUDE_HOOK_INSTALL_NAME);
     fs::write(&hook_path, CLAUDE_HOOK_ASSET)?;
     make_executable(&hook_path)?;
+    turns::write_helper(
+        hook_path
+            .parent()
+            .ok_or_else(|| io::Error::other("hook directory missing"))?,
+    )?;
 
     let settings_path = dir.join("settings.json");
     let mut settings = if settings_path.is_file() {
@@ -1121,6 +1139,21 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
         hooks,
         "SessionStart",
         format!("bash {quoted_hook_path} session"),
+        10,
+        Some("*"),
+    )?;
+
+    ensure_command_hook(
+        hooks,
+        "UserPromptSubmit",
+        format!("bash {quoted_hook_path} started"),
+        10,
+        Some("*"),
+    )?;
+    ensure_command_hook(
+        hooks,
+        "Stop",
+        format!("bash {quoted_hook_path} ended"),
         10,
         Some("*"),
     )?;
@@ -1191,6 +1224,11 @@ fn install_codex_at(dir: &Path) -> io::Result<CodexInstallPaths> {
     let hook_path = dir.join(CODEX_HOOK_INSTALL_NAME);
     fs::write(&hook_path, CODEX_HOOK_ASSET)?;
     make_executable(&hook_path)?;
+    turns::write_helper(
+        hook_path
+            .parent()
+            .ok_or_else(|| io::Error::other("hook directory missing"))?,
+    )?;
 
     let hooks_path = dir.join("hooks.json");
     let mut hooks_file = if hooks_path.is_file() {
@@ -1237,6 +1275,13 @@ fn install_codex_at(dir: &Path) -> io::Result<CodexInstallPaths> {
         None,
     )?;
 
+    ensure_command_hook(
+        hooks,
+        "UserPromptSubmit",
+        format!("bash {quoted_hook_path} started"),
+        10,
+        None,
+    )?;
     fs::write(&hooks_path, serde_json::to_string_pretty(&hooks_file)?)?;
 
     let config_path = dir.join("config.toml");
@@ -1245,7 +1290,8 @@ fn install_codex_at(dir: &Path) -> io::Result<CodexInstallPaths> {
     } else {
         String::new()
     };
-    let new_config = build_codex_config_with_hooks(&existing_config);
+    let new_config =
+        turns::configure_notify(&build_codex_config_with_hooks(&existing_config), dir, false)?;
     if new_config != existing_config {
         fs::write(&config_path, new_config)?;
     }
@@ -1529,6 +1575,13 @@ pub(crate) fn uninstall_claude() -> io::Result<ClaudeUninstallResult> {
             let quoted_hook_path = shell_single_quote(&hook_path.display().to_string());
             updated_settings |= remove_command_hook(
                 hooks,
+                "UserPromptSubmit",
+                &format!("bash {quoted_hook_path} started"),
+            )?;
+            updated_settings |=
+                remove_command_hook(hooks, "Stop", &format!("bash {quoted_hook_path} ended"))?;
+            updated_settings |= remove_command_hook(
+                hooks,
                 "SessionStart",
                 &format!("bash {quoted_hook_path} idle"),
             )?;
@@ -1645,6 +1698,11 @@ fn uninstall_codex_at(codex_dir: &Path) -> io::Result<CodexUninstallResult> {
             let quoted_hook_path = shell_single_quote(&hook_path.display().to_string());
             updated_hooks |= remove_command_hook(
                 hooks,
+                "UserPromptSubmit",
+                &format!("bash {quoted_hook_path} started"),
+            )?;
+            updated_hooks |= remove_command_hook(
+                hooks,
                 "SessionStart",
                 &format!("bash {quoted_hook_path} idle"),
             )?;
@@ -1677,6 +1735,13 @@ fn uninstall_codex_at(codex_dir: &Path) -> io::Result<CodexUninstallResult> {
         }
     }
 
+    if config_path.is_file() {
+        let content = fs::read_to_string(&config_path)?;
+        let restored = turns::configure_notify(&content, codex_dir, true)?;
+        if restored != content {
+            fs::write(&config_path, restored)?;
+        }
+    }
     let removed_hook_file = remove_file_if_exists(&hook_path)?;
 
     Ok(CodexUninstallResult {
@@ -3229,13 +3294,17 @@ mod tests {
             .as_str()
             .unwrap()
             .contains(" session"));
-        assert!(settings["hooks"].get("UserPromptSubmit").is_none());
+        assert!(settings["hooks"]["UserPromptSubmit"]
+            .as_array()
+            .is_some_and(|v| v.len() == 1));
         assert!(settings["hooks"].get("PreToolUse").is_none());
         assert!(settings["hooks"].get("PermissionRequest").is_none());
         assert!(settings["hooks"].get("PostToolUse").is_none());
         assert!(settings["hooks"].get("PostToolUseFailure").is_none());
         assert!(settings["hooks"].get("SubagentStop").is_none());
-        assert!(settings["hooks"].get("Stop").is_none());
+        assert!(settings["hooks"]["Stop"]
+            .as_array()
+            .is_some_and(|v| v.len() == 1));
         assert!(settings["hooks"].get("SessionEnd").is_none());
 
         std::env::remove_var("HOME");
@@ -3281,13 +3350,17 @@ mod tests {
             settings["hooks"]["SessionStart"].as_array().unwrap().len(),
             1
         );
-        assert!(settings["hooks"].get("UserPromptSubmit").is_none());
+        assert!(settings["hooks"]["UserPromptSubmit"]
+            .as_array()
+            .is_some_and(|v| v.len() == 1));
         assert!(settings["hooks"].get("PreToolUse").is_none());
         assert!(settings["hooks"].get("PermissionRequest").is_none());
         assert!(settings["hooks"].get("PostToolUse").is_none());
         assert!(settings["hooks"].get("PostToolUseFailure").is_none());
         assert!(settings["hooks"].get("SubagentStop").is_none());
-        assert!(settings["hooks"].get("Stop").is_none());
+        assert!(settings["hooks"]["Stop"]
+            .as_array()
+            .is_some_and(|v| v.len() == 1));
         assert!(settings["hooks"].get("SessionEnd").is_none());
 
         std::env::remove_var("HOME");
@@ -3337,9 +3410,13 @@ mod tests {
             settings["hooks"]["SessionEnd"][0]["hooks"][0]["command"],
             "echo keep-session-end"
         );
-        assert!(settings["hooks"].get("UserPromptSubmit").is_none());
+        assert!(settings["hooks"]["UserPromptSubmit"]
+            .as_array()
+            .is_some_and(|v| v.len() == 1));
         assert!(settings["hooks"].get("PreToolUse").is_none());
-        assert!(settings["hooks"].get("Stop").is_none());
+        assert!(settings["hooks"]["Stop"]
+            .as_array()
+            .is_some_and(|v| v.len() == 1));
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
@@ -3368,7 +3445,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(1));
-        assert_eq!(claude.expected_version, 6);
+        assert_eq!(claude.expected_version, CLAUDE_INTEGRATION_VERSION);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -3398,7 +3475,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(2));
-        assert_eq!(claude.expected_version, 6);
+        assert_eq!(claude.expected_version, CLAUDE_INTEGRATION_VERSION);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -3714,7 +3791,9 @@ mod tests {
             .as_str()
             .unwrap()
             .contains(" session"));
-        assert!(hooks["hooks"].get("UserPromptSubmit").is_none());
+        assert!(hooks["hooks"]["UserPromptSubmit"]
+            .as_array()
+            .is_some_and(|v| v.len() == 1));
         assert!(hooks["hooks"].get("PreToolUse").is_none());
         assert!(hooks["hooks"].get("PermissionRequest").is_none());
         assert!(hooks["hooks"].get("Stop").is_none());
@@ -3769,7 +3848,9 @@ mod tests {
         let config = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
 
         assert_eq!(hooks["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
-        assert!(hooks["hooks"].get("UserPromptSubmit").is_none());
+        assert!(hooks["hooks"]["UserPromptSubmit"]
+            .as_array()
+            .is_some_and(|v| v.len() == 1));
         assert!(hooks["hooks"].get("PreToolUse").is_none());
         assert!(hooks["hooks"].get("PermissionRequest").is_none());
         assert!(hooks["hooks"].get("Stop").is_none());
@@ -4594,7 +4675,7 @@ mod tests {
         assert!(CLAUDE_HOOK_ASSET.contains("pane.report_agent_session"));
         assert!(!CLAUDE_HOOK_ASSET.contains("\"state\": action"));
         assert!(!CLAUDE_HOOK_ASSET.contains("pane.release_agent"));
-        assert!(CODEX_HOOK_ASSET.contains("HERDR_HOOK_INPUT_FILE"));
+        assert!(CODEX_HOOK_ASSET.contains("os.fdopen(3"));
         assert!(CODEX_HOOK_ASSET.contains("agent_session_id"));
         assert!(CODEX_HOOK_ASSET.contains("pane.report_agent_session"));
         assert!(!CODEX_HOOK_ASSET.contains("\"state\": action"));

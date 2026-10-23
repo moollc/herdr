@@ -277,6 +277,10 @@ impl App {
             changed = true;
         }
 
+        if self.state.copy_feedback.is_some() && self.copy_feedback_deadline.is_none() {
+            self.copy_feedback_deadline = Some(now + super::COPY_FEEDBACK_DURATION);
+            changed = true;
+        }
         if self
             .copy_feedback_deadline
             .is_some_and(|deadline| now >= deadline)
@@ -348,6 +352,8 @@ impl App {
             changed |= self.start_pending_agent_resumes(self.pending_agent_resume_due(now));
         }
         changed |= self.advance_agent_restarts(now);
+        changed |= self.advance_overseer(now);
+        changed |= self.advance_allowance_guard(now);
         self.sync_animation_timer(now);
         changed
     }
@@ -403,16 +409,17 @@ impl App {
         })
     }
 
-    /// Working agents and unconfirmed completions keep status animations ticking,
+    /// Working agents and opted-in completion blinks keep status animations ticking,
     /// including the focused pane and set-down agents shown in a peek.
     fn agent_panel_has_animation(&self) -> bool {
         crate::ui::tasks_has_animation(&self.state)
             || self.state.workspaces.iter().any(|ws| {
                 ws.has_working_pane(&self.state.terminals)
-                    || ws
-                        .tabs
-                        .iter()
-                        .any(|tab| tab.has_unseen_idle_pane(&self.state.terminals))
+                    || (self.state.pane_header().finished_blink
+                        && ws
+                            .tabs
+                            .iter()
+                            .any(|tab| tab.has_unseen_idle_pane(&self.state.terminals)))
             })
             || self.state.detached_agents.iter().any(|agent| {
                 self.state
@@ -420,7 +427,9 @@ impl App {
                     .get(&agent.pane.attached_terminal_id)
                     .is_some_and(|terminal| {
                         terminal.state == AgentState::Working
-                            || (terminal.state == AgentState::Idle && !agent.pane.seen)
+                            || (self.state.pane_header().finished_blink
+                                && terminal.state == AgentState::Idle
+                                && !agent.pane.seen)
                     })
             })
     }
@@ -734,7 +743,7 @@ impl App {
         }
     }
 
-    fn ping_alert_pane(&mut self, phrase: &str) {
+    pub(super) fn ping_alert_pane(&mut self, phrase: &str) {
         let name = self.state.usage_config.alert_pane.trim().to_string();
         if name.is_empty() {
             return;
@@ -963,6 +972,8 @@ impl App {
             self.state.next_pending_agent_notification_deadline(),
             self.pending_agent_resume_deadline,
             self.agent_restart_deadline(),
+            self.overseer_deadline(),
+            self.allowance_guard_deadline(),
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
             self.selection_highlight_clear_deadline,
@@ -1813,7 +1824,14 @@ mod tests {
             .seen = false;
         let now = Instant::now();
         app.sync_animation_timer(now);
+        assert!(app.next_animation_tick.is_none());
+        app.state.pane_header.finished_blink = true;
+        app.sync_animation_timer(now);
         assert_eq!(app.next_animation_tick, Some(now + ANIMATION_INTERVAL));
+        app.state.pane_header.finished_blink = false;
+        app.sync_animation_timer(now);
+        assert!(app.next_animation_tick.is_none());
+        app.state.pane_header.finished_blink = true;
         assert!(app.state.toggle_agent_completion_acknowledgement(pane_id));
         app.sync_animation_timer(now);
         assert!(app.next_animation_tick.is_none());
@@ -1827,10 +1845,43 @@ mod tests {
         push_detached_agent(&mut app, AgentState::Idle, false);
         let now = Instant::now();
         app.sync_headless_animation_timer(now);
+        assert!(app.next_animation_tick.is_none());
+        app.state.pane_header.finished_blink = true;
+        app.sync_headless_animation_timer(now);
         assert_eq!(
             app.next_animation_tick,
             Some(now + crate::app::HEADLESS_ANIMATION_INTERVAL)
         );
+    }
+
+    #[test]
+    fn finished_blink_off_stops_working_spinner_and_keeps_only_duration_updates() {
+        let (mut app, pane_id) = test_app_with_pane();
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let now = Instant::now();
+        app.state.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Working;
+        app.sync_animation_timer(now);
+        assert!(app.agent_panel_has_animation());
+        app.state.terminals.get_mut(&terminal_id).unwrap().state = AgentState::Idle;
+        app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .seen = false;
+        app.sync_animation_timer(now);
+        assert!(!app.agent_panel_has_animation());
+        assert!(app.next_animation_tick.is_none());
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .agent_last_finished_at = Some(std::time::SystemTime::now());
+        app.sync_animation_timer(now);
+        assert_eq!(app.next_animation_tick, Some(now + Duration::from_secs(1)));
     }
 
     #[test]

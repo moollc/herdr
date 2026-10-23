@@ -8,9 +8,12 @@
 set -eu
 
 action="${1:-}"
-hook_input_file="$(mktemp "${TMPDIR:-/tmp}/herdr-codex-hook.XXXXXX")" || { echo "herdr orientation: cannot create hook input file" >&2; exit 0; }
-trap 'rm -f "$hook_input_file"' EXIT HUP INT TERM
-cat >"$hook_input_file" 2>/dev/null || true
+case "$action" in
+  started|ended|notify)
+    command -v python3 >/dev/null 2>&1 || exit 0
+    exec python3 "$(dirname "$0")/herdr-turn-report.py" codex "$action" "${2:-}"
+    ;;
+esac
 
 case "$action" in
   session) ;;
@@ -23,7 +26,7 @@ esac
 [ -n "${HERDR_PANE_ID:-}" ] || { echo "herdr orientation: missing HERDR_PANE_ID" >&2; exit 0; }
 command -v python3 >/dev/null 2>&1 || { echo "herdr orientation: python3 unavailable" >&2; exit 0; }
 
-HERDR_ACTION="$action" HERDR_HOOK_INPUT_FILE="$hook_input_file" python3 - <<'PY'
+HERDR_ACTION="$action" python3 - 3<&0 <<'PY'
 import fcntl
 import hashlib
 import json
@@ -38,20 +41,17 @@ source = "herdr:codex"
 action = os.environ.get("HERDR_ACTION", "")
 pane_id = os.environ.get("HERDR_PANE_ID")
 socket_path = os.environ.get("HERDR_SOCKET_PATH")
-hook_input_file = os.environ.get("HERDR_HOOK_INPUT_FILE")
 
 if not pane_id or not socket_path:
     raise SystemExit(0)
 
-hook_input = {}
-if hook_input_file:
-    try:
-        with open(hook_input_file, encoding="utf-8") as handle:
-            content = handle.read()
-        if content.strip():
-            hook_input = json.loads(content)
-    except Exception:
-        hook_input = {}
+try:
+    with os.fdopen(3, encoding="utf-8") as handle:
+        hook_input = json.load(handle)
+    if not isinstance(hook_input, dict):
+        raise ValueError("hook input is not an object")
+except (OSError, ValueError):
+    raise SystemExit(0)
 
 request_id = f"{source}:{int(time.time() * 1000)}:{random.randrange(1_000_000):06d}"
 report_seq = time.time_ns()
@@ -67,6 +67,7 @@ if agent_session_id:
             "agent": "codex",
             "seq": report_seq,
             "agent_session_id": agent_session_id,
+            "turn_reporting": True,
             "startup_source": hook_input.get("source"),
         },
     }
@@ -163,7 +164,8 @@ def deliver(context, nonce):
                 "hookEventName": "SessionStart", "additionalContext": context}}), flush=True)
             record("emitted")
         ack = {"id": request_id + ":ack", "method": "pane.ack_orientation", "params": {
-            "pane_id": pane_id, "source": source, "agent_session_id": agent_session_id, "nonce": nonce}}
+            "pane_id": pane_id, "source": source, "agent_session_id": agent_session_id,
+            "turn_reporting": True, "nonce": nonce}}
         try:
             retry(ack)
         except Exception as error:

@@ -157,6 +157,10 @@ fn enqueue_submit(
     trailing: Bytes,
     delay: Duration,
 ) -> Result<(), (&'static str, String)> {
+    if let Some(bytes) = leading.as_ref() {
+        runtime.record_input_bytes(bytes);
+    }
+    runtime.record_input_bytes(&trailing);
     let key = runtime.submit_key();
     let tx = runtime.user_input_sender();
     {

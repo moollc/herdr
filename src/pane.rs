@@ -2155,6 +2155,14 @@ impl PaneRuntime {
         self.terminal.visible_ansi()
     }
 
+    pub(crate) fn detection_text(&self) -> String {
+        self.terminal.detection_text()
+    }
+
+    pub(crate) fn output_bytes(&self) -> u64 {
+        self.terminal.output_bytes()
+    }
+
     pub fn recent_text(&self, lines: usize) -> String {
         self.terminal.recent_text(lines)
     }

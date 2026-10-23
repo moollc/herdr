@@ -42,6 +42,8 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::PaneRename(_)
             | Method::PanePinModel(_)
             | Method::PaneRestartAgent(_)
+            | Method::PaneReportTurn(_)
+            | Method::PaneSetJobMarker(_)
             | Method::PaneReportAgent(_)
             | Method::PaneReportAgentSession(_)
             | Method::PaneReportMetadata(_)

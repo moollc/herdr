@@ -107,13 +107,13 @@ fn parse_integration_target(
 ) -> std::io::Result<Option<IntegrationTarget>> {
     let Some(target) = args.first().map(|arg| arg.as_str()) else {
         eprintln!(
-            "usage: herdr integration {action} <pi|omp|claude|codex|copilot|droid|kimi|opencode|hermes|qodercli|grok>"
+            "usage: herdr integration {action} <pi|omp|claude|codex|cursor|copilot|droid|kimi|opencode|hermes|qodercli|grok>"
         );
         return Ok(None);
     };
     if args.len() != 1 {
         eprintln!(
-            "usage: herdr integration {action} <pi|omp|claude|codex|copilot|droid|kimi|opencode|hermes|qodercli|grok>"
+            "usage: herdr integration {action} <pi|omp|claude|codex|cursor|copilot|droid|kimi|opencode|hermes|qodercli|grok>"
         );
         return Ok(None);
     }
@@ -123,6 +123,7 @@ fn parse_integration_target(
         "omp" => IntegrationTarget::Omp,
         "claude" => IntegrationTarget::Claude,
         "codex" => IntegrationTarget::Codex,
+        "cursor" => IntegrationTarget::Cursor,
         "copilot" => IntegrationTarget::Copilot,
         "droid" => IntegrationTarget::Droid,
         "kimi" => IntegrationTarget::Kimi,
@@ -148,6 +149,7 @@ fn print_integration_help() {
     eprintln!("  herdr integration install omp");
     eprintln!("  herdr integration install claude");
     eprintln!("  herdr integration install codex");
+    eprintln!("  herdr integration install cursor");
     eprintln!("  herdr integration install copilot");
     eprintln!("  herdr integration install droid");
     eprintln!("  herdr integration install kimi");

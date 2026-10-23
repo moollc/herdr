@@ -116,8 +116,26 @@ fn pane_controls_text(
     } else {
         text.to_string()
     };
+    let text = if title_width >= 38 && !matches!(mode, PaneTitleMode::Peeking) {
+        format!(" OVERSEE{text}")
+    } else {
+        text
+    };
     let width = text.width() as u16;
     (text, width)
+}
+
+/// Same width as OVERSEE so the control keeps its place. Where a space has
+/// no overseer of its own, the chief is simply the overseer.
+fn oversee_control_label(
+    kind: Option<crate::overseer::Kind>,
+    scope: crate::overseer::Scope,
+) -> &'static str {
+    if kind == Some(crate::overseer::Kind::Chief) && scope == crate::overseer::Scope::Workspace {
+        " OVERALL"
+    } else {
+        " OVERSEE"
+    }
 }
 
 fn pane_close_suffix(controls_text: &str) -> &str {
@@ -143,6 +161,9 @@ fn pane_close_control_rect(area: Rect, controls_x: u16, controls_text: &str) -> 
 }
 
 fn pane_pop_control_rect(area: Rect, controls_x: u16, controls_text: &str) -> Option<Rect> {
+    let (controls_text, controls_x) = controls_text
+        .strip_prefix(" OVERSEE")
+        .map_or((controls_text, controls_x), |rest| (rest, controls_x + 8));
     controls_text
         .starts_with(PANE_POP_CONTROL)
         .then(|| Rect::new(controls_x, area.y, PANE_POP_CONTROL.width() as u16, 1))
@@ -152,6 +173,13 @@ fn pane_focus_control_rect(area: Rect, controls_x: u16, controls_text: &str) -> 
     let close = pane_close_control_rect(area, controls_x, controls_text);
     let focus_x = pane_pop_control_rect(area, controls_x, controls_text)
         .map_or(controls_x, |pop| pop.x + pop.width);
+    let focus_x = if controls_text.starts_with(" OVERSEE")
+        && pane_pop_control_rect(area, controls_x, controls_text).is_none()
+    {
+        focus_x + 8
+    } else {
+        focus_x
+    };
     let focus_width = close.x.saturating_sub(focus_x);
     Rect::new(focus_x, area.y, focus_width, 1)
 }
@@ -571,7 +599,10 @@ fn pane_status_mark(
         && !(docked
             && (app.landing_worktrees.contains(&ws.id)
                 || app.landing_failures.contains_key(&ws.id)));
-    let color = if pending_completion && !super::completion_blink_on(app.spinner_tick) {
+    let color = if pending_completion
+        && app.pane_header().finished_blink
+        && !super::completion_blink_on(app.spinner_tick)
+    {
         mute_when_host_unfocused(app, app.palette.overlay0)
     } else {
         color
@@ -729,6 +760,13 @@ fn pane_chrome_controls(
     };
     let focus_rect = pane_focus_control_rect(area, controls_x, controls_text);
     let mut controls = vec![close];
+    if controls_text.starts_with(" OVERSEE") {
+        controls.push(PaneChromeControl {
+            pane_id,
+            action: PaneChromeAction::Oversee,
+            rect: Rect::new(controls_x, area.y, 8, 1),
+        });
+    }
     if focus_rect.width > 0 {
         controls.push(PaneChromeControl {
             pane_id,
@@ -980,7 +1018,32 @@ fn render_code_ui_pane_chrome(
         spans.push(Span::styled(rule_text, edge_style));
     }
     if !controls_text.is_empty() {
-        spans.push(Span::styled(controls_text.clone(), edge_style));
+        if let Some(rest) = controls_text.strip_prefix(" OVERSEE") {
+            let terminal_id = app.terminal_id_for_any_pane(pane_id);
+            let kind = terminal_id
+                .as_ref()
+                .and_then(|id| app.terminals.get(id))
+                .and_then(|t| t.overseer.kind());
+            let on = kind.is_some();
+            let label = oversee_control_label(
+                kind,
+                app.effective_overseer_scope(
+                    terminal_id.and_then(|id| app.terminal_places().get(&id).copied()),
+                ),
+            );
+            let style = if on {
+                Style::default()
+                    .fg(app.palette.panel_bg)
+                    .bg(active_accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                edge_style
+            };
+            spans.push(Span::styled(label, style));
+            spans.push(Span::styled(rest.to_string(), edge_style));
+        } else {
+            spans.push(Span::styled(controls_text.clone(), edge_style));
+        }
     }
 
     frame.render_widget(
@@ -2112,7 +2175,7 @@ mod tests {
     }
 
     #[test]
-    fn unconfirmed_pane_completion_blinks_without_losing_its_click_target() {
+    fn finished_blink_controls_pane_completion_without_losing_its_click_target() {
         let (mut app, pane_id) = usage_app_with_agent(Some(crate::detect::Agent::Codex));
         app.active = Some(0);
         let terminal_id = app.workspaces[0]
@@ -2124,23 +2187,26 @@ mod tests {
         let pane = app.workspaces[0].pane_state_mut(pane_id).unwrap();
         pane.seen = false;
         pane.completed = true;
-        for tick in [0, 4, 8, 12] {
-            app.spinner_tick = tick;
-            let mark = pane_status_mark(
-                &app,
-                &app.workspaces[0],
-                pane_id,
-                app.terminals.get(&terminal_id),
-            )
-            .unwrap();
-            assert_eq!(mark.glyph, "●");
-            assert!(mark.clickable);
-            let expected = if super::super::completion_blink_on(tick) {
-                app.palette.green
-            } else {
-                app.palette.overlay0
-            };
-            assert_eq!(mark.color, expected);
+        for blink in [false, true] {
+            app.pane_header.finished_blink = blink;
+            for tick in [0, 4, 8, 12] {
+                app.spinner_tick = tick;
+                let mark = pane_status_mark(
+                    &app,
+                    &app.workspaces[0],
+                    pane_id,
+                    app.terminals.get(&terminal_id),
+                )
+                .unwrap();
+                assert_eq!(mark.glyph, "●");
+                assert!(mark.clickable);
+                let expected = if !blink || super::super::completion_blink_on(tick) {
+                    app.palette.green
+                } else {
+                    app.palette.overlay0
+                };
+                assert_eq!(mark.color, expected);
+            }
         }
         assert!(app.toggle_agent_completion_acknowledgement(pane_id));
         for tick in [0, 4] {
@@ -2319,14 +2385,14 @@ mod tests {
         assert!(wide.contains("wk ■■■■■■■■■■ 80% 4/d"), "{wide}");
 
         // Squares go first. Both two-letter labels stay.
-        let mid = header_row(&app, 52, make());
+        let mid = header_row(&app, 60, make());
         assert!(mid.contains("Olivia"), "{mid}");
         assert!(mid.contains("5h 70% 3/h"), "{mid}");
         assert!(mid.contains("wk 80% 4/d"), "{mid}");
         assert!(!mid.contains('■'), "{mid}");
 
         // Narrower: the weekly meter goes, and the five hour label stays.
-        let narrow = header_row(&app, 38, make());
+        let narrow = header_row(&app, 46, make());
         assert!(narrow.contains("Olivia"), "{narrow}");
         assert!(narrow.contains("5h 70% 3/h"), "{narrow}");
         assert!(!narrow.contains("80%"), "{narrow}");
@@ -2357,12 +2423,26 @@ mod tests {
     }
 
     #[test]
+    fn chief_reads_overall_only_where_spaces_have_their_own_overseer() {
+        use crate::overseer::{Kind, Scope};
+        for (kind, scope, label) in [
+            (None, Scope::Workspace, " OVERSEE"),
+            (Some(Kind::Space), Scope::Workspace, " OVERSEE"),
+            (Some(Kind::Chief), Scope::Workspace, " OVERALL"),
+            (Some(Kind::Chief), Scope::Session, " OVERSEE"),
+        ] {
+            assert_eq!(oversee_control_label(kind, scope), label);
+            assert_eq!(label.chars().count(), " OVERSEE".chars().count());
+        }
+    }
+
+    #[test]
     fn pop_leads_the_controls_only_when_the_host_can_pop_out() {
         let (with_pop, _) = pane_controls_text(40, PaneTitleMode::Normal, true, true);
-        assert_eq!(with_pop, " ⧉ POP ⛶ FOCUS HIDE ");
+        assert_eq!(with_pop, " OVERSEE ⧉ POP ⛶ FOCUS HIDE ");
 
         let (zoomed, _) = pane_controls_text(40, PaneTitleMode::Zoomed, false, true);
-        assert!(zoomed.starts_with(PANE_POP_CONTROL), "{zoomed:?}");
+        assert!(zoomed.starts_with(" OVERSEE ⧉ POP"), "{zoomed:?}");
 
         let (without, _) = pane_controls_text(40, PaneTitleMode::Normal, true, false);
         assert!(!without.contains("POP"), "{without:?}");
@@ -2392,7 +2472,7 @@ mod tests {
         let focus = rect_for(PaneChromeAction::Focus);
         let close = rect_for(PaneChromeAction::Close);
 
-        assert_eq!(pop.x, pane_chrome_controls_x(area, controls_width));
+        assert_eq!(pop.x, pane_chrome_controls_x(area, controls_width) + 8);
         assert_eq!(pop.width, PANE_POP_CONTROL.width() as u16);
         assert_eq!(focus.x, pop.x + pop.width);
         assert_eq!(focus.x + focus.width, close.x);

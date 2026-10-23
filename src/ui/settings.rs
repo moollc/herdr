@@ -877,6 +877,7 @@ mod tests {
         let rendered = rendered_settings(&app);
 
         assert!(rendered.contains("status [✓]"));
+        assert!(rendered.contains("finished blink [ ]"));
         assert!(rendered.contains("agent name [✓]"));
         assert!(rendered.contains("working directory [✓]"));
         assert!(rendered.contains("parent directory [ ]"));

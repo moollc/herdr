@@ -22,6 +22,7 @@ mod agent_model;
 mod agent_orientation;
 mod agent_resume;
 mod agent_summary;
+mod allowance_guard;
 mod api;
 mod app;
 mod black_box;
@@ -44,6 +45,7 @@ mod ipc;
 mod kitty_graphics;
 mod layout;
 mod logging;
+mod overseer;
 mod pane;
 mod pane_names;
 mod persist;
@@ -63,6 +65,7 @@ mod tasks;
 mod terminal;
 mod terminal_notify;
 mod terminal_theme;
+mod turn_reporting;
 mod ui;
 mod update;
 pub mod usage;
@@ -271,11 +274,12 @@ state_colors = true
 # Fields on each pane's top edge. Status and name are on; the rest are off,
 # matching the current name-only titles. Turn them on from Settings → pane
 # labels, or here. Status is the agent's mark before its name: a spinner while
-# it works, a blinking dot once it finishes, which a click turns into a steady check.
-# The pending dot blinks even in the focused pane, in sync with tab attention.
+# it works, a steady dot once it finishes, which a click turns into a check.
+# finished_blink opts into blinking dots, tab attention and sidebar completion pulses.
 # usage is off until you set it true.
 # [ui.pane_header]
 # status = true
+# finished_blink = false
 # agent_name = true
 # hostname = false
 # working_directory = false
@@ -302,6 +306,19 @@ state_colors = true
 # claude_statusline = false # display only; set true to print meters; usage is recorded either way
 # cursor_pools = "both" # both or tighter; table and sidebar, labelled cm and om. A pane header always shows the tighter pool (cm or om)
 # codex_home = "~/.codex" # read first; $CODEX_HOME, ~/.codex and pane Codex homes are read too
+
+# Allowance guard. When a provider's five hour allowance is low or falls fast,
+# every working agent on it, in any space, gets one note to wind down, and at
+# the stop line is interrupted with its own interrupt key. Nothing is killed.
+# The overseer pane gets one line. The usage bar shows a ! while it is active.
+# [allowance_guard]
+# wind_down_pct = 15 # at or below this much left
+# fast_drop_points = 25 # or a fall of this many points
+# fast_window_minutes = 10 # within this many minutes
+# stop_pct = 3 # at or below this, working agents are interrupted
+# claude = true
+# codex = true
+# cursor = false # its Auto pool is meant to run to zero
 
 # Agent panel scope: "current" or "all". Toggling it in the sidebar saves this setting.
 # agent_panel_scope = "all"

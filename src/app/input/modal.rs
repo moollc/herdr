@@ -759,6 +759,25 @@ pub(super) fn apply_context_menu_action(
         }
         (
             ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
+            Some("Overseer scope"),
+        ) => {
+            if let Some(choice) = state.cycle_space_overseer_scope(ws_idx) {
+                state.copy_feedback = Some(crate::app::state::CopyFeedback {
+                    message: match choice {
+                        None => "Overseer: follows the setting".to_string(),
+                        Some(crate::overseer::Scope::Workspace) => {
+                            "Overseer: this space has its own".to_string()
+                        }
+                        Some(crate::overseer::Scope::Session) => {
+                            "Overseer: one for the whole session".to_string()
+                        }
+                    },
+                });
+            }
+            leave_modal(state);
+        }
+        (
+            ContextMenuKind::Workspace { ws_idx } | ContextMenuKind::GitWorkspace { ws_idx, .. },
             Some("Close" | "Close group"),
         ) => {
             state.selected = ws_idx;

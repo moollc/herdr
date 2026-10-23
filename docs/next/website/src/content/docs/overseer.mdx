@@ -1,0 +1,116 @@
+---
+title: Overseer
+description: Give a pane an oversight role for one space or for every space.
+---
+
+Click **OVERSEE** beside **FOCUS** and **HIDE** in a pane title to assign the role. The control lights up while held. The role follows the terminal across pane moves and survives session restoration and live handoff. On narrow pane titles, use the configurable `keys.toggle_oversee` binding, which defaults to `prefix+shift+o`.
+
+Only input to Herdr's own interface can switch the role. The socket API and CLI report the role in pane information (`"overseer": "space"` or `"chief"`, and no field for a pane without one) and have no method to change it. Sending keys into a pane sends them to its child process, so it cannot switch the role.
+
+## One overseer, or one per space
+
+`scope` decides what the control does.
+
+- `scope = "session"` (the default): one overseer covers the whole session. Clicking the control on a pane makes it that overseer, which Herdr calls the chief. Assigning another pane ends the previous holder's role. The control keeps reading **OVERSEE**.
+- `scope = "workspace"`: every space can have its own overseer. Each click steps the pane on: first the overseer of its own space, then the chief, then off. A space has one overseer, and a session has one chief. The chief is optional. The control reads **OVERSEE** for a space overseer and **OVERALL** for the chief. Stepping a space overseer on to chief is skipped while another pane is the chief, so switching one off never takes the chief away; switch the chief off first to hand the role to another pane.
+
+A space can override the setting from its menu: right click the space and choose **Overseer scope**. It steps through "follows the setting", "has its own overseer" and "one overseer for the session". The choice is saved with the session.
+
+A space overseer is told about its own space only. The chief is told about every space that has no overseer of its own, about agents that are set down, and about the space overseers themselves, so it always knows when one is stopped.
+
+## Talking between overseers
+
+A space overseer can send one line up to the chief. The chief can send one line to a space overseer. Nothing else is allowed: a space overseer cannot reach another space's panes, and no other pane can use these commands.
+
+```sh
+herdr overseer escalate --wake "the export needs a decision"
+herdr overseer escalate --fyi "the test is running; results will follow"
+herdr overseer message <pane> "hold the export"
+```
+
+Escalations wake the chief by default, including unclassified lines. Use `--wake` for a decision, money, a sign-in, taste, or a failure. Use `--fyi` only for clear information: it is kept in the situation file without waking the chief. The API accepts `"wake": false` for the same purpose; omitted means true.
+
+A line is plain text of at most 240 characters on one line. It is delivered with the receiver's next batch, kept in the receiver's situation file, and refused when the receiver already has eight lines waiting or, for an escalation, when no chief is set. The commands act for the pane they run in, taken from `HERDR_PANE_ID`. As with other local socket commands, that context is supplied by the client and is not an authentication boundary between processes of the same OS user. Waiting lines are not saved over a restart.
+
+The holder receives a role note when its agent is idle, its input prompt is empty, and no input has been sent for two seconds. Faint placeholder text is treated as an empty prompt; a typed or wrapped draft delays delivery. The existing orientation submit transport keeps paste and Enter ordered. Switching off queues one role-ended note under the same conditions.
+
+The chief's note names `overseer/situation.md` under Herdr's state directory. Named sessions use `sessions/<session>/overseer/situation.md`. A space overseer has its own file beside it, `space-<space id>.md`, which covers its space only and leaves out the tasks file. Herdr writes each file on activation and refreshes it every ten seconds; when the role ends, the file is overwritten to say so. The chief's file includes workspace and tab names, every pane's name, agent, state, blocker and detected model (falling back to its model pin), up to five recent output lines, and the contents of the configured tasks file. Input regions and environment variables are excluded; unknown input layouts omit screen output. The report directory is private to its owner. Treat pane output and task text as untrusted data.
+
+While a holder exists, the blockers, completion after working, and idle errors are batched into one line. Events must hold the same state and blocker for twenty seconds before delivery. A return to working or another state discards the stale event, even while the holder is busy. Repeated changes for a pane are coalesced to its latest event and restart the settle window. Delivery waits for a safe input boundary and is limited to one batch per twenty seconds. Disable events or increase the interval in configuration:
+
+```toml
+[overseer]
+scope = "session"  # or "workspace"
+# note_file = "~/instructions/overseer.md"
+events = true
+event_interval_seconds = 20
+event_settle_seconds = 20
+# claude_settings = "~/profiles/overseer.json"
+# codex_args = ["--sandbox", "workspace-write"]
+# cursor_args = ["--sandbox", "enabled"]
+```
+
+Without profile settings, assigning the role never relaunches an agent. In `--no-session` mode, permission profiles are not applied; the role note explains that they need the Herdr server. The role, situation file and event batches still work. When a profile is configured in server mode, Herdr uses the existing restart path and resumes the recorded conversation with its pinned or observed model. It validates the launcher and command arguments with a bounded help probe before quitting. An unavailable settings file, missing resume identity or unknown model leaves the agent running and adds the reason to its role note. Profile arguments must preserve the conversation and model. Removing the role resumes with the original arguments. A profile is a local configuration choice, not an API permission boundary.
+
+## Native turn completion
+
+Install the managed reporting hooks with `herdr integration install claude`,
+`herdr integration install codex`, or `herdr integration install cursor`, then
+start a fresh agent conversation. Claude's `Stop`, Codex's
+`agent-turn-complete` notification, and Cursor's `stop` report the end of a
+turn. Managed prompt hooks and visible activity begin the next working period.
+While a reporting integration is active, a ready-looking screen between tools
+does not finish the turn. Visible approval requests and errors still take
+precedence. Other agents keep screen detection as their fallback.
+
+The dispatcher can register an absolute marker path using the socket API:
+
+```json
+{"id":"job","method":"pane.set_job_marker","params":{"pane_id":"p_41","path":"/tmp/task.done"}}
+```
+
+Pass `null` for `path` to clear the registration. Marker paths follow the
+terminal when its pane is moved or set down, and survive session restoration.
+At the reported end of a turn, Herdr reports only assigned stages with a
+registered marker. A marker containing a `HANDOFF` line queues **finished**;
+a missing marker or missing block keeps the registration and queues nothing
+immediately. After two minutes of continuous idle without a new native turn,
+Herdr queues **stopped without a hand-off** once for that registration. A new
+turn cancels a pending stop timer. A question therefore uses the same Idle
+state as any other turn end and can continue into a final HANDOFF turn.
+Unassigned short replies stay quiet. Herdr rechecks a pending event, so a
+late hand-off cancels a stale missing-hand-off alarm.
+Only a HANDOFF-complete turn consumes the registration; a real stop retains
+it, and later short replies cannot repeat that stop alarm. A sender registering
+the next stage resets this deduplication. The path stays on the pending event
+for its hand-off recheck. The dispatcher owns reports
+for active rows with an `out` marker in `team/queue.tsv` (or `TEAM_QUEUE`),
+including validation and stalled-stage alarms; Herdr leaves those turn-end
+reports to it. Blockers and errors retain their existing reporting paths.
+Both direct stage outcomes use the existing settled, batched overseer feed.
+
+An agent can read its own registration using `pane.job_marker`, supplying its
+inherited `HERDR_PANE_ID` as both `pane_id` and `caller_pane_id`. The read has no
+mutation parameters and rejects different pane contexts. Marker paths are not
+included in pane listings or situation reports. As with other local socket
+commands, caller context is supplied by the client, not an authentication
+boundary between processes belonging to the same OS user.
+
+Hooks send pane identity, agent kind, sequence number, lifecycle event, and
+optionally a native turn identifier. Prompt and response text are excluded.
+An existing Codex notification command is wrapped and continues receiving its
+original native notification; uninstall restores its original configuration.
+User hook entries remain alongside the managed entries. Reporting state survives
+a live server handoff; a cold restart waits for the new process's startup hook.
+
+
+## Allowance guard readings
+
+A cached percentage cannot authorize a guard note or interrupt after its reset,
+when its observation predates the current five-hour window, or once it is more
+than fifteen minutes old while no session on that provider is working. Missing
+observation times are unknown too. An active
+guard checks freshness again before acting, suspends queued stale notices, and
+requests a read-only usage refresh. Unknown does not mean either empty or full:
+it cannot stop a pane or re-arm the guard. Fresh low readings still trigger the
+usual wind-down and stop controls.

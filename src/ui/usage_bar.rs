@@ -134,7 +134,7 @@ fn default_kinds(provider: Provider) -> &'static [WindowKind] {
     }
 }
 
-fn is_stale(usage: &ProviderUsage, now: u64) -> bool {
+pub(crate) fn is_stale(usage: &ProviderUsage, now: u64) -> bool {
     usage
         .seen_at
         .is_some_and(|seen| now.saturating_sub(seen) > stale_after_secs(usage.provider))
@@ -218,6 +218,23 @@ fn shown_meters(usage: &ProviderUsage, now: u64, tighter_only: bool) -> Vec<Mete
     }
     let idx = tighter_index(&usage.windows).min(meters.len() - 1);
     vec![meters[idx].clone()]
+}
+
+/// The mark on a bar while the allowance guard is active on its provider: a
+/// `!` after each percent. The sidebar block also says `guard` by the name.
+pub(crate) const GUARD_MARK: &str = "!";
+
+fn guarded(app: &AppState, provider: Provider, mut meters: Vec<Meter>) -> Vec<Meter> {
+    if app.allowance_guard.active(provider) {
+        for meter in &mut meters {
+            // The guard watches the five hour window, or both Cursor pools.
+            if meter.number.ends_with('%') && (provider == Provider::Cursor || meter.label == "5h")
+            {
+                meter.number.push_str(GUARD_MARK);
+            }
+        }
+    }
+    meters
 }
 
 fn dim_rgb(rgb: (u8, u8, u8)) -> (u8, u8, u8) {
@@ -411,7 +428,7 @@ pub(crate) fn header_usage_for(
     let snapshot = app.usage_snapshot.as_ref()?;
     let usage = snapshot.providers.iter().find(|u| u.provider == provider)?;
     Some(HeaderUsage {
-        meters: shown_meters(usage, app.usage_now, true),
+        meters: guarded(app, provider, shown_meters(usage, app.usage_now, true)),
     })
 }
 
@@ -451,10 +468,14 @@ pub(crate) fn table_meters_for(
         .iter()
         .find(|u| u.provider == provider)
         .map(|usage| {
-            shown_meters(
-                usage,
-                app.usage_now,
-                app.usage_config.cursor_pools == crate::config::CursorPools::Tighter,
+            guarded(
+                app,
+                provider,
+                shown_meters(
+                    usage,
+                    app.usage_now,
+                    app.usage_config.cursor_pools == crate::config::CursorPools::Tighter,
+                ),
             )
         })
         .unwrap_or_default()
@@ -558,11 +579,18 @@ fn block_rows(app: &AppState) -> Vec<BlockRow> {
         if rows.is_empty() {
             rows.push(BlockRow::Title);
         }
-        rows.push(BlockRow::Provider(provider, None));
-        for meter in shown_meters(
-            usage,
-            app.usage_now,
-            app.usage_config.cursor_pools == crate::config::CursorPools::Tighter,
+        rows.push(BlockRow::Provider(
+            provider,
+            app.allowance_guard.active(provider).then_some("guard"),
+        ));
+        for meter in guarded(
+            app,
+            provider,
+            shown_meters(
+                usage,
+                app.usage_now,
+                app.usage_config.cursor_pools == crate::config::CursorPools::Tighter,
+            ),
         ) {
             rows.push(BlockRow::Meter(vec![meter]));
         }
@@ -621,15 +649,23 @@ fn render_allowance_block(app: &AppState, frame: &mut Frame, area: Rect) {
         );
         let line = match row {
             BlockRow::Title => Line::from(Span::styled(" allowance", Style::default().fg(dim))),
-            BlockRow::Provider(provider, _) => {
+            BlockRow::Provider(provider, note) => {
                 let kind = *default_kinds(*provider)
                     .last()
                     .unwrap_or(&WindowKind::Weekly);
                 let rgb = palette::window_rgb(*provider, kind);
-                Line::from(Span::styled(
+                let mut spans = vec![Span::styled(
                     format!(" {}", provider_name(*provider)),
                     Style::default().fg(rgb_color(rgb)),
-                ))
+                )];
+                if let Some(note) = note {
+                    let red = palette::level_rgb(*provider, WindowKind::FiveHour, Some(5));
+                    spans.push(Span::styled(
+                        format!(" {GUARD_MARK}{note}"),
+                        Style::default().fg(rgb_color(red)),
+                    ));
+                }
+                Line::from(spans)
             }
             BlockRow::Meter(meters) => {
                 let avail = usize::from(rect.width).saturating_sub(1);
@@ -963,6 +999,48 @@ mod tests {
             providers: provs,
         });
         app
+    }
+
+    #[test]
+    fn the_guard_marks_the_bar_of_its_provider_only() {
+        let mut app = sidebar_app(2, false);
+        let row_text = |app: &AppState| {
+            block_rows(app)
+                .iter()
+                .map(|row| match row {
+                    BlockRow::Provider(p, note) => {
+                        format!("{}{}", provider_name(*p), note.unwrap_or(""))
+                    }
+                    BlockRow::Meter(m) => m
+                        .iter()
+                        .map(|m| m.number.clone())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    BlockRow::Title => "title".into(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = row_text(&app);
+        assert!(
+            before
+                .iter()
+                .all(|r| !r.contains(GUARD_MARK) && !r.contains("guard")),
+            "{before:?}"
+        );
+        app.allowance_guard.config.codex = true;
+        app.allowance_guard.observe(Provider::Codex, 10, NOW);
+        let after = row_text(&app);
+        assert!(after.contains(&"GPTguard".to_string()), "{after:?}");
+        assert!(after.contains(&"50%!".to_string()), "{after:?}");
+        assert!(
+            after.contains(&"Claude".to_string()),
+            "claude is not marked: {after:?}"
+        );
+        assert_eq!(
+            after.iter().filter(|r| r.contains(GUARD_MARK)).count(),
+            1,
+            "only the five hour window: {after:?}"
+        );
     }
 
     #[test]

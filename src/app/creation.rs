@@ -323,6 +323,10 @@ impl App {
                 .is_some_and(|focused| focused == pane_id);
         let presentation = terminal.effective_presentation();
         Some(crate::api::schema::PaneInfo {
+            overseer: terminal
+                .overseer
+                .kind()
+                .map(|kind| kind.as_str().to_string()),
             pane_id: self.public_pane_id(ws_idx, pane_id)?,
             name: crate::pane_names::effective_name(&self.state.terminals, &terminal.id),
             terminal_id: terminal.id.to_string(),

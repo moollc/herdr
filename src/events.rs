@@ -46,6 +46,13 @@ pub enum AppEvent {
         process_exited: bool,
         observed_at: Instant,
     },
+    TurnReported {
+        pane_id: PaneId,
+        agent: Agent,
+        event: crate::turn_reporting::TurnEvent,
+        seq: u64,
+        turn_id: Option<String>,
+    },
     /// Hook-authoritative agent state was reported for a pane.
     HookStateReported {
         pane_id: PaneId,

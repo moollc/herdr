@@ -316,7 +316,8 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
         }
         let active = idx == ws.active_tab;
         let needs_attention = !active && tab.has_unseen_idle_pane(&app.terminals);
-        let blink_on = super::completion_blink_on(app.spinner_tick);
+        let blink_on =
+            app.pane_header().finished_blink && super::completion_blink_on(app.spinner_tick);
         let style = if needs_attention && blink_on {
             Style::default()
                 .fg(panel_contrast_fg(p))
@@ -402,7 +403,7 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     #[test]
-    fn inactive_tab_blinks_when_it_has_unseen_idle_pane() {
+    fn finished_blink_controls_inactive_tab_attention() {
         let mut app = AppState::test_new();
         let mut ws = Workspace::test_new("workspace");
         let second_tab = ws.test_add_tab(Some("done"));
@@ -423,13 +424,22 @@ mod tests {
         app.spinner_tick = 0;
         app.view.tab_hit_areas = vec![Rect::new(0, 0, 8, 1), Rect::new(9, 0, 8, 1)];
 
-        let backend = TestBackend::new(24, 1);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| render_tab_bar(&app, frame, Rect::new(0, 0, 24, 1)))
-            .unwrap();
-
-        let style = terminal.backend().buffer()[(9, 0)].style();
-        assert_eq!(style.bg, Some(app.palette.accent));
+        for blink in [false, true] {
+            app.pane_header.finished_blink = blink;
+            for tick in [0, 4, 8, 12] {
+                app.spinner_tick = tick;
+                let mut terminal = Terminal::new(TestBackend::new(24, 1)).unwrap();
+                terminal
+                    .draw(|frame| render_tab_bar(&app, frame, Rect::new(0, 0, 24, 1)))
+                    .unwrap();
+                let style = terminal.backend().buffer()[(9, 0)].style();
+                if blink && super::super::completion_blink_on(tick) {
+                    assert_eq!(style.bg, Some(app.palette.accent));
+                } else {
+                    assert_ne!(style.bg, Some(app.palette.accent));
+                    assert_eq!(style.fg, Some(app.palette.accent));
+                }
+            }
+        }
     }
 }

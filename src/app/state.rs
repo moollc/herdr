@@ -898,6 +898,7 @@ pub struct PanePopOutRequest {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PaneChromeAction {
+    Oversee,
     /// Open the pane in its own window in the host terminal.
     PopOut,
     Focus,
@@ -1627,7 +1628,12 @@ impl ContextMenuState {
     pub fn items(&self) -> Vec<String> {
         match &self.kind {
             ContextMenuKind::Workspace { .. } => {
-                vec!["Rename".into(), "Edit purpose".into(), "Close".into()]
+                vec![
+                    "Rename".into(),
+                    "Edit purpose".into(),
+                    "Overseer scope".into(),
+                    "Close".into(),
+                ]
             }
             ContextMenuKind::Tab { .. } => {
                 vec![
@@ -1644,6 +1650,7 @@ impl ContextMenuState {
             } => vec![
                 "Rename".into(),
                 "Edit purpose".into(),
+                "Overseer scope".into(),
                 "Close".into(),
                 "New worktree".into(),
                 "Open worktree...".into(),
@@ -1654,6 +1661,7 @@ impl ContextMenuState {
             } => vec![
                 "Rename".into(),
                 "Edit purpose".into(),
+                "Overseer scope".into(),
                 "Close".into(),
                 "Delete worktree checkout...".into(),
             ],
@@ -1665,6 +1673,7 @@ impl ContextMenuState {
             } => vec![
                 "Rename".into(),
                 "Edit purpose".into(),
+                "Overseer scope".into(),
                 "Close group".into(),
                 "New worktree".into(),
                 "Open worktree...".into(),
@@ -2013,6 +2022,8 @@ pub struct AppState {
     pub pane_header: PaneHeaderConfig,
     /// The sidebar allowance block and the 10% alert.
     pub usage_config: crate::config::UsageDisplayConfig,
+    /// The allowance guard's settings and which providers it is active on.
+    pub allowance_guard: crate::allowance_guard::Guard,
     /// The latest allowance readings, drawn in pane headers and the sidebar.
     pub usage_snapshot: Option<crate::usage::UsageSnapshot>,
     /// Pure snapshot of the optional file-backed Tasks panel.
@@ -2091,6 +2102,8 @@ pub struct AppState {
     pub host_terminal_theme: TerminalTheme,
     /// Set when a persisted session snapshot would change.
     pub session_dirty: bool,
+    /// The `[overseer] scope` setting; a space may override it.
+    pub overseer_scope: crate::overseer::Scope,
     /// Terminal runtimes that should be shut down by the app/runtime layer
     /// after state has detached their terminal metadata.
     pub(crate) terminal_runtime_shutdowns: Vec<crate::terminal::TerminalId>,
@@ -2487,6 +2500,7 @@ impl AppState {
             show_agent_labels_on_pane_borders: true,
             pane_header: PaneHeaderConfig::default(),
             usage_config: crate::config::UsageDisplayConfig::default(),
+            allowance_guard: crate::allowance_guard::Guard::default(),
             usage_snapshot: None,
             board: crate::board::BoardSnapshot::default(),
             tasks: crate::tasks::TasksSnapshot::default(),
@@ -2540,6 +2554,7 @@ impl AppState {
             global_menu: MenuListState::new(0),
             host_terminal_theme: TerminalTheme::default(),
             session_dirty: false,
+            overseer_scope: crate::overseer::Scope::default(),
             terminal_runtime_shutdowns: Vec::new(),
         }
     }

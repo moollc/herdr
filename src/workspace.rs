@@ -122,6 +122,8 @@ pub struct Workspace {
     /// What the space is for, in the user's words. Written when the space is
     /// made and edited from its menu; shown when the pointer rests on its card.
     pub purpose: Option<String>,
+    /// This space's own answer to `[overseer] scope`, set from its menu.
+    pub overseer_scope: Option<crate::overseer::Scope>,
     /// Fallback workspace identity source for tests, old snapshots, or missing runtimes.
     pub identity_cwd: PathBuf,
     /// Cached current git branch for the workspace repo.
@@ -267,6 +269,7 @@ impl Workspace {
                 id: generate_workspace_id(),
                 custom_name: None,
                 purpose: None,
+                overseer_scope: None,
                 identity_cwd: initial_cwd.clone(),
                 cached_git_branch: git_branch(&initial_cwd),
                 cached_git_ahead_behind: None,
@@ -923,6 +926,7 @@ impl Workspace {
             id: generate_workspace_id(),
             custom_name: None,
             purpose: None,
+            overseer_scope: None,
             identity_cwd: identity_cwd.clone(),
             cached_git_branch: git_branch(&identity_cwd),
             cached_git_ahead_behind: None,
@@ -1000,6 +1004,7 @@ impl Workspace {
             id: generate_workspace_id(),
             custom_name: Some(name.to_string()),
             purpose: None,
+            overseer_scope: None,
             identity_cwd: identity_cwd.clone(),
             cached_git_branch: git_branch(&identity_cwd),
             cached_git_ahead_behind: None,

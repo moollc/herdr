@@ -73,6 +73,7 @@ pub fn is_reserved_native_state_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
         ("herdr:claude", "claude")
+            | ("herdr:cursor", "cursor")
             | ("herdr:codex", "codex")
             | ("herdr:droid", "droid")
             | ("herdr:opencode", "opencode")
@@ -110,6 +111,13 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
         ("herdr:claude", "claude", AgentSessionRefKind::Id) => {
             vec![
                 "claude".into(),
+                "--resume".into(),
+                session_ref.value.clone(),
+            ]
+        }
+        ("herdr:cursor", "cursor", AgentSessionRefKind::Id) => {
+            vec![
+                "cursor-agent".into(),
                 "--resume".into(),
                 session_ref.value.clone(),
             ]
@@ -164,6 +172,7 @@ fn is_official_agent_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
         ("herdr:claude", "claude")
+            | ("herdr:cursor", "cursor")
             | ("herdr:codex", "codex")
             | ("herdr:copilot", "copilot")
             | ("herdr:droid", "droid")

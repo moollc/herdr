@@ -1012,6 +1012,30 @@ mod tests {
     }
 
     #[test]
+    fn finished_blink_setting_toggles_both_directions() {
+        let mut state = state_with_workspaces(&["test"]);
+        let row = PaneHeaderField::ALL
+            .iter()
+            .position(|field| *field == PaneHeaderField::FinishedBlink)
+            .unwrap();
+        assert_eq!(
+            pane_header_toggle_action(&state, row),
+            Some(SettingsAction::SavePaneHeaderField(
+                PaneHeaderField::FinishedBlink,
+                true
+            ))
+        );
+        state.pane_header.finished_blink = true;
+        assert_eq!(
+            pane_header_toggle_action(&state, row),
+            Some(SettingsAction::SavePaneHeaderField(
+                PaneHeaderField::FinishedBlink,
+                false
+            ))
+        );
+    }
+
+    #[test]
     fn settings_mouse_click_toggles_pane_header_git_branch() {
         let mut app = app_for_mouse_test();
         // Tall enough that the whole settings popup, every pane label row

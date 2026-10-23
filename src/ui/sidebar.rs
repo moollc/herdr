@@ -1313,6 +1313,7 @@ fn render_workspace_rows(
         let open_bottom =
             outlined.is_some_and(|group| group.y == card.rect.y && group.height > card.rect.height);
         render_workspace_card(frame, card.rect, &name, selected, open_bottom, app);
+        light_workspace_card_dot(frame, card, state, seen, app);
     }
 
     render_space_group_outline(app, frame, area, outlined);
@@ -1737,6 +1738,38 @@ fn render_new_workspace_button(frame: &mut Frame, rect: Rect, app: &AppState) {
 /// is already on the pane, where the work happens. Its dot is hollow while the
 /// agents are folded away, so a card with nothing listed under it still says
 /// whether that is because it is closed or because it is empty.
+/// Gives a card's dot its state color, whichever space the card belongs to.
+/// The card draws its whole label in the name color, so without this a space
+/// you are not in looks the same busy or idle. Agents that are working, blocked
+/// or finished unseen pulse the dot, the way their rows do, but only when
+/// `finished_blink` is on; otherwise the dot stays steady.
+fn light_workspace_card_dot(
+    frame: &mut Frame,
+    card: &crate::app::state::WorkspaceCardArea,
+    state: AgentState,
+    seen: bool,
+    app: &AppState,
+) {
+    let rect = card.rect;
+    let row = if rect.height < WORKSPACE_CARD_ROWS {
+        rect.y
+    } else {
+        rect.y + 1
+    };
+    let x = rect.x + 1 + if card.indented { 2 } else { 0 };
+    if rect.width < 4 || x >= rect.x + rect.width - 1 || row >= frame.area().bottom() {
+        return;
+    }
+    let (_, style) = sidebar_state_dot(state, seen, app);
+    let color = style.fg.unwrap_or(app.palette.overlay0);
+    let color = match agent_status_bar_motion(state, seen, app.pane_header().finished_blink) {
+        _ if !app.pane_header().finished_blink => color,
+        AgentBarMotion::Still => color,
+        _ => fade_toward_background(color, agent_status_bar_pulse_fade(app.spinner_tick), app),
+    };
+    frame.buffer_mut()[(x, row)].set_fg(color);
+}
+
 fn workspace_card_label(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -2214,11 +2247,11 @@ enum AgentBarMotion {
 /// or blocked — pulse in place. Everything settled holds still so a quiet
 /// sidebar stays quiet. Anything that is not [`AgentBarMotion::Still`] also
 /// keeps the animation timer running, so the bar only moves when frames tick.
-fn agent_status_bar_motion(state: AgentState, seen: bool) -> AgentBarMotion {
+fn agent_status_bar_motion(state: AgentState, seen: bool, finished_blink: bool) -> AgentBarMotion {
     match state {
         AgentState::Working => AgentBarMotion::Bounce,
         AgentState::Blocked => AgentBarMotion::Pulse,
-        AgentState::Idle if !seen => AgentBarMotion::Pulse,
+        AgentState::Idle if !seen && finished_blink => AgentBarMotion::Pulse,
         _ => AgentBarMotion::Still,
     }
 }
@@ -2280,7 +2313,7 @@ fn agent_status_bar_styles(
     rows: usize,
 ) -> Vec<Color> {
     let mut styles = vec![color; rows];
-    match agent_status_bar_motion(state, seen) {
+    match agent_status_bar_motion(state, seen, app.pane_header().finished_blink) {
         AgentBarMotion::Still => {}
         AgentBarMotion::Pulse => {
             let faded =
@@ -2775,6 +2808,15 @@ mod tests {
     /// Foreground colors of one agent entry's status bar cells, top to bottom,
     /// with the pane in `state` and the animation at `tick`.
     fn status_bar_colors(state: AgentState, seen: bool, tick: u32) -> Vec<Color> {
+        status_bar_colors_with_blink(state, seen, tick, true)
+    }
+
+    fn status_bar_colors_with_blink(
+        state: AgentState,
+        seen: bool,
+        tick: u32,
+        blink: bool,
+    ) -> Vec<Color> {
         let area = Rect::new(0, 0, 28, 24);
         let mut app = crate::app::state::AppState::test_new();
         let workspace = Workspace::test_new("herdr");
@@ -2790,6 +2832,7 @@ mod tests {
         app.active = Some(0);
         app.selected = 0;
         app.spinner_tick = tick;
+        app.pane_header.finished_blink = blink;
 
         let runtimes = TerminalRuntimeRegistry::new();
         let mut terminal =
@@ -3021,6 +3064,17 @@ mod tests {
     }
 
     #[test]
+    fn finished_blink_off_keeps_unseen_sidebar_attention_steady() {
+        let first = status_bar_colors_with_blink(AgentState::Idle, false, 0, false);
+        for tick in [4, 8, 24, 48, 120] {
+            assert_eq!(
+                status_bar_colors_with_blink(AgentState::Idle, false, tick, false),
+                first
+            );
+        }
+    }
+
+    #[test]
     fn finished_but_unseen_status_bar_pulses() {
         assert_pulses(AgentState::Idle, false);
     }
@@ -3200,6 +3254,46 @@ mod tests {
         let buf = terminal.backend().buffer();
 
         assert_eq!(buf[(card.x + 1, card.y + 1)].symbol(), COLLAPSED_SPACE_DOT);
+    }
+
+    #[test]
+    fn space_card_dot_shows_the_state_of_a_space_you_are_not_in() {
+        let area = Rect::new(0, 0, 28, 24);
+        let (app, terminal) = render_sidebar_list_with(area, |app| {
+            app.active = None;
+            for terminal in app.terminals.values_mut() {
+                terminal.state = AgentState::Blocked;
+            }
+        });
+        let card = compute_workspace_card_areas(&app, area)[0].rect;
+        let dot = &terminal.backend().buffer()[(card.x + 1, card.y + 1)];
+
+        assert_eq!(dot.symbol(), "●");
+        assert_eq!(dot.style().fg, Some(app.palette.red));
+    }
+
+    #[test]
+    fn space_card_dot_holds_still_unless_blinking_is_on() {
+        let area = Rect::new(0, 0, 28, 24);
+        let dot_colors = |blink: bool, tick: u32| {
+            let (app, terminal) = render_sidebar_list_with(area, |app| {
+                app.active = None;
+                app.pane_header.finished_blink = blink;
+                app.spinner_tick = tick;
+                for terminal in app.terminals.values_mut() {
+                    terminal.state = AgentState::Blocked;
+                }
+            });
+            let card = compute_workspace_card_areas(&app, area)[0].rect;
+            terminal.backend().buffer()[(card.x + 1, card.y + 1)]
+                .style()
+                .fg
+        };
+        let steady = dot_colors(false, 0);
+        for tick in [4, 8, 24, 48, 120] {
+            assert_eq!(dot_colors(false, tick), steady);
+        }
+        assert!((0..60).any(|tick| dot_colors(true, tick) != steady));
     }
 
     #[test]

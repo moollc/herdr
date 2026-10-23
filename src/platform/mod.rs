@@ -208,3 +208,15 @@ mod tests {
 }
 
 pub(crate) mod usage;
+
+/// Restrict locally generated situation reports to the session owner.
+pub(crate) fn set_private_directory(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}

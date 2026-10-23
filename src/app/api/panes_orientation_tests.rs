@@ -12,6 +12,7 @@ fn session_start(
     app.handle_pane_report_agent_session(
         "startup".into(),
         PaneReportAgentSessionParams {
+            turn_reporting: false,
             pane_id: format!("p_{}", pane.raw()),
             source: "herdr:codex".into(),
             agent: "codex".into(),

@@ -149,11 +149,20 @@ pub(crate) struct GhosttyPaneCore {
 
 pub(crate) struct PaneTerminal {
     pub(crate) ghostty: GhosttyPaneTerminal,
+    /// Bytes the child has written to this pane, for the allowance guard.
+    output_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl PaneTerminal {
     pub(crate) fn new(ghostty: GhosttyPaneTerminal) -> Self {
-        Self { ghostty }
+        Self {
+            ghostty,
+            output_bytes: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn output_bytes(&self) -> u64 {
+        self.output_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn process_pty_bytes(
@@ -163,6 +172,8 @@ impl PaneTerminal {
         bytes: &[u8],
         response_writer: &mpsc::Sender<Bytes>,
     ) -> ProcessBytesResult {
+        self.output_bytes
+            .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         self.ghostty
             .process_pty_bytes(pane_id, shell_pid, bytes, response_writer)
     }

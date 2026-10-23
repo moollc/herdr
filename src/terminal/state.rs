@@ -69,6 +69,8 @@ pub struct TerminalState {
     fallback_observed_at: Option<Instant>,
     stale_hook_idle_since: Option<Instant>,
     pub hook_authority: Option<HookAuthority>,
+    pub turn_reporting: Option<crate::turn_reporting::Reporting>,
+    pub job_marker: Option<PathBuf>,
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     pub manual_label: Option<String>,
@@ -112,6 +114,7 @@ pub struct TerminalState {
     pub orientation_offer: Option<crate::agent_orientation::OrientationOffer>,
     /// Hook-free orientation progress for the current agent process.
     /// The session snapshot carries it for a live handoff. A cold restore drops it.
+    pub overseer: crate::overseer::Role,
     pub auto_orientation: crate::agent_orientation::AutoOrientation,
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
@@ -142,6 +145,8 @@ impl TerminalState {
             fallback_observed_at: None,
             stale_hook_idle_since: None,
             hook_authority: None,
+            turn_reporting: None,
+            job_marker: None,
             agent_metadata: HashMap::new(),
             persisted_agent_session: None,
             manual_label: None,
@@ -160,6 +165,7 @@ impl TerminalState {
             revision: 0,
             orientation: crate::agent_orientation::OrientationState::Suppressed,
             orientation_offer: None,
+            overseer: crate::overseer::Role::default(),
             auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
             launch_argv: None,
             respawn_shell_on_exit: false,
@@ -320,6 +326,20 @@ impl TerminalState {
         let previous_detected_agent = self.detected_agent;
         let previous_session = self.current_session_identity_for_persistence();
         self.detected_agent = agent;
+        if process_exited || (previous_detected_agent.is_some() && agent != previous_detected_agent)
+        {
+            self.turn_reporting = None;
+        } else if let Some(report) = &mut self.turn_reporting {
+            // A stale spinner after Stop must not start another turn. Observe
+            // the ready prompt first. Once working, only a report can end it.
+            if visible_idle {
+                report.saw_idle = true;
+            }
+            if visible_working && report.saw_idle {
+                report.working = true;
+                report.saw_idle = false;
+            }
+        }
         self.fallback_state = fallback_state;
         self.fallback_visible_blocker = visible_blocker && fallback_state == AgentState::Blocked;
         self.fallback_visible_idle = visible_idle && fallback_state == AgentState::Idle;
@@ -538,7 +558,7 @@ impl TerminalState {
             .is_some_and(|session| session.source == source && session.agent == agent)
     }
 
-    fn current_session_identity_for_persistence(
+    pub(crate) fn current_session_identity_for_persistence(
         &self,
     ) -> Option<(
         String,
@@ -747,6 +767,8 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
+        self.turn_reporting = None;
+        self.job_marker = None;
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
         self.blocked_reason = None;
@@ -773,18 +795,78 @@ impl TerminalState {
         })
     }
 
+    pub fn report_turn(
+        &mut self,
+        agent: Agent,
+        event: crate::turn_reporting::TurnEvent,
+        seq: u64,
+        turn_id: Option<String>,
+    ) -> Option<TerminalStateMutation> {
+        if self
+            .effective_known_agent()
+            .is_some_and(|known| known != agent)
+        {
+            return None;
+        }
+        let now = Instant::now();
+        let previous_agent_label = self.effective_agent_label().map(str::to_string);
+        let previous_known_agent = self.effective_known_agent();
+        let previous_state = self.state;
+        let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
+        let report = self
+            .turn_reporting
+            .get_or_insert_with(|| crate::turn_reporting::Reporting::new(agent));
+        if seq <= report.seq {
+            return None;
+        }
+        report.seq = seq;
+        use crate::turn_reporting::TurnEvent;
+        match event {
+            TurnEvent::Ready => { /* SessionStart never cancels an active turn. */ }
+            TurnEvent::Started => {
+                report.working = true;
+                report.saw_idle = false;
+            }
+            TurnEvent::Ended => {
+                if turn_id.is_some() && turn_id == report.turn_id {
+                    return None;
+                }
+                report.turn_id = turn_id;
+                report.working = false;
+                report.saw_idle = false;
+                report.ends = report.ends.wrapping_add(1);
+                report.finished = self.job_marker.as_ref().is_some_and(|path| path.is_file());
+            }
+        }
+        Some(TerminalStateMutation {
+            effective_state_change: self.recompute_effective_state(
+                previous_agent_label,
+                previous_known_agent,
+                previous_state,
+                previous_presentation,
+                now,
+            ),
+            session_ref_changed: false,
+        })
+    }
+
     pub fn effective_agent_label(&self) -> Option<&str> {
         self.hook_authority
             .as_ref()
             .map(|authority| authority.agent_label.as_str())
             .or_else(|| self.detected_agent.map(crate::detect::agent_label))
+            .or_else(|| self.turn_reporting.as_ref().map(|r| r.agent.as_str()))
     }
 
     pub fn effective_known_agent(&self) -> Option<Agent> {
         if let Some(authority) = &self.hook_authority {
             return crate::detect::parse_agent_label(&authority.agent_label);
         }
-        self.detected_agent
+        self.detected_agent.or_else(|| {
+            self.turn_reporting
+                .as_ref()
+                .and_then(|r| crate::detect::parse_agent_label(&r.agent))
+        })
     }
 
     fn visible_blocker_overrides_hook(&self) -> bool {
@@ -918,6 +1000,8 @@ impl TerminalState {
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
+        self.turn_reporting = None;
+        self.job_marker = None;
         self.orientation = crate::agent_orientation::OrientationState::Suppressed;
         self.orientation_offer = None;
         self.detected_agent = None;
@@ -1020,7 +1104,15 @@ impl TerminalState {
         previous_presentation: EffectivePresentation,
         now: Instant,
     ) -> Option<EffectiveStateChange> {
-        let state = if self.visible_blocker_overrides_hook() {
+        let state = if let Some(report) = &self.turn_reporting {
+            if self.fallback_visible_blocker {
+                AgentState::Blocked
+            } else if report.working {
+                AgentState::Working
+            } else {
+                AgentState::Idle
+            }
+        } else if self.visible_blocker_overrides_hook() {
             AgentState::Blocked
         } else if self.visible_working_overrides_hook() {
             AgentState::Working

@@ -291,7 +291,7 @@ impl App {
                 params.agent_session_path,
             ),
             source: params.source,
-            agent_label,
+            agent_label: agent_label.clone(),
             seq: params.seq,
         });
 
@@ -305,6 +305,17 @@ impl App {
                     self.state.mark_session_dirty();
                     self.schedule_session_save();
                 }
+            }
+        }
+        if params.turn_reporting {
+            if let Some(agent) = crate::detect::parse_agent_label(&agent_label) {
+                self.handle_internal_event(crate::events::AppEvent::TurnReported {
+                    pane_id,
+                    agent,
+                    event: crate::turn_reporting::TurnEvent::Ready,
+                    seq: params.seq.unwrap_or(1),
+                    turn_id: None,
+                });
             }
         }
         // SessionStart is a context channel, independent of literal task input.
@@ -834,6 +845,7 @@ mod tests {
         let response = app.handle_pane_report_agent_session(
             "report".into(),
             PaneReportAgentSessionParams {
+                turn_reporting: false,
                 startup_source: None,
                 pane_id: format!("p_{}", detached_pane_id.raw()),
                 source: "herdr:claude".into(),

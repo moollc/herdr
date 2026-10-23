@@ -3094,6 +3094,18 @@ impl AppState {
                 })
                 .into_iter()
                 .collect(),
+            AppEvent::TurnReported {
+                pane_id,
+                agent,
+                event,
+                seq,
+                turn_id,
+            } => self
+                .update_terminal_state(pane_id, |terminal| {
+                    terminal.report_turn(agent, event, seq, turn_id)
+                })
+                .into_iter()
+                .collect(),
             AppEvent::HookStateReported {
                 pane_id,
                 source,

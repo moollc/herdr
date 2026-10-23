@@ -3,9 +3,11 @@ use std::time::{Duration, Instant};
 
 mod agents;
 mod integrations;
+mod overseer;
 mod panes;
 pub(super) mod responses;
 mod tabs;
+mod turns;
 mod view;
 mod workspaces;
 mod worktrees;
@@ -104,6 +106,7 @@ impl App {
             }
             self.announce_allowance_recoveries();
             self.sync_usage_redraw_deadline();
+            self.evaluate_allowance_guard();
             return;
         }
 
@@ -254,13 +257,21 @@ impl App {
         };
         let orient_pane = match &ev {
             AppEvent::StateChanged { pane_id, .. }
+            | AppEvent::TurnReported { pane_id, .. }
             | AppEvent::HookStateReported { pane_id, .. }
             | AppEvent::HookAuthorityCleared { pane_id, .. }
             | AppEvent::HookAgentReleased { pane_id, .. } => Some(*pane_id),
             _ => None,
         };
         let previous_toast = self.state.toast.clone();
+        let overseen = self.state.terminals.values().any(|t| t.overseer.active);
+        if overseen {
+            self.collect_overseer_events(std::time::Instant::now());
+        }
         let pane_updates = self.state.handle_app_event(ev);
+        if overseen {
+            self.collect_overseer_events(std::time::Instant::now());
+        }
         if let Some(pane_id) = orient_pane {
             self.maybe_auto_orient(pane_id);
         }
@@ -676,6 +687,21 @@ impl App {
                 return self.handle_pane_restart_agent(request.id, target);
             }
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
+            Method::PaneReportTurn(params) => {
+                return self.handle_pane_report_turn(request.id, params)
+            }
+            Method::OverseerEscalate(params) => {
+                return self.handle_overseer_escalate(request.id, params)
+            }
+            Method::OverseerMessage(params) => {
+                return self.handle_overseer_message(request.id, params)
+            }
+            Method::PaneSetJobMarker(params) => {
+                return self.handle_pane_set_job_marker(request.id, params)
+            }
+            Method::PaneJobMarker(params) => {
+                return self.handle_pane_job_marker(request.id, params)
+            }
             Method::PaneReportAgent(params) => {
                 return self.handle_pane_report_agent(request.id, params);
             }

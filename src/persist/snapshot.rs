@@ -180,6 +180,8 @@ pub struct WorkspaceSnapshot {
     pub custom_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overseer_scope: Option<crate::overseer::Scope>,
     pub identity_cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_space: Option<crate::workspace::WorktreeSpaceMembership>,
@@ -257,6 +259,12 @@ pub struct PaneSnapshot {
     /// drops it. Snapshots from before the field read as unarmed.
     #[serde(default, skip_serializing_if = "auto_orientation_is_unarmed")]
     pub auto_orientation: crate::agent_orientation::AutoOrientation,
+    #[serde(default)]
+    pub overseer: crate::overseer::Role,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_marker: Option<std::path::PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_reporting: Option<crate::turn_reporting::Reporting>,
     /// Whether the finish had been acknowledged. An agent that finished wears
     /// the done marker until its marker is clicked, and clicking it leaves the
     /// check behind until it is clicked again or another run finishes, so both
@@ -327,6 +335,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
             id: None,
             custom_name: snap.custom_name,
             purpose: None,
+            overseer_scope: None,
             identity_cwd,
             worktree_space: None,
             tabs: vec![tab],
@@ -498,7 +507,7 @@ pub fn capture(
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
                 DetachedAgentSnapshot {
                     pane_id: detached.pane_id.raw(),
-                    pane: capture_pane(&detached.pane, cwd, &state.terminals),
+                    pane: capture_pane(&detached.pane, cwd, &state.terminals, terminal_runtimes),
                     seen: detached.pane.seen,
                     completed: detached.pane.completed,
                 }
@@ -519,6 +528,7 @@ fn capture_workspace(
         id: Some(ws.id.clone()),
         custom_name: ws.custom_name.clone(),
         purpose: ws.purpose.clone(),
+        overseer_scope: ws.overseer_scope,
         identity_cwd: ws
             .resolved_identity_cwd_from(terminals, terminal_runtimes)
             .unwrap_or_else(|| ws.identity_cwd.clone()),
@@ -561,6 +571,7 @@ fn capture_pane(
         crate::terminal::TerminalId,
         crate::terminal::TerminalState,
     >,
+    terminal_runtimes: &TerminalRuntimeRegistry,
 ) -> PaneSnapshot {
     let terminal = terminals.get(&pane.attached_terminal_id);
     let agent_session = terminal.and_then(|terminal| {
@@ -602,6 +613,15 @@ fn capture_pane(
             .map(|terminal| terminal.orientation)
             .unwrap_or_default(),
         orientation_offer: terminal.and_then(|terminal| terminal.orientation_offer.clone()),
+        job_marker: terminal.and_then(|t| t.job_marker.clone()),
+        turn_reporting: terminal.and_then(|t| t.turn_reporting.clone()),
+        overseer: {
+            let mut role = terminal.map(|t| t.overseer.clone()).unwrap_or_default();
+            role.input_pending = terminal_runtimes
+                .get(&pane.attached_terminal_id)
+                .is_some_and(|runtime| runtime.has_pending_input());
+            role
+        },
         auto_orientation: terminal
             .map(|terminal| terminal.auto_orientation)
             .unwrap_or_default(),
@@ -625,7 +645,10 @@ fn capture_tab(
         let cwd = tab
             .cwd_for_pane(*id, terminals, terminal_runtimes)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
-        panes.insert(id.raw(), capture_pane(pane, cwd, terminals));
+        panes.insert(
+            id.raw(),
+            capture_pane(pane, cwd, terminals, terminal_runtimes),
+        );
     }
     TabSnapshot {
         custom_name: tab.custom_name.clone(),
@@ -893,6 +916,9 @@ mod tests {
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
                 orientation_offer: None,
+                job_marker: None,
+                turn_reporting: None,
+                overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen: true,
                 completed: false,
@@ -913,6 +939,9 @@ mod tests {
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
                 orientation_offer: None,
+                job_marker: None,
+                turn_reporting: None,
+                overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen: true,
                 completed: false,
@@ -926,6 +955,7 @@ mod tests {
         let snap = SessionSnapshot {
             workspaces: vec![WorkspaceSnapshot {
                 purpose: None,
+                overseer_scope: None,
                 id: Some("wproj".to_string()),
                 custom_name: Some("pi-mono".to_string()),
                 identity_cwd: PathBuf::from("/home/can/Projects/herdr"),
@@ -1508,6 +1538,9 @@ mod tests {
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
                 orientation_offer: None,
+                job_marker: None,
+                turn_reporting: None,
+                overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen: true,
                 completed: false,
@@ -1530,6 +1563,9 @@ mod tests {
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
                 orientation_offer: None,
+                job_marker: None,
+                turn_reporting: None,
+                overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen: true,
                 completed: false,
@@ -1544,6 +1580,7 @@ mod tests {
             version: SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 purpose: None,
+                overseer_scope: None,
                 id: Some("test-ws".to_string()),
                 custom_name: Some("fallback test".to_string()),
                 identity_cwd: PathBuf::from("/tmp"),

@@ -409,6 +409,7 @@ fn restore_workspace(
                 .unwrap_or_else(crate::workspace::generate_workspace_id),
             custom_name: snap.custom_name.clone(),
             purpose: snap.purpose.clone(),
+            overseer_scope: snap.overseer_scope,
             identity_cwd: snap.identity_cwd.clone(),
             cached_git_branch: crate::workspace::git_branch(&snap.identity_cwd),
             cached_git_ahead_behind: None,
@@ -680,6 +681,12 @@ fn restore_pane(
         if let Some(label) = saved_label {
             terminal.set_manual_label(label);
         }
+        terminal.overseer = saved_pane
+            .map(|p| p.overseer.clone())
+            .unwrap_or_default()
+            .restored(was_imported);
+        terminal.job_marker = saved_pane.and_then(|p| p.job_marker.clone());
+        terminal.pending_restart = terminal.overseer.pending_restart();
         terminal.model_pin = saved_model_pin;
         if let Some(agent_name) = saved_agent_name {
             terminal.set_agent_name(agent_name);
@@ -785,6 +792,11 @@ fn restore_pane(
             } else {
                 None
             };
+            terminal.turn_reporting = if was_imported {
+                saved_pane.and_then(|p| p.turn_reporting.clone())
+            } else {
+                None
+            };
             terminal.auto_orientation = saved_pane
                 .map(|pane| pane.auto_orientation)
                 .unwrap_or_default()
@@ -814,6 +826,12 @@ fn restore_pane(
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
+            terminal.overseer = saved_pane
+                .map(|p| p.overseer.clone())
+                .unwrap_or_default()
+                .restored(was_imported);
+            terminal.job_marker = saved_pane.and_then(|p| p.job_marker.clone());
+            terminal.pending_restart = terminal.overseer.pending_restart();
             terminal.model_pin = saved_model_pin;
             if let Some(agent_name) = saved_agent_name {
                 terminal.set_agent_name(agent_name);
@@ -1338,6 +1356,9 @@ mod tests {
                     launch_argv: None,
                     orientation: crate::agent_orientation::OrientationState::Suppressed,
                     orientation_offer: None,
+                    job_marker: None,
+                    turn_reporting: None,
+                    overseer: crate::overseer::Role::default(),
                     auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                     seen: true,
                     completed: false,
@@ -1406,6 +1427,9 @@ mod tests {
                     launch_argv: Some(launch_argv.clone()),
                     orientation: crate::agent_orientation::OrientationState::Pending,
                     orientation_offer: None,
+                    job_marker: None,
+                    turn_reporting: None,
+                    overseer: crate::overseer::Role::default(),
                     auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                     seen: true,
                     completed: false,
@@ -1469,6 +1493,7 @@ mod tests {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 purpose: None,
+                overseer_scope: None,
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
@@ -1489,6 +1514,9 @@ mod tests {
                             launch_argv: Some(launch_argv.clone()),
                             orientation: crate::agent_orientation::OrientationState::Suppressed,
                             orientation_offer: None,
+                            job_marker: None,
+                            turn_reporting: None,
+                            overseer: crate::overseer::Role::default(),
                             auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                             seen: true,
                             completed: false,
@@ -1561,6 +1589,9 @@ mod tests {
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
                 orientation_offer: None,
+                job_marker: None,
+                turn_reporting: None,
+                overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen,
                 completed,
@@ -1574,6 +1605,7 @@ mod tests {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 purpose: None,
+                overseer_scope: None,
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
@@ -1675,6 +1707,7 @@ mod tests {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 purpose: None,
+                overseer_scope: None,
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
@@ -1701,6 +1734,9 @@ mod tests {
                             launch_argv: None,
                             orientation: crate::agent_orientation::OrientationState::Suppressed,
                             orientation_offer: None,
+                            job_marker: None,
+                            turn_reporting: None,
+                            overseer: crate::overseer::Role::default(),
                             auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                             seen: true,
                             completed: false,
@@ -1763,6 +1799,7 @@ mod tests {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 purpose: None,
+                overseer_scope: None,
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
@@ -1789,6 +1826,9 @@ mod tests {
                             launch_argv: None,
                             orientation: crate::agent_orientation::OrientationState::Suppressed,
                             orientation_offer: None,
+                            job_marker: None,
+                            turn_reporting: None,
+                            overseer: crate::overseer::Role::default(),
                             auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                             seen: true,
                             completed: false,
@@ -1891,6 +1931,9 @@ mod tests {
                     launch_argv: Some(launch_argv.clone()),
                     orientation: crate::agent_orientation::OrientationState::Pending,
                     orientation_offer: None,
+                    job_marker: None,
+                    turn_reporting: None,
+                    overseer: crate::overseer::Role::default(),
                     auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                     seen: true,
                     completed: false,
@@ -1946,6 +1989,7 @@ mod tests {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 purpose: None,
+                overseer_scope: None,
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),
@@ -1972,6 +2016,9 @@ mod tests {
                             launch_argv: None,
                             orientation: crate::agent_orientation::OrientationState::Pending,
                             orientation_offer: None,
+                            job_marker: None,
+                            turn_reporting: None,
+                            overseer: crate::overseer::Role::default(),
                             auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                             seen: true,
                             completed: false,
@@ -2149,6 +2196,9 @@ mod tests {
                 launch_argv: None,
                 orientation: crate::agent_orientation::OrientationState::Suppressed,
                 orientation_offer: None,
+                job_marker: None,
+                turn_reporting: None,
+                overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen: true,
                 completed: false,
@@ -2176,6 +2226,7 @@ mod tests {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 purpose: None,
+                overseer_scope: None,
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd,
@@ -2217,6 +2268,9 @@ mod tests {
             launch_argv: None,
             orientation: crate::agent_orientation::OrientationState::Suppressed,
             orientation_offer: None,
+            job_marker: None,
+            turn_reporting: None,
+            overseer: crate::overseer::Role::default(),
             auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
             seen: true,
             completed: false,
@@ -2229,6 +2283,7 @@ mod tests {
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 purpose: None,
+                overseer_scope: None,
                 id: Some("workspace".into()),
                 custom_name: None,
                 identity_cwd: cwd.clone(),

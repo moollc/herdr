@@ -4,8 +4,9 @@
 
 ### Changed
 
+- The overseer role can cover one space as well as the whole session. With `[overseer] scope = "workspace"` each space can have its own overseer, plus one optional chief that hears every space without one. A space can override the setting from its menu. Space overseers send one line up with `herdr overseer escalate` and the chief answers with `herdr overseer message`. Pane information now reports `overseer` as `"space"` or `"chief"`, and omits it for other panes.
 - Fresh structured agent launches now use `--conversation new`, keeping their model-conversation intent separate from `--session`, which selects a named Herdr instance. This prevents an external launcher targeting a named instance from accidentally losing its first-task orientation.
-- A finished agent's dot in its pane header blinks until its completion is acknowledged, using the same rhythm as an inactive tab's attention indicator. It used to stay solid even while waiting for acknowledgement. Pending completions keep the animation clock running without another agent working.
+- Finished agents now show steady completion dots, tab attention and sidebar bars by default. Enable `finished_blink` under `[ui.pane_header]` or Settings → pane labels to restore blinking until acknowledged. With blinking off, pending completions no longer keep the animation clock running.
 
 ### Fixed
 
@@ -18,6 +19,9 @@
 - In Black Box, a Ctrl+clicked URL also stopped opening a third time from Black Box itself. herdr sets Black Box's `vte.ext.blackbox.app-opens-links` terminal property while it runs and clears it on exit, and Black Box leaves Ctrl+clicked links to herdr while it is set.
 
 ### Added
+
+- The allowance guard. When a provider's five hour allowance falls to 15% or below, or drops 25 points within 10 minutes, every working agent on that provider, in any space, gets one note to finish its step, save, write a hand off and stop. At 3% or below those agents are interrupted with their own interrupt key, and nothing is killed. The overseer pane gets one line naming the provider, the percent and the pane writing the most output. A `!` on the usage bar shows while the guard is active, and it re-arms once the allowance is back above 50%. Set it in `[allowance_guard]`: `wind_down_pct`, `fast_drop_points`, `fast_window_minutes`, `stop_pct`, and `claude`, `codex`, `cursor` to turn a provider on or off (Cursor is off by default).
+- Pane titles now have an OVERSEE switch and configurable keyboard binding. One pane per session can receive a role note, a current situation file, and batched completion and blocker feedback; pane information reports the role without allowing API callers to assign it. Optional profiles reuse the conversation resume path.
 - `[ui] acknowledge_on_pane_focus = true` confirms a finished agent when its pane is clicked or focused. The default is `false`, preserving manual confirmation. Settings → experiments toggles the same preference as `acknowledge completion on pane focus`. Focusing one pane leaves other agents' pending completions alone, and repeated focus never undoes a confirmation.
 - `[ui] minimap_collapsed_by_default = true` starts new tabs with their sidebar layout previews folded, including the first tab of a new space. Previews used to always start open. Each tab can still be unfolded with its arrow, and restored tabs keep their saved choice.
 - In Black Box, a pane title shows `⧉ POP` to the left of `⛶ FOCUS`. Clicking it opens the pane in its own Black Box window that stays above other windows and sits exactly over the pane: same position on screen, same width and height. The window is a direct attach to the pane's terminal, so closing it returns the pane to the layout at its usual size. The client tells the server which terminal it runs in when it connects, from `TERM_PROGRAM`, and POP appears only for a client running in Black Box. The window is opened through Black Box's `vte.ext.blackbox.pop-out` terminal properties, which carry the pane's terminal id and cells, never a command. This changes the client protocol, so the client and server must both be updated.

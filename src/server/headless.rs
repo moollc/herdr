@@ -1243,7 +1243,9 @@ impl HeadlessServer {
                 }
                 true
             }
-            AppEvent::StateChanged { .. } | AppEvent::HookStateReported { .. } => {
+            AppEvent::StateChanged { .. }
+            | AppEvent::HookStateReported { .. }
+            | AppEvent::TurnReported { .. } => {
                 self.sync_foreground_client_state();
                 self.app.handle_internal_event(ev);
                 self.forward_agent_notifications(Instant::now());
@@ -2812,6 +2814,8 @@ impl HeadlessServer {
                 .start_pending_agent_resumes(self.app.pending_agent_resume_due(now));
         }
         changed |= self.app.advance_agent_restarts(now);
+        changed |= self.app.advance_overseer(now);
+        changed |= self.app.advance_allowance_guard(now);
         self.app.sync_headless_animation_timer(now);
         changed
     }
@@ -3853,6 +3857,131 @@ next_tab = ""
         drop(runtime);
         drop(_runtime_guard);
         rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn headless_scheduler_advances_overseer_situation_and_note() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("oversight");
+        let pane = workspace.tabs[0].root_pane;
+        let id = workspace.terminal_id(pane).unwrap().clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.ensure_test_terminals();
+        let terminal = server.app.state.terminals.get_mut(&id).unwrap();
+        terminal.detected_agent = Some(crate::detect::Agent::Codex);
+        terminal.state = crate::detect::AgentState::Idle;
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes("checks passed\r\n› \r\n".as_bytes());
+        server.app.terminal_runtimes.insert(id.clone(), runtime);
+        let folder = std::env::temp_dir().join(format!(
+            "herdr-headless-overseer-{}",
+            crate::terminal::TerminalId::alloc()
+        ));
+        server.app.overseer_service.situation_path = folder.join("situation.md");
+        server.app.state.toggle_oversee(pane);
+        assert!(server.handle_scheduled_tasks_headless(Instant::now(), true));
+        assert!(server.app.overseer_service.situation_path.is_file());
+        let bytes = rx.try_recv().unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("You are the overseer"));
+        assert!(server.app.state.terminals[&id].overseer.notices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn headless_overseer_profile_yields_to_input_queued_during_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut server = test_headless_server();
+        // The shared fixture disables persistence; this test exercises server mode.
+        server.app.no_session = false;
+        let workspace = crate::workspace::Workspace::test_new("oversight");
+        let pane = workspace.tabs[0].root_pane;
+        let id = workspace.terminal_id(pane).unwrap().clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.ensure_test_terminals();
+        let folder = server.client_socket_path.parent().unwrap().to_path_buf();
+        let launcher = folder.join("codex");
+        std::fs::write(&launcher, "#!/bin/sh\nprintf 'probe\\n' >> \"$0.started\"\nwhile [ ! -f \"$0.queued\" ]; do sleep 0.01; done\nexit 0\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let terminal = server.app.state.terminals.get_mut(&id).unwrap();
+        terminal.detected_agent = Some(crate::detect::Agent::Codex);
+        terminal.state = crate::detect::AgentState::Idle;
+        terminal.model_pin = crate::agent_model::ModelPin::new("test-model", None)
+            .unwrap()
+            .with_launch(launcher.to_str(), &[]);
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("same-conversation").unwrap(),
+        });
+        server.app.overseer_service.config.codex_args =
+            Some(vec!["--sandbox".into(), "workspace-write".into()]);
+        server.app.overseer_service.situation_path = folder.join("situation.md");
+        let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes("checks passed\r\n› \r\n".as_bytes());
+        server.app.terminal_runtimes.insert(id.clone(), runtime);
+        let (writer, _control, _render) = test_client_writer();
+        server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 1,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::SemanticFrame,
+            keybindings: None,
+            direct_attach_requested: false,
+            host_terminal_program: None,
+            writer,
+        });
+        server.clients.get_mut(&1).unwrap().mode = ClientConnectionMode::TerminalAttach {
+            terminal_id: id.to_string(),
+        };
+        let tx = server.server_event_tx.clone();
+        let started = launcher.with_extension("started");
+        let queued = launcher.with_extension("queued");
+        let sender = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !started.exists() {
+                assert!(Instant::now() < deadline, "launcher never started");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            tx.try_send(ServerEvent::ClientInput {
+                client_id: 1,
+                data: b"draft".to_vec(),
+            })
+            .unwrap();
+            std::fs::write(queued, "queued").unwrap();
+        });
+        server.app.state.toggle_oversee(pane);
+        let now = Instant::now();
+        server.app.advance_overseer(now);
+        sender.join().unwrap();
+        assert!(rx.try_recv().is_err(), "probe must not write quit");
+        assert!(server.app.overseer_service.profile_probes.contains_key(&id));
+        assert!(!server.app.state.terminals[&id].overseer.notices[0].profile_checked);
+        assert!(server.drain_server_events());
+        assert_eq!(rx.try_recv().unwrap().as_ref(), b"draft");
+        server.app.advance_overseer(now + Duration::from_secs(1));
+        assert!(!server.app.overseer_service.profile_probes.contains_key(&id));
+        assert!(server.app.state.terminals[&id].pending_restart.is_none());
+        assert!(rx.try_recv().is_err());
+        server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: vec![0x15],
+        });
+        assert_eq!(rx.try_recv().unwrap().as_ref(), b"\x15");
+        server.app.advance_overseer(now + Duration::from_secs(4));
+        assert!(rx.try_recv().is_err(), "fresh probe must also yield");
+        assert_eq!(
+            std::fs::read_to_string(launcher.with_extension("started"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        server.app.advance_overseer(now + Duration::from_secs(5));
+        assert_eq!(rx.try_recv().unwrap().as_ref(), b"/quit");
+        assert!(server.app.state.terminals[&id].pending_restart.is_some());
     }
 
     #[test]

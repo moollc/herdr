@@ -12,9 +12,76 @@ use crate::layout::PaneId;
 /// The PTY implementation still delegates to the legacy pane runtime while the
 /// migration proceeds, but production code now depends on this terminal-layer
 /// type instead of the pane module's implementation detail.
-pub struct TerminalRuntime(crate::pane::PaneRuntime);
+pub struct TerminalRuntime(
+    crate::pane::PaneRuntime,
+    std::sync::Mutex<Option<std::time::Instant>>,
+    std::sync::atomic::AtomicBool,
+);
 
 impl TerminalRuntime {
+    fn from_inner(inner: crate::pane::PaneRuntime) -> Self {
+        Self(
+            inner,
+            std::sync::Mutex::new(None),
+            std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+
+    pub(crate) fn record_input(&self) {
+        if let Ok(mut last) = self.1.lock() {
+            *last = Some(std::time::Instant::now());
+        }
+    }
+
+    pub(crate) fn record_input_bytes(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.record_input();
+        let enter = self.encode_terminal_key(crate::input::TerminalKey::from(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        ));
+        let deletion = [
+            crossterm::event::KeyCode::Backspace,
+            crossterm::event::KeyCode::Delete,
+        ]
+        .into_iter()
+        .any(|code| {
+            let encoded = self.encode_terminal_key(crate::input::TerminalKey::from(
+                crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+            ));
+            !encoded.is_empty() && bytes == encoded
+        });
+        if (!enter.is_empty() && bytes.ends_with(&enter))
+            || deletion
+            || matches!(bytes, b"\x15" | b"\x03" | b"\x08" | b"\x7f" | b"\x1b[3~")
+        {
+            self.2.store(false, std::sync::atomic::Ordering::Relaxed);
+        } else if bytes.starts_with(b"\x1b[200~")
+            || (bytes.first() != Some(&27) && bytes.iter().any(|b| *b >= 32))
+        {
+            self.2.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn has_pending_input(&self) -> bool {
+        self.2.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn input_is_quiet(&self, now: std::time::Instant) -> bool {
+        if self.2.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        self.1.lock().is_ok_and(|last| {
+            last.is_none_or(|last| {
+                now.saturating_duration_since(last) >= std::time::Duration::from_secs(2)
+            })
+        })
+    }
+
     pub fn shutdown(self) {
         self.0.shutdown();
     }
@@ -74,7 +141,7 @@ impl TerminalRuntime {
             render_notify,
             render_dirty,
         )
-        .map(Self)
+        .map(Self::from_inner)
     }
 
     pub fn spawn(
@@ -101,7 +168,7 @@ impl TerminalRuntime {
             render_notify,
             render_dirty,
         )
-        .map(Self)
+        .map(Self::from_inner)
     }
 
     pub fn spawn_with_initial_history(
@@ -130,7 +197,7 @@ impl TerminalRuntime {
             render_notify,
             render_dirty,
         )
-        .map(Self)
+        .map(Self::from_inner)
     }
 
     pub fn spawn_shell_command(
@@ -159,7 +226,7 @@ impl TerminalRuntime {
             render_notify,
             render_dirty,
         )
-        .map(Self)
+        .map(Self::from_inner)
     }
 
     pub fn spawn_argv_command(
@@ -186,7 +253,7 @@ impl TerminalRuntime {
             render_notify,
             render_dirty,
         )
-        .map(Self)
+        .map(Self::from_inner)
     }
 
     pub fn apply_host_terminal_theme(&self, theme: crate::terminal_theme::TerminalTheme) {
@@ -251,6 +318,14 @@ impl TerminalRuntime {
         self.0.visible_ansi()
     }
 
+    pub(crate) fn detection_text(&self) -> String {
+        self.0.detection_text()
+    }
+
+    pub(crate) fn output_bytes(&self) -> u64 {
+        self.0.output_bytes()
+    }
+
     pub fn recent_text(&self, lines: usize) -> String {
         self.0.recent_text(lines)
     }
@@ -310,10 +385,12 @@ impl TerminalRuntime {
     }
 
     pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
+        self.record_input_bytes(&bytes);
         self.0.send_bytes(bytes).await
     }
 
     pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.record_input_bytes(&bytes);
         self.0.try_send_bytes(bytes)
     }
 
@@ -326,6 +403,7 @@ impl TerminalRuntime {
     }
 
     pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
+        self.record_input_bytes(text.as_bytes());
         self.0.send_paste(text).await
     }
 
@@ -407,7 +485,7 @@ impl TerminalRuntime {
 impl TerminalRuntime {
     pub(crate) fn test_with_channel(cols: u16, rows: u16) -> (Self, mpsc::Receiver<Bytes>) {
         let (runtime, rx) = crate::pane::PaneRuntime::test_with_channel(cols, rows);
-        (Self(runtime), rx)
+        (Self::from_inner(runtime), rx)
     }
 
     pub(crate) fn test_with_channel_capacity(
@@ -417,11 +495,11 @@ impl TerminalRuntime {
     ) -> (Self, mpsc::Receiver<Bytes>) {
         let (runtime, rx) =
             crate::pane::PaneRuntime::test_with_channel_capacity(cols, rows, capacity);
-        (Self(runtime), rx)
+        (Self::from_inner(runtime), rx)
     }
 
     pub(crate) fn test_with_screen_bytes(cols: u16, rows: u16, bytes: &[u8]) -> Self {
-        Self(crate::pane::PaneRuntime::test_with_screen_bytes(
+        Self::from_inner(crate::pane::PaneRuntime::test_with_screen_bytes(
             cols, rows, bytes,
         ))
     }
@@ -436,7 +514,7 @@ impl TerminalRuntime {
         scrollback_limit_bytes: usize,
         bytes: &[u8],
     ) -> Self {
-        Self(crate::pane::PaneRuntime::test_with_scrollback_bytes(
+        Self::from_inner(crate::pane::PaneRuntime::test_with_scrollback_bytes(
             cols,
             rows,
             scrollback_limit_bytes,
@@ -458,6 +536,6 @@ impl TerminalRuntime {
             bytes,
             channel_capacity,
         );
-        (Self(runtime), rx)
+        (Self::from_inner(runtime), rx)
     }
 }

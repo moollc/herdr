@@ -9,6 +9,7 @@ mod agent_orientation;
 mod agent_restart;
 mod agent_resume;
 mod agents;
+mod allowance_guard;
 mod api;
 mod api_helpers;
 mod commander;
@@ -18,6 +19,7 @@ mod creation;
 mod ids;
 mod input;
 pub(crate) mod notifications;
+mod overseer;
 mod runtime;
 mod session;
 pub mod state;
@@ -150,6 +152,8 @@ pub struct App {
     pub(crate) last_git_remote_status_refresh: Instant,
     pub(crate) last_player_poll: Instant,
     pub(crate) board_watcher: crate::board::BoardWatcher,
+    pub(crate) overseer_service: crate::overseer::Service,
+    pub(crate) guard_run: allowance_guard::GuardRuntime,
     pub(crate) tasks_watcher: crate::tasks::TasksWatcher,
     pub(crate) last_player_snapshot: crate::ui::player::PlayerSnapshot,
     pub(crate) last_player_playlist: crate::ui::player::PlaylistSnapshot,
@@ -592,6 +596,7 @@ impl App {
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
             pane_header: config.ui.pane_header,
             usage_config: config.ui.usage.clone(),
+            allowance_guard: crate::allowance_guard::Guard::new(config.allowance_guard.clone()),
             usage_snapshot: None,
             board: crate::board::BoardSnapshot::default(),
             tasks: crate::tasks::TasksSnapshot::default(),
@@ -648,10 +653,12 @@ impl App {
             global_menu: state::MenuListState::new(0),
             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
             session_dirty: false,
+            overseer_scope: config.overseer.scope,
             terminal_runtime_shutdowns: Vec::new(),
         };
 
         state.terminals = restored_terminals;
+        crate::overseer::restore_input_guards(&state.terminals, &restored_terminal_runtimes);
 
         for ws_idx in 0..state.workspaces.len() {
             let cwd = state.workspaces[ws_idx]
@@ -685,6 +692,8 @@ impl App {
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
             last_player_poll: Instant::now() - PLAYER_POLL_INTERVAL,
+            overseer_service: crate::overseer::Service::new(config),
+            guard_run: allowance_guard::GuardRuntime::default(),
             tasks_watcher: crate::tasks::TasksWatcher::new(crate::tasks::configured_path(
                 config.tasks_file.as_deref(),
             )),
@@ -778,6 +787,7 @@ impl App {
         app.state.terminals = terminals;
         app.state.detached_agents = detached_agents;
         app.terminal_runtimes = runtimes.into();
+        crate::overseer::restore_input_guards(&app.state.terminals, &app.terminal_runtimes);
         app.state.active = snapshot
             .active
             .filter(|&idx| idx < app.state.workspaces.len());
@@ -1313,7 +1323,16 @@ impl App {
         let invalid_section =
             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
 
+        if !invalid_section("overseer") {
+            self.overseer_service.config = config.overseer.clone();
+            self.state.overseer_scope = config.overseer.scope;
+        }
+        if !invalid_section("allowance_guard") {
+            self.state.allowance_guard.config = config.allowance_guard.clone();
+        }
         if !invalid_section("tasks_file") {
+            self.overseer_service.tasks_path =
+                crate::tasks::configured_path(config.tasks_file.as_deref());
             self.tasks_watcher
                 .set_path(crate::tasks::configured_path(config.tasks_file.as_deref()));
         }

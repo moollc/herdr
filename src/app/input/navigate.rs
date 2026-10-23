@@ -522,6 +522,7 @@ pub(crate) enum NavigateAction {
     OpenComposer,
     OpenCommander,
     ToggleSidebar,
+    ToggleOversee,
     ToggleTasks,
     ToggleAgents,
     ToggleAgentTable,
@@ -627,6 +628,7 @@ fn action_for_key(
         (&kb.composer, NavigateAction::OpenComposer),
         (&kb.commander, NavigateAction::OpenCommander),
         (&kb.toggle_sidebar, NavigateAction::ToggleSidebar),
+        (&kb.toggle_oversee, NavigateAction::ToggleOversee),
         (&kb.toggle_tasks, NavigateAction::ToggleTasks),
         (&kb.toggle_agents, NavigateAction::ToggleAgents),
         (&kb.toggle_agent_table, NavigateAction::ToggleAgentTable),
@@ -757,6 +759,16 @@ pub(super) fn execute_navigate_action_in_context(
             {
                 super::modal::open_rename_pane(state, pane_id);
             }
+        }
+        NavigateAction::ToggleOversee => {
+            if let Some(pane) = state
+                .active
+                .and_then(|i| state.workspaces.get(i))
+                .and_then(|ws| ws.focused_pane_id())
+            {
+                state.toggle_oversee(pane);
+            }
+            leave_navigate_mode(state);
         }
         NavigateAction::FocusPaneLeft => state.navigate_pane(NavDirection::Left),
         NavigateAction::FocusPaneDown => state.navigate_pane(NavDirection::Down),

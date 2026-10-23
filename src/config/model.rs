@@ -185,6 +185,8 @@ pub struct ConfigReloadReport {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub overseer: crate::overseer::OverseerConfig,
+    pub allowance_guard: crate::allowance_guard::GuardConfig,
     pub onboarding: Option<bool>,
     /// Legacy board source, retained for configuration compatibility.
     pub board_file: Option<String>,
@@ -257,6 +259,8 @@ pub struct KeysConfig {
     pub commander: BindingConfig,
     /// Toggle sidebar collapse. Default: "prefix+b"
     pub toggle_sidebar: BindingConfig,
+    /// Assign or release the focused pane overseer. Default: "prefix+shift+o".
+    pub toggle_oversee: BindingConfig,
     /// Toggle the right Tasks column. Default: "prefix+t".
     pub toggle_tasks: BindingConfig,
     /// Toggle compact sidebar agent names. Default: "prefix+a".
@@ -585,6 +589,7 @@ impl Default for KeysConfig {
             composer: BindingConfig::one("prefix+/"),
             commander: BindingConfig::one("f2"),
             toggle_sidebar: BindingConfig::one("prefix+b"),
+            toggle_oversee: BindingConfig::one("prefix+shift+o"),
             toggle_tasks: BindingConfig::one("prefix+t"),
             toggle_agents: BindingConfig::one("prefix+a"),
             toggle_agent_table: BindingConfig::one("prefix+shift+b"),
@@ -684,6 +689,8 @@ pub struct PaneHeaderConfig {
     /// The agent's status mark before its name: the spinner while it works,
     /// and the dot, clickable into a check, once it finishes.
     pub status: bool,
+    /// Blink unseen completions in pane headers, tabs and sidebar. Default: false.
+    pub finished_blink: bool,
     pub agent_name: bool,
     pub hostname: bool,
     pub working_directory: bool,
@@ -699,6 +706,7 @@ impl Default for PaneHeaderConfig {
     fn default() -> Self {
         Self {
             status: true,
+            finished_blink: false,
             agent_name: true,
             hostname: false,
             working_directory: false,
@@ -828,10 +836,11 @@ pub(crate) enum PaneHeaderField {
     GitBranch,
     GitStatus,
     Usage,
+    FinishedBlink,
 }
 
 impl PaneHeaderField {
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::Status,
         Self::AgentName,
         Self::Hostname,
@@ -840,6 +849,7 @@ impl PaneHeaderField {
         Self::GitBranch,
         Self::GitStatus,
         Self::Usage,
+        Self::FinishedBlink,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -852,6 +862,7 @@ impl PaneHeaderField {
             Self::GitBranch => "git branch",
             Self::GitStatus => "git status",
             Self::Usage => "usage",
+            Self::FinishedBlink => "finished blink",
         }
     }
 
@@ -865,6 +876,7 @@ impl PaneHeaderField {
             Self::GitBranch => "git_branch",
             Self::GitStatus => "git_status",
             Self::Usage => "usage",
+            Self::FinishedBlink => "finished_blink",
         }
     }
 
@@ -878,6 +890,7 @@ impl PaneHeaderField {
             Self::GitBranch => header.git_branch,
             Self::GitStatus => header.git_status,
             Self::Usage => header.usage,
+            Self::FinishedBlink => header.finished_blink,
         }
     }
 }
@@ -1062,7 +1075,10 @@ show_agent_labels_on_pane_borders = false
         let config: Config = toml::from_str("[ui.pane_header]\nusage = false\n").unwrap();
         assert!(!config.ui.pane_header.usage);
         // Shown last, after git status.
-        assert_eq!(PaneHeaderField::ALL.last(), Some(&PaneHeaderField::Usage));
+        assert_eq!(
+            PaneHeaderField::ALL.last(),
+            Some(&PaneHeaderField::FinishedBlink)
+        );
     }
 
     #[test]
@@ -1120,6 +1136,7 @@ show_agent_labels_on_pane_borders = false
     fn pane_header_defaults_to_status_and_name_and_parses() {
         let default_config = Config::default();
         assert!(default_config.ui.pane_header.status);
+        assert!(!default_config.ui.pane_header.finished_blink);
         assert!(default_config.ui.pane_header.agent_name);
         assert!(!default_config.ui.pane_header.working_directory);
         assert!(!default_config.ui.pane_header.parent_directory);
@@ -1129,6 +1146,7 @@ show_agent_labels_on_pane_borders = false
 
         let toml = r#"
 [ui.pane_header]
+finished_blink = true
 status = false
 agent_name = false
 working_directory = true
@@ -1138,6 +1156,12 @@ git_status = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.pane_header.status);
+        assert!(config.ui.pane_header.finished_blink);
+        assert!(PaneHeaderField::FinishedBlink.enabled(config.ui.pane_header));
+        assert_eq!(
+            PaneHeaderField::FinishedBlink.config_key(),
+            "finished_blink"
+        );
         assert!(!config.ui.pane_header.agent_name);
         assert!(config.ui.pane_header.working_directory);
         assert!(config.ui.pane_header.parent_directory);
