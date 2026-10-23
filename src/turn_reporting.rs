@@ -46,7 +46,7 @@ mod tests {
         t
     }
     #[test]
-    fn native_turn_reporting_ignores_idle_guesses_for_every_kind() {
+    fn native_turn_reporting_recovers_from_sustained_visible_idle_for_every_kind() {
         for agent in [Agent::Claude, Agent::Codex, Agent::Cursor] {
             let mut t = pane(agent);
             t.report_turn(agent, TurnEvent::Ready, 1, None);
@@ -63,7 +63,12 @@ mod tests {
                     false,
                     now + Duration::from_secs(seconds),
                 );
-                assert_eq!(t.state, AgentState::Working, "{agent:?}");
+                let expected = if seconds < 15 {
+                    AgentState::Working
+                } else {
+                    AgentState::Idle
+                };
+                assert_eq!(t.state, expected, "{agent:?} at {seconds}s");
             }
             t.report_turn(agent, TurnEvent::Ended, 3, Some("one".into()));
             assert_eq!(t.state, AgentState::Idle);
@@ -73,6 +78,37 @@ mod tests {
                 .report_turn(agent, TurnEvent::Ended, 4, Some("one".into()))
                 .is_none());
             assert_eq!(t.turn_reporting.as_ref().unwrap().ends, 1);
+        }
+    }
+    #[test]
+    fn visible_idle_at_fifteen_seconds_recovers_without_native_completion() {
+        for agent in [Agent::Claude, Agent::Codex, Agent::Cursor] {
+            let mut t = pane(agent);
+            t.report_turn(agent, TurnEvent::Started, 1, None);
+            let now = Instant::now();
+            for seconds in [0, 3, 14, 15, 25, 120] {
+                t.set_detected_state_with_reason_at(
+                    Some(agent),
+                    AgentState::Idle,
+                    None,
+                    false,
+                    true,
+                    false,
+                    false,
+                    now + Duration::from_secs(seconds),
+                );
+                assert_eq!(
+                    t.state,
+                    if seconds < 15 {
+                        AgentState::Working
+                    } else {
+                        AgentState::Idle
+                    }
+                );
+                let native = t.turn_reporting.as_ref().unwrap();
+                assert_eq!(native.ends, 0);
+                assert!(!native.finished);
+            }
         }
     }
     #[test]
@@ -172,5 +208,125 @@ mod tests {
         assert!(t
             .report_turn(Agent::Claude, TurnEvent::Ended, 2, None)
             .is_none());
+    }
+    #[test]
+    fn interrupted_ready_prompt_recovers_without_end_hook_and_rearms() {
+        let content = include_str!("../tests/fixtures/interrupted-ready.txt");
+        let detection = crate::detect::detect_agent(Some(Agent::Claude), content);
+        assert!(detection.visible_idle && !detection.visible_working && !detection.visible_blocker);
+        for agent in [Agent::Claude, Agent::Codex, Agent::Cursor] {
+            let mut t = pane(agent);
+            t.report_turn(agent, TurnEvent::Started, 1, None);
+            let now = Instant::now();
+            for seconds in [0, 14, 15] {
+                t.set_detected_state_with_reason_at(
+                    Some(agent),
+                    AgentState::Idle,
+                    None,
+                    false,
+                    true,
+                    false,
+                    false,
+                    now + Duration::from_secs(seconds),
+                );
+                assert_eq!(
+                    t.state,
+                    if seconds < 15 {
+                        AgentState::Working
+                    } else {
+                        AgentState::Idle
+                    }
+                );
+            }
+            assert_eq!(
+                t.turn_reporting.as_ref().unwrap().ends,
+                0,
+                "recovery is not a fabricated completion"
+            );
+            assert!(!t.turn_reporting.as_ref().unwrap().finished);
+            t.report_turn(agent, TurnEvent::Started, 2, None);
+            assert_eq!(t.state, AgentState::Working);
+        }
+    }
+    #[test]
+    fn positive_idle_recovery_resets_on_ambiguous_or_working_frame() {
+        let mut t = pane(Agent::Claude);
+        t.report_turn(Agent::Claude, TurnEvent::Started, 1, None);
+        let now = Instant::now();
+        t.set_detected_state_with_reason_at(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            None,
+            false,
+            true,
+            false,
+            false,
+            now,
+        );
+        t.set_detected_state_with_reason_at(
+            Some(Agent::Claude),
+            AgentState::Working,
+            None,
+            false,
+            false,
+            true,
+            false,
+            now + Duration::from_secs(14),
+        );
+        t.set_detected_state_with_reason_at(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            None,
+            false,
+            true,
+            false,
+            false,
+            now + Duration::from_secs(15),
+        );
+        assert_eq!(t.state, AgentState::Working);
+        t.set_detected_state_with_reason_at(
+            Some(Agent::Claude),
+            AgentState::Idle,
+            None,
+            false,
+            false,
+            false,
+            false,
+            now + Duration::from_secs(29),
+        );
+        assert_eq!(t.state, AgentState::Working);
+    }
+    #[test]
+    fn accepted_manual_idle_overrides_native_working_but_stale_report_does_not() {
+        for agent in [Agent::Claude, Agent::Codex, Agent::Cursor] {
+            let mut t = pane(agent);
+            t.report_turn(agent, TurnEvent::Started, 1, None);
+            t.set_hook_authority_with_custom_status_at(
+                "manual".into(),
+                crate::detect::agent_label(agent).into(),
+                AgentState::Idle,
+                None,
+                None,
+                None,
+                Some(100),
+                Instant::now(),
+            )
+            .unwrap();
+            assert_eq!(t.state, AgentState::Idle);
+            t.report_turn(agent, TurnEvent::Started, 2, None);
+            assert!(t
+                .set_hook_authority_with_custom_status_at(
+                    "manual".into(),
+                    crate::detect::agent_label(agent).into(),
+                    AgentState::Idle,
+                    None,
+                    None,
+                    None,
+                    Some(99),
+                    Instant::now()
+                )
+                .is_none());
+            assert_eq!(t.state, AgentState::Working);
+        }
     }
 }

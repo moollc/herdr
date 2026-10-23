@@ -69,20 +69,11 @@ impl App {
         let mut events = Vec::new();
         for usage in &snapshot.providers {
             let working = !self.guard_panes(usage.provider).is_empty();
-            if let Some(pct) = allowance_guard::reading(usage, now, working) {
-                let resumed = self.guard_run.refresh_requested.contains(&usage.provider);
-                let mut next = self.state.allowance_guard.observe(usage.provider, pct, now);
-                if resumed && next.is_empty() && self.state.allowance_guard.active(usage.provider) {
-                    next.push(Event::WindDown {
-                        provider: usage.provider,
-                        pct,
-                        fast: self.state.allowance_guard.fast(usage.provider),
-                    });
-                }
-                events.extend(next);
-            } else if !self.state.allowance_guard.config.watches(usage.provider) {
-                self.state.allowance_guard.observe(usage.provider, 100, now);
-            }
+            events.extend(
+                self.state
+                    .allowance_guard
+                    .observe_usage(usage, now, working),
+            );
         }
         self.pause_unknown_guard(snapshot, &trusted, received);
         if !events.is_empty() {
@@ -99,7 +90,11 @@ impl App {
             .iter()
             .filter_map(|usage| {
                 let working = !self.guard_panes(usage.provider).is_empty();
-                allowance_guard::reading(usage, now, working).map(|_| usage.provider)
+                usage
+                    .windows
+                    .iter()
+                    .any(|w| allowance_guard::window_reading(usage, w, now, working).is_some())
+                    .then_some(usage.provider)
             })
             .collect()
     }
@@ -113,13 +108,25 @@ impl App {
         now: Instant,
     ) {
         for provider in [Provider::Claude, Provider::Codex, Provider::Cursor] {
-            if trusted.contains(&provider) {
+            let estimated = snapshot
+                .providers
+                .iter()
+                .filter(|u| u.provider == provider)
+                .any(|u| {
+                    u.windows
+                        .iter()
+                        .any(|w| w.resets_at.is_some_and(|at| at <= snapshot.taken_at))
+                });
+            if trusted.contains(&provider) && !estimated {
                 self.guard_run.refresh_requested.remove(&provider);
                 continue;
             }
             let prefix = format!(
-                "Herdr allowance guard: {} five hour",
-                provider_name(provider)
+                "Herdr allowance guard: {} {}",
+                provider_name(provider),
+                crate::ui::usage_bar::window_phrase(
+                    self.state.allowance_guard.policy_kind(provider)
+                )
             );
             self.guard_run
                 .lines
@@ -201,7 +208,20 @@ impl App {
                     (*provider, *pct)
                 }
             };
-            let panes = self.guard_panes(provider);
+            let panes: Vec<_> = self
+                .guard_panes(provider)
+                .into_iter()
+                .filter(|id| {
+                    !self
+                        .state
+                        .terminals
+                        .get(id)
+                        .is_some_and(|t| t.overseer.active)
+                })
+                .collect();
+            let phrase = crate::ui::usage_bar::window_phrase(
+                self.state.allowance_guard.policy_kind(provider),
+            );
             let names = panes
                 .iter()
                 .map(|id| self.guard_name(id))
@@ -219,13 +239,13 @@ impl App {
                         .map(|id| format!("; burning fastest: {}", self.guard_name(&id)))
                         .unwrap_or_default();
                     format!(
-                        "Herdr allowance guard: {} five hour allowance {} at {pct}%. Told to wind down: {who}{burning}.",
+                        "Herdr allowance guard: {} {phrase} allowance {} at {pct}%. Told to wind down: {who}{burning}.",
                         provider_name(provider),
                         if *fast { "fell fast, now" } else { "is" },
                     )
                 }
                 Event::Stop { .. } => format!(
-                    "Herdr allowance guard: {} five hour allowance at {pct}%. Interrupting with each agent's own interrupt key, nothing is killed: {who}.",
+                    "Herdr allowance guard: {} {phrase} allowance at {pct}%. Interrupting with each agent's own interrupt key, nothing is killed: {who}.",
                     provider_name(provider),
                 ),
             };
@@ -255,15 +275,23 @@ impl App {
             .retain_panes(|id| live.contains(id));
         let trusted = if let Some((snapshot, epoch, received)) = self.guard_run.readings.clone() {
             let epoch_now = epoch.saturating_add(now.saturating_duration_since(received).as_secs());
+            for usage in &snapshot.providers {
+                let working = !self.guard_panes(usage.provider).is_empty();
+                self.state
+                    .allowance_guard
+                    .observe_usage(usage, epoch_now, working);
+            }
             let trusted = self.trusted_guard_providers(&snapshot, epoch_now);
-            self.pause_unknown_guard(&snapshot, &trusted, now);
+            let mut clocked = snapshot.clone();
+            clocked.taken_at = epoch_now;
+            self.pause_unknown_guard(&clocked, &trusted, now);
             trusted
         } else {
             HashSet::new()
         };
         let mut changed = false;
         for provider in [Provider::Claude, Provider::Codex, Provider::Cursor] {
-            if !trusted.contains(&provider) || !self.state.allowance_guard.active(provider) {
+            if !trusted.contains(&provider) {
                 continue;
             }
             for id in self.guard_panes(provider) {
@@ -278,8 +306,25 @@ impl App {
         let Some(runtime) = self.terminal_runtimes.get(id) else {
             return false;
         };
-        let needs_note = self.state.allowance_guard.needs_note(provider, id);
-        let needs_interrupt = self.state.allowance_guard.needs_interrupt(provider, id);
+        let overseer = self
+            .state
+            .terminals
+            .get(id)
+            .is_some_and(|t| t.overseer.active);
+        let Some((snapshot, epoch, received)) = &self.guard_run.readings else {
+            return false;
+        };
+        let at = epoch.saturating_add(now.saturating_duration_since(*received).as_secs());
+        let Some(usage) = snapshot.providers.iter().find(|u| u.provider == provider) else {
+            return false;
+        };
+        let Some((kind, pct, fast, needs_note, needs_interrupt)) = self
+            .state
+            .allowance_guard
+            .pane_action(provider, overseer, id, usage, (at, true))
+        else {
+            return false;
+        };
         if needs_note {
             // The safe path: only into an empty prompt nobody is typing in.
             let quiet = runtime.input_is_quiet(now)
@@ -288,11 +333,12 @@ impl App {
                     &runtime.recent_ansi(80),
                 );
             if quiet {
-                let pct = self.state.allowance_guard.last_pct(provider).unwrap_or(0);
-                let fast = self.state.allowance_guard.fast(provider);
-                let text = wind_down_note(provider, pct, fast);
+                let text = wind_down_note(provider, pct, fast)
+                    .replace("five hour", crate::ui::usage_bar::window_phrase(kind));
                 if super::api_helpers::send_prompt(runtime, &text).is_ok() {
-                    self.state.allowance_guard.mark_noted(provider, id);
+                    self.state
+                        .allowance_guard
+                        .mark_policy_action(provider, overseer, id, false);
                     return true;
                 }
             }
@@ -316,7 +362,9 @@ impl App {
                     super::api_helpers::deliver_text_then_keys(runtime, &[], &keys).is_ok()
                 });
             if sent {
-                self.state.allowance_guard.mark_interrupted(provider, id);
+                self.state
+                    .allowance_guard
+                    .mark_policy_action(provider, overseer, id, true);
                 return true;
             }
         }
@@ -377,6 +425,13 @@ mod tests {
         );
         app.state = AppState::test_new();
         app.state.mode = crate::app::Mode::Terminal;
+        let mut legacy = app.state.allowance_guard.config.effective(Provider::Codex);
+        legacy.short.wind_down_pct = 15;
+        app.state
+            .allowance_guard
+            .config
+            .providers
+            .insert(Provider::Codex, legacy);
         app
     }
 
@@ -768,5 +823,57 @@ mod tests {
             "expired queued alarms are discarded"
         );
         assert!(app.guard_run.refresh_requested.contains(&Provider::Codex));
+    }
+    #[tokio::test]
+    async fn weekly_team_limit_leaves_working_overseer_until_its_reserve() {
+        let mut app = new_app();
+        let mut worker = add(
+            &mut app,
+            "Test",
+            "Birch",
+            Agent::Claude,
+            AgentState::Working,
+        );
+        let mut boss = add(
+            &mut app,
+            "Test",
+            "Cedar",
+            Agent::Claude,
+            AgentState::Working,
+        );
+        app.state
+            .terminals
+            .get_mut(&boss.id)
+            .unwrap()
+            .overseer
+            .active = true;
+        let mut policy = app.state.allowance_guard.config.effective(Provider::Claude);
+        policy.long.wind_down_pct = 17;
+        policy.long.overseer_pct = 8;
+        app.state
+            .allowance_guard
+            .config
+            .providers
+            .insert(Provider::Claude, policy);
+        let mut snapshot = reading(Provider::Claude, 90, NOW);
+        snapshot.providers[0].windows.push(UsageWindow {
+            kind: WindowKind::Weekly,
+            left_pct: Some(17),
+            resets_at: Some(NOW + 86400),
+            note: None,
+            reset: false,
+        });
+        app.allowance_guard_readings(&snapshot, NOW);
+        ticks(&mut app, 3);
+        assert!(typed(&mut worker)
+            .await
+            .contains("weekly allowance is at 17%"));
+        assert_eq!(typed(&mut boss).await, "");
+        snapshot.providers[0].seen_at = Some(NOW + 60);
+        snapshot.providers[0].windows[1].left_pct = Some(8);
+        app.allowance_guard_readings(&snapshot, NOW + 60);
+        ticks(&mut app, 3);
+        assert!(typed(&mut boss).await.contains("weekly allowance is at 8%"));
+        assert_eq!(typed(&mut worker).await, "");
     }
 }

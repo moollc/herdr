@@ -2024,6 +2024,7 @@ pub struct AppState {
     pub usage_config: crate::config::UsageDisplayConfig,
     /// The allowance guard's settings and which providers it is active on.
     pub allowance_guard: crate::allowance_guard::Guard,
+    pub(crate) allowance_settings: Option<super::allowance_settings::AllowanceSettings>,
     /// The latest allowance readings, drawn in pane headers and the sidebar.
     pub usage_snapshot: Option<crate::usage::UsageSnapshot>,
     /// Pure snapshot of the optional file-backed Tasks panel.
@@ -2501,6 +2502,7 @@ impl AppState {
             pane_header: PaneHeaderConfig::default(),
             usage_config: crate::config::UsageDisplayConfig::default(),
             allowance_guard: crate::allowance_guard::Guard::default(),
+            allowance_settings: None,
             usage_snapshot: None,
             board: crate::board::BoardSnapshot::default(),
             tasks: crate::tasks::TasksSnapshot::default(),

@@ -692,3 +692,45 @@ Click the small arrow beside an agent name, press `prefix+a`, or run
 name per line or restore its full details. This choice is saved with the
 session. `[keys] toggle_agents` remaps the shortcut. Clicking a name still
 focuses the pane, and dragging it still moves the agent.
+
+
+## Allowance limits
+
+Right-click a provider in the sidebar allowance block to open its settings.
+The block keeps its existing appearance until opened. Select a number and type
+its replacement, or use the left and right arrows. Click switches to turn the
+guard or individual panes on and off. Save persists the limits; Cancel discards
+the draft. The stop percentage must be below wind-down, and the overseer reserve
+must be above stop and no higher than wind-down.
+
+Limits apply separately to five-hour and weekly windows. Cursor uses Auto and
+Named monthly pools. The first limit reached starts wind-down; overseer panes
+continue until their own reserve. New configurations default to Claude 15%,
+Codex 5%, stop 3%, and a fall of 25 points within 10 minutes. Cursor remains off
+by default. Explicit legacy scalar settings remain supported.
+
+```toml
+[allowance_guard.providers.codex]
+enabled = true
+fast_drop_points = 25
+fast_window_minutes = 10
+
+[allowance_guard.providers.codex.short]
+wind_down_pct = 5
+stop_pct = 3
+overseer_pct = 4
+
+[allowance_guard.providers.codex.long]
+wind_down_pct = 17
+stop_pct = 3
+overseer_pct = 8
+```
+
+Pane switches use the dispatcher's existing `BENCHED` file beside `TEAM_QUEUE`;
+`TEAM_BENCHED` can specify a different path. They do not create another bench list.
+`herdr usage --json` includes the effective `allowance_policy` for scheduling tools.
+After an observed reset deadline passes, the plain usage command labels the full
+allowance as “estimated after reset” until a real observation replaces it.
+The dispatcher resumes only work recorded as held for allowance; intentional
+parks remain parked. While waiting for a reset it holds a bounded idle-sleep
+assertion until that deadline plus fifteen minutes.

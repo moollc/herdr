@@ -19,6 +19,10 @@ pub(crate) const SETTINGS_POPUP_WIDTH: u16 = 76;
 pub(crate) const SETTINGS_POPUP_HEIGHT: u16 = 26;
 
 pub(super) fn render_settings_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    if app.allowance_settings.is_some() {
+        crate::app::allowance_settings::render(app, frame, area);
+        return;
+    }
     use crate::app::state::SettingsSection;
 
     let p = &app.palette;

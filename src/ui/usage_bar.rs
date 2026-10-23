@@ -634,6 +634,38 @@ pub(crate) fn render_sidebar_block(app: &AppState, frame: &mut Frame, sidebar: R
     render_allowance_block(app, frame, area);
 }
 
+/// Hit testing uses the exact rows and bottom anchor used by the sidebar renderer.
+pub(crate) fn provider_at(app: &AppState, col: u16, row: u16) -> Option<Provider> {
+    let sidebar = app.view.sidebar_rect;
+    if col < sidebar.x || col >= sidebar.right() {
+        return None;
+    }
+    let count = sidebar_rows(app, sidebar.height);
+    if count == 0 {
+        return None;
+    }
+    let bottom = sidebar
+        .bottom()
+        .saturating_sub(crate::ui::player::player_rows_for_sidebar(
+            app,
+            sidebar.height,
+        ));
+    let start = bottom.saturating_sub(count);
+    if row < start || row >= bottom {
+        return None;
+    }
+    let mut provider = None;
+    for (idx, item) in block_rows(app).into_iter().enumerate() {
+        if let BlockRow::Provider(p, _) = item {
+            provider = Some(p);
+        }
+        if start + idx as u16 == row {
+            return provider;
+        }
+    }
+    None
+}
+
 fn render_allowance_block(app: &AppState, frame: &mut Frame, area: Rect) {
     if area.width < 6 || area.height == 0 {
         return;

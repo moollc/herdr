@@ -53,6 +53,10 @@ pub(crate) use self::composer::{
 pub(crate) use self::describe_dialog::{
     handle_describe_dialog_key, open_space_purpose_editor, open_tab_goal_editor,
 };
+use self::modal::{
+    modal_action_from_key, ModalAction, ONBOARDING_WELCOME_ACTIONS, RELEASE_NOTES_ACTIONS,
+};
+pub(crate) use self::settings::SettingsAction;
 pub(crate) use self::{
     modal::{
         handle_confirm_close_key, handle_context_menu_key, handle_global_menu_key,
@@ -60,12 +64,6 @@ pub(crate) use self::{
     },
     navigate::terminal_direct_navigation_action,
     settings::open_settings_at,
-};
-use self::{
-    modal::{
-        modal_action_from_key, ModalAction, ONBOARDING_WELCOME_ACTIONS, RELEASE_NOTES_ACTIONS,
-    },
-    settings::SettingsAction,
 };
 use super::state::{AppState, Mode};
 use super::App;
@@ -402,6 +400,9 @@ impl App {
         if !handled_pane_double_click {
             if let Some(action) = self.state.handle_mouse(&mut self.terminal_runtimes, mouse) {
                 match action {
+                    SettingsAction::SaveAllowance(p, policy, benches) => {
+                        self.save_allowance(p, policy, benches)
+                    }
                     SettingsAction::SaveTheme(name) => self.save_theme(&name),
                     SettingsAction::SaveSound(enabled) => self.save_sound(enabled),
                     SettingsAction::SaveDoneSound(choice) => self.save_done_sound(&choice),

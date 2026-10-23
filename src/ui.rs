@@ -28,7 +28,7 @@ mod sidebar;
 mod status;
 mod tabs;
 pub(crate) mod usage_bar;
-mod widgets;
+pub(crate) mod widgets;
 
 use self::agent_table::render_global_launcher;
 pub(crate) use self::agent_table::{
@@ -611,7 +611,7 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
     }
 }
 
-fn dim_background(frame: &mut Frame, area: Rect) {
+pub(crate) fn dim_background(frame: &mut Frame, area: Rect) {
     let buf = frame.buffer_mut();
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {

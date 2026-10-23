@@ -10,6 +10,7 @@ mod agent_restart;
 mod agent_resume;
 mod agents;
 mod allowance_guard;
+pub(crate) mod allowance_settings;
 mod api;
 mod api_helpers;
 mod commander;
@@ -597,6 +598,7 @@ impl App {
             pane_header: config.ui.pane_header,
             usage_config: config.ui.usage.clone(),
             allowance_guard: crate::allowance_guard::Guard::new(config.allowance_guard.clone()),
+            allowance_settings: None,
             usage_snapshot: None,
             board: crate::board::BoardSnapshot::default(),
             tasks: crate::tasks::TasksSnapshot::default(),

@@ -54,7 +54,12 @@ fn sound_row_action(state: &mut AppState, idx: usize) -> Option<SettingsAction> 
 #[derive(Debug, Clone, PartialEq, Eq)]
 // The shared `Save` verb is semantic: these actions persist settings.
 #[allow(clippy::enum_variant_names)]
-pub(super) enum SettingsAction {
+pub(crate) enum SettingsAction {
+    SaveAllowance(
+        crate::usage::Provider,
+        crate::allowance_guard::ProviderLimits,
+        Vec<(String, bool)>,
+    ),
     SaveTheme(String),
     SaveSound(bool),
     SaveDoneSound(DoneSoundChoice),
@@ -149,6 +154,9 @@ impl App {
         let previous_section = self.state.settings.section;
         if let Some(action) = update_settings_state(&mut self.state, key) {
             match action {
+                SettingsAction::SaveAllowance(p, policy, benches) => {
+                    self.save_allowance(p, policy, benches)
+                }
                 SettingsAction::SaveTheme(name) => self.save_theme(&name),
                 SettingsAction::SaveSound(enabled) => self.save_sound(enabled),
                 SettingsAction::SaveDoneSound(choice) => self.save_done_sound(&choice),
@@ -276,6 +284,9 @@ fn apply_settings(state: &mut AppState) -> Option<SettingsAction> {
 }
 
 pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Option<SettingsAction> {
+    if state.allowance_settings.is_some() {
+        return state.allowance_key(key);
+    }
     match state.settings.section {
         SettingsSection::Theme => match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -686,6 +697,9 @@ impl AppState {
     }
 
     pub(super) fn handle_settings_mouse(&mut self, mouse: MouseEvent) -> Option<SettingsAction> {
+        if self.allowance_settings.is_some() {
+            return self.allowance_mouse(mouse);
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.settings.section == SettingsSection::Experiments {

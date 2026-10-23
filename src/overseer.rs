@@ -264,9 +264,7 @@ impl Service {
         Self {
             config: config.overseer.clone(),
             tasks_path: crate::tasks::configured_path(config.tasks_file.as_deref()),
-            queue_path: std::env::var_os("TEAM_QUEUE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| expand_path("~/model-bench-runs/team/queue.tsv")),
+            queue_path: team_queue_path(),
             situation_path: {
                 let root = crate::config::state_dir();
                 crate::session::active_name()
@@ -560,6 +558,12 @@ pub fn transition(
     } else {
         None
     }
+}
+
+pub(crate) fn team_queue_path() -> PathBuf {
+    std::env::var_os("TEAM_QUEUE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| expand_path("~/model-bench-runs/team/queue.tsv"))
 }
 
 #[cfg(test)]

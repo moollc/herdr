@@ -6,20 +6,20 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::terminal::TerminalId;
 use crate::usage::{Provider, ProviderUsage, UsageProblem, WindowKind};
 
 /// A provider re-arms once its allowance is back above this.
+#[cfg(test)]
 const REARM_ABOVE_PCT: u8 = 50;
 
 /// Cached percentages cannot authorize a note or interrupt indefinitely.
 pub(crate) const MAX_READING_AGE_SECS: u64 = 15 * 60;
 
 /// `[allowance_guard]`. Percentages are what is left of the five hour window.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuardConfig {
     /// At or below this, every working pane on the provider gets one wind down note.
     pub wind_down_pct: u8,
@@ -32,6 +32,9 @@ pub struct GuardConfig {
     pub codex: bool,
     /// Off by default: the Cursor Auto pool is run to zero on purpose.
     pub cursor: bool,
+    /// Provider overrides. Legacy scalar fields remain accepted.
+    pub providers: HashMap<Provider, ProviderLimits>,
+    legacy_thresholds: bool,
 }
 
 impl Default for GuardConfig {
@@ -44,18 +47,192 @@ impl Default for GuardConfig {
             claude: true,
             codex: true,
             cursor: false,
+            providers: HashMap::new(),
+            legacy_thresholds: false,
         }
     }
 }
 
+// Remember explicit legacy scalars, including 15, so old configurations retain their limits.
+impl<'de> Deserialize<'de> for GuardConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct Stored {
+            wind_down_pct: Option<u8>,
+            stop_pct: Option<u8>,
+            fast_drop_points: Option<u8>,
+            fast_window_minutes: Option<u64>,
+            claude: Option<bool>,
+            codex: Option<bool>,
+            cursor: Option<bool>,
+            providers: HashMap<Provider, ProviderLimits>,
+        }
+        let stored = Stored::deserialize(deserializer)?;
+        let mut result = Self {
+            legacy_thresholds: stored.wind_down_pct.is_some()
+                || stored.stop_pct.is_some()
+                || stored.fast_drop_points.is_some()
+                || stored.fast_window_minutes.is_some(),
+            ..Self::default()
+        };
+        if let Some(v) = stored.wind_down_pct {
+            result.wind_down_pct = v;
+        }
+        if let Some(v) = stored.stop_pct {
+            result.stop_pct = v;
+        }
+        if let Some(v) = stored.fast_drop_points {
+            result.fast_drop_points = v;
+        }
+        if let Some(v) = stored.fast_window_minutes {
+            result.fast_window_minutes = v;
+        }
+        if let Some(v) = stored.claude {
+            result.claude = v;
+        }
+        if let Some(v) = stored.codex {
+            result.codex = v;
+        }
+        if let Some(v) = stored.cursor {
+            result.cursor = v;
+        }
+        result.providers = stored.providers;
+        Ok(result)
+    }
+}
+
+/// Separate limits for a short window and a long window (Cursor Auto/Named).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowLimits {
+    pub wind_down_pct: u8,
+    pub stop_pct: u8,
+    pub overseer_pct: u8,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderLimits {
+    pub enabled: bool,
+    pub short: WindowLimits,
+    pub long: WindowLimits,
+    pub fast_drop_points: u8,
+    pub fast_window_minutes: u64,
+}
+impl ProviderLimits {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        for w in [&self.short, &self.long] {
+            if w.wind_down_pct > 100 || w.stop_pct >= w.wind_down_pct {
+                return Err("Stop at must be below Wind-down at (0–100).");
+            }
+            if w.overseer_pct > w.wind_down_pct || w.overseer_pct <= w.stop_pct {
+                return Err(
+                    "Overseer reserve must be above Stop at and no higher than Wind-down at.",
+                );
+            }
+        }
+        if self.fast_drop_points == 0
+            || self.fast_drop_points > 100
+            || self.fast_window_minutes == 0
+            || self.fast_window_minutes > 1440
+        {
+            return Err("Fast fall needs 1–100 points and 1–1440 minutes.");
+        }
+        Ok(())
+    }
+    pub fn window(&self, kind: WindowKind) -> &WindowLimits {
+        match kind {
+            WindowKind::Weekly | WindowKind::Monthly | WindowKind::Named => &self.long,
+            _ => &self.short,
+        }
+    }
+}
 impl GuardConfig {
-    pub fn watches(&self, provider: Provider) -> bool {
-        match provider {
+    pub fn effective(&self, provider: Provider) -> ProviderLimits {
+        let wind =
+            if provider == Provider::Codex && self.wind_down_pct == 15 && !self.legacy_thresholds {
+                5
+            } else {
+                self.wind_down_pct
+            };
+        let short = WindowLimits {
+            wind_down_pct: wind,
+            stop_pct: self.stop_pct,
+            overseer_pct: wind.saturating_sub(1).max(self.stop_pct.saturating_add(1)),
+        };
+        let long = WindowLimits {
+            wind_down_pct: self.wind_down_pct,
+            stop_pct: self.stop_pct,
+            overseer_pct: 8
+                .min(self.wind_down_pct.saturating_sub(1))
+                .max(self.stop_pct.saturating_add(1)),
+        };
+        let enabled = match provider {
             Provider::Claude => self.claude,
             Provider::Codex => self.codex,
             Provider::Cursor => self.cursor,
-        }
+        };
+        let defaults = ProviderLimits {
+            enabled,
+            short,
+            long,
+            fast_drop_points: self.fast_drop_points,
+            fast_window_minutes: self.fast_window_minutes,
+        };
+        self.providers
+            .get(&provider)
+            .filter(|p| p.validate().is_ok())
+            .cloned()
+            .map(|mut p| {
+                p.enabled &= enabled;
+                p
+            })
+            .unwrap_or(defaults)
     }
+    pub fn watches(&self, provider: Provider) -> bool {
+        self.effective(provider).enabled
+    }
+    pub fn policy(&self) -> HashMap<Provider, ProviderLimits> {
+        [Provider::Claude, Provider::Codex, Provider::Cursor]
+            .into_iter()
+            .map(|p| (p, self.effective(p)))
+            .collect()
+    }
+}
+
+/// Known observation for one window; an elapsed reset is an explicit estimate.
+/// Observation timestamps are preserved so fresh data always replaces the estimate.
+pub fn window_reading(
+    usage: &ProviderUsage,
+    w: &crate::usage::UsageWindow,
+    now: u64,
+    working: bool,
+) -> Option<u8> {
+    if matches!(
+        usage.problem,
+        Some(
+            UsageProblem::NoLogin
+                | UsageProblem::LoginExpired
+                | UsageProblem::FormatChanged
+                | UsageProblem::NoData
+        )
+    ) {
+        return None;
+    }
+    let seen = usage.seen_at?;
+    if seen > now {
+        return None;
+    }
+    if w.resets_at.is_some_and(|at| at <= now && seen <= at) && w.left_pct.is_some() {
+        return Some(100);
+    }
+    if (!working && now.saturating_sub(seen) > MAX_READING_AGE_SECS)
+        || w.reset
+        || (w.kind == WindowKind::FiveHour
+            && w.resets_at
+                .is_some_and(|at| seen < at.saturating_sub(5 * 3600)))
+    {
+        return None;
+    }
+    w.left_pct.map(|p| p.min(100))
 }
 
 /// What a new reading asks the app to do.
@@ -77,6 +254,9 @@ pub enum Event {
 struct Phase {
     fast: bool,
     stopped: bool,
+    kind: Option<WindowKind>,
+    reset: Option<u64>,
+    pct: u8,
     /// Panes already given the note, and panes already interrupted, this window.
     noted: HashSet<TerminalId>,
     interrupted: HashSet<TerminalId>,
@@ -85,9 +265,13 @@ struct Phase {
 #[derive(Debug, Default)]
 pub struct Guard {
     pub config: GuardConfig,
+    #[cfg(test)]
     history: HashMap<Provider, VecDeque<(u64, u8)>>,
+    #[cfg(test)]
     last: HashMap<Provider, u8>,
     phases: HashMap<Provider, Phase>,
+    reserves: HashMap<Provider, Phase>,
+    window_history: HashMap<(Provider, WindowKind), VecDeque<(u64, u8)>>,
 }
 
 impl Guard {
@@ -98,34 +282,201 @@ impl Guard {
         }
     }
 
+    /// Evaluate both windows and both roles. Each window has its own fast-fall history.
+    pub fn observe_usage(&mut self, usage: &ProviderUsage, now: u64, working: bool) -> Vec<Event> {
+        let provider = usage.provider;
+        let policy = self.config.effective(provider);
+        if !policy.enabled {
+            self.phases.remove(&provider);
+            self.reserves.remove(&provider);
+            self.window_history.retain(|(p, _), _| *p != provider);
+            return Vec::new();
+        }
+        let mut readings = Vec::new();
+        for w in &usage.windows {
+            let Some(pct) = window_reading(usage, w, now, working) else {
+                continue;
+            };
+            let h = self.window_history.entry((provider, w.kind)).or_default();
+            if w.resets_at.is_some_and(|at| at <= now) || h.back().is_some_and(|(_, p)| pct > *p) {
+                h.clear();
+            }
+            let seen = usage.seen_at.unwrap_or(now);
+            if h.back().is_none_or(|(at, _)| seen > *at) {
+                h.push_back((seen, pct));
+            }
+            while h.len() > 64
+                || h.front().is_some_and(|(at, _)| {
+                    now.saturating_sub(*at) > policy.fast_window_minutes.saturating_mul(60)
+                })
+            {
+                h.pop_front();
+            }
+            let fast = h
+                .iter()
+                .map(|(_, p)| *p)
+                .max()
+                .unwrap_or(pct)
+                .saturating_sub(pct)
+                >= policy.fast_drop_points;
+            readings.push((w, pct, fast));
+        }
+        let mut events = Vec::new();
+        for overseer in [false, true] {
+            let phases = if overseer {
+                &mut self.reserves
+            } else {
+                &mut self.phases
+            };
+            // A missing reading suspends action. It does not invent recovery.
+            if readings.is_empty() {
+                continue;
+            }
+            if phases.get(&provider).is_some_and(|phase| {
+                readings.iter().any(|(w, pct, _)| {
+                    Some(w.kind) == phase.kind
+                        && ((*pct > 50 && *pct > phase.pct)
+                            || phase.reset.is_some_and(|at| at <= now)
+                            || w.resets_at.is_some_and(|at| at <= now))
+                })
+            }) {
+                phases.remove(&provider);
+            }
+            let trigger = readings
+                .iter()
+                .filter(|(w, pct, fast)| {
+                    let limits = policy.window(w.kind);
+                    *pct <= if overseer {
+                        limits.overseer_pct
+                    } else {
+                        limits.wind_down_pct
+                    } || (!overseer && *fast)
+                })
+                .min_by_key(|(w, pct, _)| {
+                    i16::from(*pct)
+                        - i16::from(if overseer {
+                            policy.window(w.kind).overseer_pct
+                        } else {
+                            policy.window(w.kind).wind_down_pct
+                        })
+                });
+            if let Some((w, pct, fast)) = trigger {
+                let fresh = !phases.contains_key(&provider);
+                let phase = phases.entry(provider).or_default();
+                phase.kind = Some(w.kind);
+                phase.reset = w.resets_at;
+                phase.pct = *pct;
+                phase.fast = *fast;
+                if fresh && !overseer {
+                    events.push(Event::WindDown {
+                        provider,
+                        pct: *pct,
+                        fast: *fast,
+                    });
+                }
+                if *pct <= policy.window(w.kind).stop_pct && !phase.stopped {
+                    phase.stopped = true;
+                    if !overseer {
+                        events.push(Event::Stop {
+                            provider,
+                            pct: *pct,
+                        });
+                    }
+                }
+            }
+        }
+        events
+    }
+    pub fn policy_kind(&self, provider: Provider) -> WindowKind {
+        self.phases
+            .get(&provider)
+            .and_then(|p| p.kind)
+            .unwrap_or(WindowKind::FiveHour)
+    }
+    pub fn pane_action(
+        &self,
+        provider: Provider,
+        overseer: bool,
+        pane: &TerminalId,
+        usage: &ProviderUsage,
+        context: (u64, bool),
+    ) -> Option<(WindowKind, u8, bool, bool, bool)> {
+        if !self.config.watches(provider) {
+            return None;
+        }
+        let phase = if overseer {
+            self.reserves.get(&provider)
+        } else {
+            self.phases.get(&provider)
+        }?;
+        let kind = phase.kind?;
+        let window = usage.windows.iter().find(|w| w.kind == kind)?;
+        let (now, working) = context;
+        let pct = window_reading(usage, window, now, working)?;
+        if window.resets_at.is_some_and(|at| at <= now) {
+            return None;
+        }
+        Some((
+            kind,
+            pct,
+            phase.fast,
+            !phase.noted.contains(pane),
+            phase.stopped && !phase.interrupted.contains(pane),
+        ))
+    }
+    pub fn mark_policy_action(
+        &mut self,
+        provider: Provider,
+        overseer: bool,
+        pane: &TerminalId,
+        interrupted: bool,
+    ) {
+        let phase = if overseer {
+            self.reserves.get_mut(&provider)
+        } else {
+            self.phases.get_mut(&provider)
+        };
+        if let Some(phase) = phase {
+            if interrupted {
+                phase.interrupted.insert(pane.clone());
+            } else {
+                phase.noted.insert(pane.clone());
+            }
+        }
+    }
+
     /// True while the guard is active on the provider, for the usage bar mark.
     pub fn active(&self, provider: Provider) -> bool {
         self.phases.contains_key(&provider)
     }
 
     pub fn any_active(&self) -> bool {
-        !self.phases.is_empty()
+        !self.phases.is_empty() || !self.reserves.is_empty()
     }
 
     /// True once per pane and window: the pane has not had the note yet.
+    #[cfg(test)]
     pub fn needs_note(&self, provider: Provider, pane: &TerminalId) -> bool {
         self.phases
             .get(&provider)
             .is_some_and(|p| !p.noted.contains(pane))
     }
 
+    #[cfg(test)]
     pub fn mark_noted(&mut self, provider: Provider, pane: &TerminalId) {
         if let Some(phase) = self.phases.get_mut(&provider) {
             phase.noted.insert(pane.clone());
         }
     }
 
+    #[cfg(test)]
     pub fn needs_interrupt(&self, provider: Provider, pane: &TerminalId) -> bool {
         self.phases
             .get(&provider)
             .is_some_and(|p| p.stopped && !p.interrupted.contains(pane))
     }
 
+    #[cfg(test)]
     pub fn mark_interrupted(&mut self, provider: Provider, pane: &TerminalId) {
         if let Some(phase) = self.phases.get_mut(&provider) {
             phase.interrupted.insert(pane.clone());
@@ -134,25 +485,22 @@ impl Guard {
 
     /// Forgets panes that have gone, so the sets do not grow.
     pub fn retain_panes(&mut self, live: impl Fn(&TerminalId) -> bool) {
-        for phase in self.phases.values_mut() {
+        for phase in self.phases.values_mut().chain(self.reserves.values_mut()) {
             phase.noted.retain(|id| live(id));
             phase.interrupted.retain(|id| live(id));
         }
     }
 
     /// The percent the provider was last seen at.
+    #[cfg(test)]
     pub fn last_pct(&self, provider: Provider) -> Option<u8> {
         self.last.get(&provider).copied()
-    }
-
-    /// True when the guard was set off by a fast fall rather than the line.
-    pub fn fast(&self, provider: Provider) -> bool {
-        self.phases.get(&provider).is_some_and(|p| p.fast)
     }
 
     /// A provider whose reading cannot be used (no login, stale, switched off)
     /// takes no new action. An active phase stays until the allowance is seen
     /// back above 50%, so a missing reading never re-arms it by accident.
+    #[cfg(test)]
     pub fn observe(&mut self, provider: Provider, pct: u8, now: u64) -> Vec<Event> {
         if !self.config.watches(provider) {
             self.phases.remove(&provider);
@@ -209,6 +557,7 @@ impl Guard {
 /// its reset is unknown until a new reading arrives. Claude and Codex use the five hour window; Cursor uses
 /// the pool with less left. Age beyond fifteen minutes is unknown only while no
 /// session on that provider is working; reset and invalid-source checks always apply.
+#[cfg(test)]
 pub fn reading(usage: &ProviderUsage, now: u64, provider_working: bool) -> Option<u8> {
     if matches!(
         usage.problem,
@@ -245,6 +594,13 @@ pub fn reading(usage: &ProviderUsage, now: u64, provider_working: bool) -> Optio
             w.left_pct.map(|p| p.min(100))
         })
         .min()
+}
+
+/// The bench file lives beside the dispatcher's single queue file.
+pub fn benched_path() -> std::path::PathBuf {
+    std::env::var_os("TEAM_BENCHED")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| crate::overseer::team_queue_path().with_file_name("BENCHED"))
 }
 
 #[cfg(test)]
@@ -550,5 +906,124 @@ mod tests {
         );
         u.windows[0].reset = true;
         assert_eq!(reading(&u, now, false), None);
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use crate::usage::UsageWindow;
+    fn usage(short: u8, long: u8, now: u64) -> ProviderUsage {
+        ProviderUsage {
+            provider: Provider::Codex,
+            seen_at: Some(now),
+            source: "fixture".into(),
+            problem: None,
+            windows: vec![
+                UsageWindow {
+                    kind: WindowKind::FiveHour,
+                    left_pct: Some(short),
+                    resets_at: Some(now + 3600),
+                    note: None,
+                    reset: false,
+                },
+                UsageWindow {
+                    kind: WindowKind::Weekly,
+                    left_pct: Some(long),
+                    resets_at: Some(now + 86400),
+                    note: None,
+                    reset: false,
+                },
+            ],
+        }
+    }
+    #[test]
+    fn provider_defaults_legacy_values_and_restart_roundtrip() {
+        let c = GuardConfig::default();
+        assert_eq!(c.effective(Provider::Codex).short.wind_down_pct, 5);
+        assert_eq!(c.effective(Provider::Claude).short.wind_down_pct, 15);
+        let legacy: GuardConfig = toml::from_str("wind_down_pct=15").unwrap();
+        assert_eq!(legacy.effective(Provider::Codex).short.wind_down_pct, 15);
+        assert!(!c.effective(Provider::Cursor).enabled);
+        let mut config: crate::config::Config =
+            toml::from_str("[allowance_guard]\nwind_down_pct=20\ncodex=false\n").unwrap();
+        assert_eq!(
+            config
+                .allowance_guard
+                .effective(Provider::Codex)
+                .short
+                .wind_down_pct,
+            20
+        );
+        let mut p = c.effective(Provider::Codex);
+        p.short.wind_down_pct = 5;
+        config
+            .allowance_guard
+            .providers
+            .insert(Provider::Codex, p.clone());
+        let encoded = toml::to_string(&p).unwrap();
+        let restarted: ProviderLimits = toml::from_str(&encoded).unwrap();
+        assert_eq!(restarted, p);
+        let mut g = Guard::new(c);
+        assert!(g.observe_usage(&usage(15, 90, 100), 100, true).is_empty());
+        assert!(matches!(
+            g.observe_usage(&usage(5, 90, 200), 200, true).first(),
+            Some(Event::WindDown { pct: 5, .. })
+        ));
+    }
+    #[test]
+    fn weekly_team_floor_keeps_overseer_reserve_and_stop_below_winddown() {
+        let mut g = Guard::default();
+        let mut policy = g.config.effective(Provider::Codex);
+        policy.long.wind_down_pct = 17;
+        policy.long.overseer_pct = 8;
+        g.config.providers.insert(Provider::Codex, policy.clone());
+        let pane = TerminalId::alloc();
+        let u = usage(90, 17, 100);
+        assert!(!g.observe_usage(&u, 100, true).is_empty());
+        assert!(g
+            .pane_action(Provider::Codex, false, &pane, &u, (100, true))
+            .is_some());
+        assert!(g
+            .pane_action(Provider::Codex, true, &pane, &u, (100, true))
+            .is_none());
+        let u = usage(90, 8, 200);
+        g.observe_usage(&u, 200, true);
+        assert!(g
+            .pane_action(Provider::Codex, true, &pane, &u, (200, true))
+            .is_some());
+        policy.short.stop_pct = policy.short.wind_down_pct;
+        assert!(policy.validate().is_err());
+        policy.short.stop_pct = policy.short.wind_down_pct + 1;
+        assert!(policy.validate().is_err());
+    }
+    #[test]
+    fn expired_low_is_estimated_full_rearms_and_real_low_replaces_it() {
+        let mut g = Guard::default();
+        let mut u = usage(3, 90, 100);
+        g.observe_usage(&u, 100, true);
+        assert!(g.active(Provider::Codex));
+        u.windows[0].resets_at = Some(200);
+        assert_eq!(window_reading(&u, &u.windows[0], 300, false), Some(100));
+        g.observe_usage(&u, 300, false);
+        assert!(!g.active(Provider::Codex));
+        let fresh = usage(3, 90, 400);
+        assert!(!g.observe_usage(&fresh, 400, true).is_empty());
+        assert!(g.active(Provider::Codex));
+    }
+    #[test]
+    fn independent_window_fast_history_does_not_invent_a_drop() {
+        let mut g = Guard::default();
+        g.observe_usage(&usage(99, 20, 100), 100, true);
+        assert!(g.observe_usage(&usage(98, 19, 200), 200, true).is_empty());
+        let mut u = usage(60, 90, 300);
+        g.observe_usage(&u, 300, true);
+        let pane = TerminalId::alloc();
+        assert!(g
+            .pane_action(Provider::Codex, false, &pane, &u, (300, true))
+            .is_some());
+        u.seen_at = Some(301);
+        g.observe_usage(&u, 301, true);
+        assert!(g.active(Provider::Codex));
     }
 }

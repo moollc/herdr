@@ -16,6 +16,7 @@ mod metadata;
 pub use metadata::{AgentMetadata, AgentMetadataReport, EffectivePresentation};
 
 const CLAUDE_WORKING_HOLD: Duration = Duration::from_millis(1200);
+const NATIVE_IDLE_RECOVERY_GRACE: Duration = Duration::from_secs(15);
 const STALE_HOOK_IDLE_GRACE: Duration = Duration::from_secs(2);
 
 fn summary_text_is_usable(text: &str) -> bool {
@@ -68,6 +69,7 @@ pub struct TerminalState {
     fallback_visible_working: bool,
     fallback_observed_at: Option<Instant>,
     stale_hook_idle_since: Option<Instant>,
+    native_idle_since: Option<Instant>,
     pub hook_authority: Option<HookAuthority>,
     pub turn_reporting: Option<crate::turn_reporting::Reporting>,
     pub job_marker: Option<PathBuf>,
@@ -144,6 +146,7 @@ impl TerminalState {
             fallback_visible_working: false,
             fallback_observed_at: None,
             stale_hook_idle_since: None,
+            native_idle_since: None,
             hook_authority: None,
             turn_reporting: None,
             job_marker: None,
@@ -329,10 +332,24 @@ impl TerminalState {
         if process_exited || (previous_detected_agent.is_some() && agent != previous_detected_agent)
         {
             self.turn_reporting = None;
+            self.native_idle_since = None;
         } else if let Some(report) = &mut self.turn_reporting {
-            // A stale spinner after Stop must not start another turn. Observe
-            // the ready prompt first. Once working, only a report can end it.
-            if visible_idle {
+            // Only sustained positive idle evidence recovers a missing end hook.
+            // Ambiguous repaints, blockers and working chrome cancel the window.
+            let ready = visible_idle
+                && !visible_working
+                && !visible_blocker
+                && fallback_state == AgentState::Idle;
+            if ready && report.working {
+                let since = self.native_idle_since.get_or_insert(now);
+                if now.saturating_duration_since(*since) >= NATIVE_IDLE_RECOVERY_GRACE {
+                    report.working = false;
+                    self.native_idle_since = None;
+                }
+            } else {
+                self.native_idle_since = None;
+            }
+            if ready {
                 report.saw_idle = true;
             }
             if visible_working && report.saw_idle {
@@ -474,6 +491,19 @@ impl TerminalState {
         let previous_session = self.current_session_identity_for_persistence();
         if self.known_agent_label_conflicts_with_detected_agent(&agent_label) {
             return None;
+        }
+        // An accepted explicit state report must also update native turn authority.
+        // Per-source sequence rejection above still protects against replay.
+        if state == AgentState::Idle {
+            if let Some(report) = &mut self.turn_reporting {
+                if crate::detect::parse_agent_label(&report.agent)
+                    == crate::detect::parse_agent_label(&agent_label)
+                {
+                    report.working = false;
+                    report.saw_idle = false;
+                    self.native_idle_since = None;
+                }
+            }
         }
         self.persisted_agent_session = None;
         self.hook_authority = Some(HookAuthority {
@@ -820,6 +850,7 @@ impl TerminalState {
             return None;
         }
         report.seq = seq;
+        self.native_idle_since = None;
         use crate::turn_reporting::TurnEvent;
         match event {
             TurnEvent::Ready => { /* SessionStart never cancels an active turn. */ }

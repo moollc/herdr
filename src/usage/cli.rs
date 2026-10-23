@@ -44,7 +44,14 @@ fn run_readings(
     let snapshot =
         state.refresh_with_sources_and_publish(&want, now, fetch, false, command, |_| {});
     if json {
-        writeln!(output, "{}", serde_json::to_string_pretty(&snapshot)?)
+        let mut value = serde_json::to_value(&snapshot)?;
+        value["allowance_policy"] = serde_json::to_value(
+            crate::config::Config::load()
+                .config
+                .allowance_guard
+                .policy(),
+        )?;
+        writeln!(output, "{}", serde_json::to_string_pretty(&value)?)
     } else {
         write_plain(&snapshot, now, output)
     }
@@ -56,7 +63,15 @@ pub(super) fn write_plain(
 ) -> io::Result<()> {
     for p in &snapshot.providers {
         for w in &p.windows {
-            let left = w.left_pct.map_or("?".into(), |n| format!("{n}%"));
+            let estimated = w
+                .resets_at
+                .is_some_and(|at| at <= now && p.seen_at.is_some_and(|seen| seen <= at))
+                && w.left_pct.is_some();
+            let left = if estimated {
+                "100% (estimated after reset)".into()
+            } else {
+                w.left_pct.map_or("?".into(), |n| format!("{n}%"))
+            };
             let reset = w
                 .resets_at
                 .map_or("?".into(), |t| local_time(t, c"%Y-%m-%d %H:%M:%S %Z"));

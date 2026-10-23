@@ -84,6 +84,16 @@ impl AppState {
             return None;
         }
 
+        if matches!(self.mode, Mode::Terminal | Mode::Navigate)
+            && mouse.kind == MouseEventKind::Down(MouseButton::Right)
+        {
+            if let Some(provider) = crate::ui::usage_bar::provider_at(self, mouse.column, mouse.row)
+            {
+                self.open_allowance_settings(provider);
+                return None;
+            }
+        }
+
         if self.mode == Mode::Settings {
             return self.handle_settings_mouse(mouse);
         }
@@ -1757,7 +1767,7 @@ impl AppState {
             .map(|card| card.ws_idx)
     }
 
-    pub(super) fn screen_rect(&self) -> Rect {
+    pub(crate) fn screen_rect(&self) -> Rect {
         let table = self.view.agent_table.area;
         let composer = self.view.composer.area;
         let terminal = self.view.terminal_area;
