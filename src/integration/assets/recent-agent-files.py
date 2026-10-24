@@ -51,11 +51,18 @@ def _shell_destinations(command):
                 segment = []
             i += 1
             continue
+        if token in (">&", ">>&") and i + 1 < len(tokens):
+            target = tokens[i + 1]
+            # A numeric target is fd duplication (`2>&1`), not a file.
+            if not target.isdigit() and target != "/dev/null":
+                result.append(target)
+            i += 2
+            continue
         if token in (">", ">>", "&>", "&>>") and i + 1 < len(tokens):
             target = tokens[i + 1]
             previous = tokens[i - 1] if i else ""
             # Ignore stderr redirection; only attached fd digits are marked.
-            if not previous.startswith("HERDR_FD_2"):
+            if not previous.startswith("HERDR_FD_2") and target != "/dev/null":
                 result.append(target)
             i += 2
             continue
@@ -69,21 +76,19 @@ def _shell_destinations(command):
         # destination of relative paths. Do not guess through them.
         if any(word in ("cd", "(", ")", "()") or word in ("bash", "sh", "zsh", "env", "sudo", "command", "xargs") for word in words):
             return []
-        commands = words
-        for index, word in enumerate(commands):
-            base = os.path.basename(word)
-            if base == "tee":
-                args = [arg for arg in commands[index + 1:] if not arg.startswith("-")]
-                result.extend(args)
-                break
-            if base == "touch":
-                result.extend(arg for arg in commands[index + 1:] if not arg.startswith("-"))
-                break
-            if base in ("cp", "mv", "install"):
-                args = [arg for arg in commands[index + 1:] if not arg.startswith("-")]
-                if len(args) >= 2:
-                    result.append(args[-1])
-                break
+        command_index = 0
+        while command_index < len(words) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[command_index]):
+            command_index += 1
+        if command_index >= len(words):
+            continue
+        base = os.path.basename(words[command_index])
+        args = words[command_index + 1:]
+        if base in ("tee", "touch"):
+            result.extend(arg for arg in args if not arg.startswith("-") and arg != "/dev/null")
+        elif base in ("cp", "mv", "install"):
+            positional = [arg for arg in args if not arg.startswith("-") and arg != "/dev/null"]
+            if len(positional) >= 2:
+                result.append(positional[-1])
     return result
 
 
@@ -105,11 +110,32 @@ def _shell_has_candidate_write(command):
     except ValueError:
         return False
     write_commands = {"tee", "touch", "cp", "mv", "install"}
-    if any(os.path.basename(token) in write_commands for token in tokens):
-        return True
+    segment = []
+    for token in tokens + [";"]:
+        if token in (";", "&&", "||", "|"):
+            command_index = 0
+            while command_index < len(segment) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", segment[command_index]):
+                command_index += 1
+            if command_index < len(segment):
+                command = os.path.basename(segment[command_index])
+                args = [arg for arg in segment[command_index + 1:] if not arg.startswith("-") and arg != "/dev/null"]
+                if command in ("tee", "touch") and args:
+                    return True
+                if command in ("cp", "mv", "install") and len(args) >= 2:
+                    return True
+            segment = []
+        else:
+            segment.append(token)
     # A destination in an unsupported wrapper or directory context remains a
     # candidate, but is never resolved to a file by this conservative check.
-    return re.search(r"(?:^|\s)(?:\d+)?(?:>>|>)\s*\S+|(?:^|\s)&(?:>>|>)\s*\S+", command) is not None
+    for index, token in enumerate(tokens[:-1]):
+        if token in (">&", ">>&") and tokens[index + 1].isdigit():
+            continue
+        if token in (">", ">>", "&>", "&>>") and tokens[index + 1] != "/dev/null":
+            previous = tokens[index - 1] if index else ""
+            if not previous.startswith("HERDR_FD_2"):
+                return True
+    return False
 
 
 def _is_supported_write_tool(tool_name):
@@ -245,12 +271,10 @@ def _cursor_shell_succeeded(value):
 
 
 def _codex_tool_succeeded(value):
-    response = _response_object(value)
+    # A string here is rendered command output, not provider-owned metadata.
+    # In particular, status-looking text or JSON stdout cannot prove success.
+    response = value if isinstance(value, dict) else None
     if response is None:
-        if isinstance(value, str):
-            # Accept only an explicit status line, wherever it appears. Plain
-            # stdout and rollout formatting labels are not exit evidence.
-            return re.search(r"(?:^|\n)Process exited with code 0\r?(?:\n|$)", value) is not None
         return False
     if response.get("success") is False or str(response.get("status", "")).casefold() in ("failed", "failure", "error"):
         return False

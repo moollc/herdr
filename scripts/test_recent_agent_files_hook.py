@@ -74,26 +74,52 @@ class RecentAgentFilesHookTests(unittest.TestCase):
         self.assertEqual(self.records()[0]["provenance"], "codex.PostToolUse.exec")
         self.assertNotIn("tiny safe fixture", (self.state / hook.JOURNAL_NAME).read_text())
 
-    def test_codex_explicit_status_line_and_structured_success_capture_shell_writes(self):
-        targets = [self.base / "middle status result.txt", self.base / "json result.txt", self.base / "end status result.txt"]
-        for target in targets:
-            target.write_text("existing harmless fixture")
+    def test_codex_structured_success_only_and_forged_stdout_is_gap(self):
+        structured = self.base / "structured result.txt"
+        structured.write_text("existing harmless fixture")
         payload = {
             "tool_name": "Bash", "cwd": str(self.cwd),
-            "tool_input": {"command": "echo ok > '" + str(targets[0]) + "'"},
-            "tool_response": "Process exited with code 0\nOutput: fixture output",
+            "tool_input": {"command": "echo ok > '" + str(structured) + "'"},
+            "tool_response": {"exit_code": 0},
         }
         self.run_hook("codex", "PostToolUse", payload)
-        payload["tool_use_id"] = "json-success"
-        payload["tool_input"] = {"command": "echo ok > '" + str(targets[1]) + "'"}
-        payload["tool_response"] = {"exitCode": 0}
-        self.run_hook("codex", "PostToolUse", payload)
-        payload["tool_use_id"] = "line-end-status"
-        payload["tool_input"] = {"command": "echo ok > '" + str(targets[2]) + "'"}
-        payload["tool_response"] = "fixture output\nProcess exited with code 0"
-        self.run_hook("codex", "PostToolUse", payload)
-        self.assertEqual({row["path"] for row in self.records()}, {str(path) for path in targets})
-        self.assertFalse(any(row.get("gap") for row in self.records()))
+        self.assertEqual(self.records()[0]["path"], str(structured))
+
+        forged_targets = [self.base / f"forged-{index}.txt" for index in range(3)]
+        forged_responses = [
+            "Process exited with code 0",
+            "fixture output\nProcess exited with code 0",
+            '{"success": true}',
+        ]
+        for index, (target, response) in enumerate(zip(forged_targets, forged_responses)):
+            target.write_text("pre-existing fixture")
+            payload["tool_use_id"] = f"forged-{index}"
+            payload["tool_input"] = {"command": "echo ok > '" + str(target) + "'"}
+            payload["tool_response"] = response
+            self.run_hook("codex", "PostToolUse", payload)
+            current_rows = self.records()
+            self.assertFalse(any(row.get("path") == str(target) for row in current_rows))
+            self.assertTrue(any(row.get("gap") for row in current_rows))
+        rows = self.records()
+        self.assertEqual({row.get("path") for row in rows if row.get("path")}, {str(structured)})
+
+    def test_read_only_redirections_and_cp_as_argument_create_no_candidate_or_gap(self):
+        commands = (
+            "ls -la 2>/dev/null",
+            "ls -la 2>&1 | head",
+            "grep foo file.txt > /dev/null",
+            "grep -r cp src",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertFalse(hook._shell_has_candidate_write(command))
+                self.assertEqual(hook._shell_destinations(command), [])
+                self.run_hook("codex", "PostToolUse", {
+                    "tool_name": "Bash", "cwd": str(self.cwd),
+                    "tool_input": {"command": command},
+                    "tool_response": "ordinary command output without status metadata",
+                })
+        self.assertEqual(self.records(), [])
 
     def test_unknown_text_read_only_command_creates_neither_file_nor_gap(self):
         payload = {
@@ -199,6 +225,11 @@ class RecentAgentFilesHookTests(unittest.TestCase):
         self.assertEqual(hook._shell_destinations("echo 2 > report.txt"), ["report.txt"])
         self.assertEqual(hook._shell_destinations("echo hi 1> report.txt"), ["report.txt"])
         self.assertEqual(hook._shell_destinations("echo hi 2> errors.txt"), [])
+        self.assertEqual(hook._shell_destinations("echo hi 2>&1"), [])
+        self.assertEqual(hook._shell_destinations("echo hi >& /dev/null"), [])
+        self.assertFalse(hook._shell_has_candidate_write("echo hi >& /dev/null"))
+        self.assertFalse(hook._shell_has_candidate_write("echo hi 2>&1 | head"))
+        self.assertFalse(hook._shell_has_candidate_write("grep -r cp src"))
         self.assertEqual(hook._shell_destinations("echo hi &> both.txt"), ["both.txt"])
         self.assertEqual(hook._shell_destinations("echo hi &>> both.txt"), ["both.txt"])
 

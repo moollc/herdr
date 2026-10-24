@@ -42,6 +42,7 @@ pub(crate) struct RecentFilesWatcher {
     root: Option<PathBuf>,
     journal: PathBuf,
     stamp: Option<JournalStamp>,
+    next_gap_refresh: Option<Instant>,
     next_poll: Instant,
 }
 
@@ -55,6 +56,7 @@ impl RecentFilesWatcher {
             root: None,
             journal,
             stamp: None,
+            next_gap_refresh: None,
             next_poll: Instant::now(),
         }
     }
@@ -80,13 +82,15 @@ impl RecentFilesWatcher {
         root: Option<PathBuf>,
         snapshot: &mut RecentFilesSnapshot,
     ) -> bool {
+        let previous_snapshot = snapshot.clone();
         let mut changed = false;
         if root != self.root {
             self.root = root.clone();
             if root.is_none() {
                 *snapshot = RecentFilesSnapshot::default();
                 self.stamp = None;
-                return true;
+                self.next_gap_refresh = None;
+                return *snapshot != previous_snapshot;
             }
             snapshot.root = root.clone();
             snapshot.loading = true;
@@ -103,7 +107,10 @@ impl RecentFilesWatcher {
                 len: metadata.len(),
             })
         });
-        if current_stamp == self.stamp && !changed && !snapshot.truncated {
+        if current_stamp == self.stamp
+            && !changed
+            && self.next_gap_refresh.is_none_or(|deadline| now < deadline)
+        {
             return false;
         }
         self.stamp = current_stamp;
@@ -111,10 +118,13 @@ impl RecentFilesWatcher {
             .selected
             .and_then(|index| snapshot.files.get(index))
             .map(|file| file.path.clone());
-        let (files, truncated, error) = match read_journal_at(&self.journal, wall_now) {
-            Ok(result) => result,
-            Err(error) => (Vec::new(), true, Some(error)),
-        };
+        let (files, truncated, error, next_gap_expiry) =
+            match read_journal_details(&self.journal, wall_now) {
+                Ok(result) => result,
+                Err(error) => (Vec::new(), true, Some(error), None),
+            };
+        self.next_gap_refresh =
+            next_gap_expiry.map(|expiry| now + expiry.duration_since(wall_now).unwrap_or_default());
         snapshot.files = files;
         snapshot.truncated = truncated;
         snapshot.error = error;
@@ -132,7 +142,7 @@ impl RecentFilesWatcher {
         snapshot.scroll_offset = snapshot
             .scroll_offset
             .min(snapshot.files.len().saturating_sub(1));
-        changed = true;
+        changed = *snapshot != previous_snapshot;
         changed
     }
 }
@@ -145,10 +155,18 @@ fn read_journal_at(
     journal: &Path,
     wall_now: SystemTime,
 ) -> Result<(Vec<RecentFile>, bool, Option<String>), String> {
+    let (files, truncated, error, _) = read_journal_details(journal, wall_now)?;
+    Ok((files, truncated, error))
+}
+
+fn read_journal_details(
+    journal: &Path,
+    wall_now: SystemTime,
+) -> Result<(Vec<RecentFile>, bool, Option<String>, Option<SystemTime>), String> {
     let bytes = match fs::read(journal) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((Vec::new(), false, None));
+            return Ok((Vec::new(), false, None, None));
         }
         Err(_) => return Err("Agent file activity journal is unavailable".into()),
     };
@@ -159,6 +177,7 @@ fn read_journal_at(
     let journal_absolute = fs::canonicalize(journal).ok();
     let mut by_path: HashMap<PathBuf, RecentFile> = HashMap::new();
     let mut partial = false;
+    let mut next_gap_expiry: Option<SystemTime> = None;
     let mut record_count = 0;
     for line in bytes.split(|byte| *byte == b'\n') {
         if line.is_empty() {
@@ -181,7 +200,15 @@ fn read_journal_at(
             let age = wall_now
                 .duration_since(UNIX_EPOCH + Duration::from_nanos(time_ns))
                 .unwrap_or_default();
-            partial |= age <= GAP_MAX_AGE;
+            if age <= GAP_MAX_AGE {
+                partial = true;
+                let expiry = UNIX_EPOCH
+                    + Duration::from_nanos(time_ns)
+                    + GAP_MAX_AGE
+                    + Duration::from_secs(1);
+                next_gap_expiry =
+                    Some(next_gap_expiry.map_or(expiry, |current| current.min(expiry)));
+            }
             continue;
         }
         let Some(path) = record.get("path").and_then(serde_json::Value::as_str) else {
@@ -245,7 +272,7 @@ fn read_journal_at(
     let truncated = partial || files.len() > MAX_RESULTS;
     files.truncate(MAX_RESULTS);
     let error = partial.then(|| "Some agent file events were incomplete or unsupported".into());
-    Ok((files, truncated, error))
+    Ok((files, truncated, error, next_gap_expiry))
 }
 
 pub(crate) fn display_name(path: &Path, width: usize) -> String {
@@ -494,10 +521,21 @@ mod tests {
         ));
         assert!(snapshot.truncated);
         assert!(snapshot.error.is_some());
+        assert_eq!(
+            watcher.next_gap_refresh,
+            Some(monotonic_start + GAP_MAX_AGE + Duration::from_secs(1))
+        );
+
+        assert!(!watcher.poll_at(
+            monotonic_start + Duration::from_secs(1),
+            observed_at + Duration::from_secs(1),
+            Some(base.clone()),
+            &mut snapshot,
+        ));
 
         assert!(watcher.poll_at(
-            monotonic_start + Duration::from_secs(1),
-            observed_at + GAP_MAX_AGE + Duration::from_secs(1),
+            monotonic_start + GAP_MAX_AGE + Duration::from_secs(2),
+            observed_at + GAP_MAX_AGE + Duration::from_secs(2),
             Some(base),
             &mut snapshot,
         ));
@@ -510,6 +548,63 @@ mod tests {
                 .expect("journal modified time remains"),
             original_stamp,
         );
+    }
+
+    #[test]
+    fn non_gap_partial_does_not_refresh_an_unchanged_journal_each_poll() {
+        let base = fixture_dir("watcher-non-gap-partial");
+        let journal = base.join(JOURNAL_NAME);
+        fs::write(&journal, b"{bad json}\n").expect("malformed journal");
+        let mut watcher = RecentFilesWatcher::with_journal_path(journal);
+        let mut snapshot = RecentFilesSnapshot::default();
+        let monotonic_start = Instant::now();
+        let wall_start = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert!(watcher.poll_at(
+            monotonic_start,
+            wall_start,
+            Some(base.clone()),
+            &mut snapshot
+        ));
+        assert!(snapshot.truncated);
+        assert_eq!(watcher.next_gap_refresh, None);
+
+        let previous = snapshot.clone();
+        assert!(!watcher.poll_at(
+            monotonic_start + Duration::from_secs(1),
+            wall_start + Duration::from_secs(1),
+            Some(base),
+            &mut snapshot,
+        ));
+        assert_eq!(snapshot, previous);
+    }
+
+    #[test]
+    fn unchanged_snapshot_does_not_emit_changed_when_journal_stamp_changes() {
+        let base = fixture_dir("watcher-equal-snapshot");
+        let journal = base.join(JOURNAL_NAME);
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let gap = serde_json::json!({
+            "gap": "unverified or failed write event",
+            "time_ns": now.duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64,
+            "agent": "codex",
+            "provenance": "codex.PostToolUse.Bash.unverified",
+            "event_id": "gap:snapshot-equal",
+        });
+        fs::write(&journal, gap.to_string()).expect("journal");
+        let mut watcher = RecentFilesWatcher::with_journal_path(journal.clone());
+        let mut snapshot = RecentFilesSnapshot::default();
+        let monotonic_start = Instant::now();
+        assert!(watcher.poll_at(monotonic_start, now, Some(base.clone()), &mut snapshot));
+        let previous = snapshot.clone();
+        fs::write(&journal, format!("{}\n", gap))
+            .expect("change journal stamp without changing records");
+        assert!(!watcher.poll_at(
+            monotonic_start + Duration::from_secs(1),
+            now + Duration::from_secs(1),
+            Some(base),
+            &mut snapshot,
+        ));
+        assert_eq!(snapshot, previous);
     }
 
     #[test]
