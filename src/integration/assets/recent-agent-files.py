@@ -219,6 +219,11 @@ def _cursor_shell_succeeded(value):
 def _codex_tool_succeeded(value):
     response = _response_object(value)
     if response is None:
+        if isinstance(value, str):
+            # Codex shell rollouts render their result as text with this footer.
+            # Live PostToolUse delivery still needs confirmation; accept only
+            # the explicit zero-exit footer, never arbitrary output text.
+            return re.search(r"(?:^|\n)Process exited with code 0\s*$", value) is not None
         return False
     if response.get("success") is False or str(response.get("status", "")).casefold() in ("failed", "failure", "error"):
         return False

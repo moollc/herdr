@@ -74,6 +74,35 @@ class RecentAgentFilesHookTests(unittest.TestCase):
         self.assertEqual(self.records()[0]["provenance"], "codex.PostToolUse.exec")
         self.assertNotIn("tiny safe fixture", (self.state / hook.JOURNAL_NAME).read_text())
 
+    def test_codex_plain_text_and_json_success_shapes_capture_shell_writes(self):
+        targets = [self.base / "plain result.txt", self.base / "json result.txt"]
+        for target in targets:
+            target.write_text("existing harmless fixture")
+        payload = {
+            "tool_name": "Bash", "cwd": str(self.cwd),
+            "tool_input": {"command": "echo ok > '" + str(targets[0]) + "'"},
+            "tool_response": "fixture output\nProcess exited with code 0",
+        }
+        self.assertEqual(hook.capture("codex", "PostToolUse", payload, self.state), 1)
+        payload["tool_use_id"] = "json-success"
+        payload["tool_input"] = {"command": "echo ok > '" + str(targets[1]) + "'"}
+        payload["tool_response"] = {"exitCode": 0}
+        self.assertEqual(hook.capture("codex", "PostToolUse", payload, self.state), 1)
+        self.assertEqual({row["path"] for row in self.records()}, {str(path) for path in targets})
+        self.assertFalse(any(row.get("gap") for row in self.records()))
+
+    def test_unknown_codex_text_does_not_claim_success(self):
+        target = self.base / "unknown result.txt"
+        target.write_text("existing harmless fixture")
+        payload = {
+            "tool_name": "Bash", "cwd": str(self.cwd),
+            "tool_input": {"command": "echo ok > '" + str(target) + "'"},
+            "tool_response": "completed without an exit status",
+        }
+        self.assertEqual(hook.capture("codex", "PostToolUse", payload, self.state), 0)
+        self.assertFalse(any(row.get("path") == str(target) for row in self.records()))
+        self.assertTrue(any(row.get("gap") for row in self.records()))
+
     def test_failed_codex_cp_and_apply_patch_do_not_claim_existing_destinations(self):
         self.output.write_text("pre-existing")
         cp = {

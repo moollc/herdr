@@ -10,6 +10,7 @@ const MAX_JOURNAL_BYTES: u64 = 512 * 1024;
 const MAX_JOURNAL_RECORDS: usize = 500;
 const MAX_RESULTS: usize = 100;
 const JOURNAL_NAME: &str = "recent-agent-files.jsonl";
+const GAP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecentFile {
@@ -155,6 +156,17 @@ fn read_journal(journal: &Path) -> Result<(Vec<RecentFile>, bool, Option<String>
             .get("truncated")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        if record.get("gap").is_some() {
+            let Some(time_ns) = record.get("time_ns").and_then(serde_json::Value::as_u64) else {
+                partial = true;
+                continue;
+            };
+            let age = SystemTime::now()
+                .duration_since(UNIX_EPOCH + Duration::from_nanos(time_ns))
+                .unwrap_or_default();
+            partial |= age <= GAP_MAX_AGE;
+            continue;
+        }
         let Some(path) = record.get("path").and_then(serde_json::Value::as_str) else {
             partial = true;
             continue;
@@ -412,6 +424,29 @@ mod tests {
         assert!(files.is_empty());
         assert!(truncated);
         assert!(error.is_some());
+    }
+
+    #[test]
+    fn gap_indicators_expire_after_one_day() {
+        let base = fixture_dir("expired-gap");
+        let journal = base.join(JOURNAL_NAME);
+        let old_time_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .saturating_sub(GAP_MAX_AGE + Duration::from_secs(1))
+            .as_nanos() as u64;
+        let gap = serde_json::json!({
+            "gap": "unverified or failed write event",
+            "time_ns": old_time_ns,
+            "agent": "codex",
+            "provenance": "codex.PostToolUse.Bash.unverified",
+            "event_id": "gap:expired",
+        });
+        fs::write(&journal, gap.to_string()).expect("journal");
+        let (files, truncated, error) = read_journal(&journal).expect("read expired gap");
+        assert!(files.is_empty());
+        assert!(!truncated);
+        assert_eq!(error, None);
     }
 
     #[test]
