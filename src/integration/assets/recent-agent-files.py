@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Capture explicit successful agent file writes without retaining tool payloads."""
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import stat
 import sys
@@ -28,6 +30,9 @@ def _shell_destinations(command):
     """Recognize explicit write targets without interpreting or running a command."""
     if not isinstance(command, str) or len(command) > MAX_INPUT:
         return []
+    # Keep fd digits attached to a redirect distinguishable from ordinary
+    # arguments such as the 2 in `echo 2 > report.txt`.
+    command = re.sub(r"(?<!\S)(\d+)(?=(?:>>|>))", r"HERDR_FD_\1", command)
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
         lexer.whitespace_split = True
@@ -46,11 +51,11 @@ def _shell_destinations(command):
                 segment = []
             i += 1
             continue
-        if token in (">", ">>") and i + 1 < len(tokens):
+        if token in (">", ">>", "&>", "&>>") and i + 1 < len(tokens):
             target = tokens[i + 1]
             previous = tokens[i - 1] if i else ""
-            # Ignore stderr redirection; its destination is not an output file.
-            if previous not in ("2", "1", "&"):
+            # Ignore stderr redirection; only attached fd digits are marked.
+            if not previous.startswith("HERDR_FD_2"):
                 result.append(target)
             i += 2
             continue
@@ -60,7 +65,11 @@ def _shell_destinations(command):
         segments.append(segment)
 
     for words in segments:
-        commands = [word for word in words if word not in ("sudo", "env")]
+        # `cd`, subshells, and wrapper commands can change the meaning or
+        # destination of relative paths. Do not guess through them.
+        if any(word in ("cd", "(", ")", "()") or word in ("bash", "sh", "zsh", "env", "sudo", "command", "xargs") for word in words):
+            return []
+        commands = words
         for index, word in enumerate(commands):
             base = os.path.basename(word)
             if base == "tee":
@@ -76,6 +85,12 @@ def _shell_destinations(command):
                     result.append(args[-1])
                 break
     return result
+
+
+def _shell_uses_unsupported_context(command):
+    if not isinstance(command, str):
+        return False
+    return bool(re.search(r"(?:^|[;&|]\s*)(?:cd|bash|sh|zsh|env|sudo|command|xargs)\b|[()]", command))
 
 
 def _patch_paths(value):
@@ -135,15 +150,28 @@ def _event_paths(provider, event, payload):
     elif provider == "cursor" and event == "afterTabFileEdit":
         paths.append(payload.get("file_path"))
         tool = "afterTabFileEdit"
-    elif provider == "cursor" and event == "afterShellExecution":
-        # Cursor's documented post-shell payload has no exit status or cwd.
-        # Do not infer success or resolve relative targets from hook cwd.
-        tool = "afterShellExecution-unsupported"
-        return [], tool
+    elif provider == "cursor" and event == "postToolUse":
+        tool = str(payload.get("tool_name") or "postToolUse")
+        if tool.casefold() != "shell":
+            return [], tool
+        if not _cursor_shell_succeeded(payload.get("tool_output")):
+            return [], "gap:" + tool
+        tool_input = payload.get("tool_input")
+        command = tool_input.get("command") if isinstance(tool_input, dict) else None
+        if isinstance(tool_input, dict):
+            workdir = tool_input.get("workdir")
+            if isinstance(workdir, str) and Path(workdir).is_absolute():
+                cwd = workdir
+        paths.extend(_shell_destinations(command))
+        if not paths and _shell_uses_unsupported_context(command):
+            return [], "gap:" + tool
     elif provider == "codex" and event == "PostToolUse":
         tool_name = payload.get("tool_name")
         tool_input = payload.get("tool_input")
         tool = str(tool_name or "PostToolUse")
+        if not _codex_tool_succeeded(payload.get("tool_response")):
+            relevant = any(word in tool.casefold() for word in ("write", "edit", "patch", "create")) or tool.casefold() in ("bash", "exec", "exec_command", "shell")
+            return [], ("gap:" if relevant else "") + tool
         paths.extend(_direct_paths(tool_name, tool_input))
         normalized_name = str(tool_name or "").casefold()
         if normalized_name in ("bash", "exec", "exec_command", "shell"):
@@ -152,7 +180,13 @@ def _event_paths(provider, event, payload):
                 if isinstance(tool_input, dict)
                 else tool_input
             )
+            if isinstance(tool_input, dict):
+                workdir = tool_input.get("workdir")
+                if isinstance(workdir, str) and Path(workdir).is_absolute():
+                    cwd = workdir
             paths.extend(_shell_destinations(command))
+            if not paths and _shell_uses_unsupported_context(command):
+                return [], "gap:" + tool
     else:
         return [], "unsupported:" + str(event or "unknown")
 
@@ -162,6 +196,37 @@ def _event_paths(provider, event, payload):
         if path and path not in normalized and _is_regular_file(path):
             normalized.append(path)
     return normalized, tool
+
+
+def _response_object(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _cursor_shell_succeeded(value):
+    response = _response_object(value)
+    code = response.get("exitCode") if response else None
+    return type(code) is int and code == 0
+
+
+def _codex_tool_succeeded(value):
+    response = _response_object(value)
+    if response is None:
+        return False
+    if response.get("success") is False or str(response.get("status", "")).casefold() in ("failed", "failure", "error"):
+        return False
+    for key in ("exit_code", "exitCode"):
+        code = response.get(key)
+        if type(code) is int:
+            return code == 0
+    return response.get("success") is True or str(response.get("status", "")).casefold() in ("success", "succeeded")
 
 
 def _read_journal(path):
@@ -179,12 +244,11 @@ def _read_journal(path):
             continue
         if (
             isinstance(record, dict)
-            and isinstance(record.get("path"), str)
-            and os.path.isabs(record["path"])
             and isinstance(record.get("time_ns"), int)
             and isinstance(record.get("agent"), str)
             and isinstance(record.get("provenance"), str)
             and isinstance(record.get("event_id"), str)
+            and (record.get("gap") or (isinstance(record.get("path"), str) and os.path.isabs(record["path"])))
         ):
             records.append(record)
     return records
@@ -205,10 +269,10 @@ def _bounded_upsert(journal, record):
         records = [
             {key: value for key, value in item.items() if key != "truncated"}
             for item in old_records
-            if item["path"] != record["path"] and item["event_id"] != record["event_id"]
+            if item.get("path") != record.get("path") and item["event_id"] != record["event_id"]
         ]
         records.append(record)
-        records.sort(key=lambda item: (item["time_ns"], item["path"]), reverse=True)
+        records.sort(key=lambda item: (item["time_ns"], item.get("path", "")), reverse=True)
         if len(records) > MAX_RECORDS:
             history_truncated = True
         records = records[:MAX_RECORDS]
@@ -244,11 +308,13 @@ def capture(provider, event, payload, state_dir, *, now_ns=None):
         return 0
     paths, tool = _event_paths(provider, event, payload)
     if not paths:
+        if tool.startswith("gap:"):
+            _mark_gap(provider, event, tool[4:], state_dir, now_ns)
         return 0
     journal = Path(state_dir) / JOURNAL_NAME
     captured = 0
     timestamp = int(now_ns if now_ns is not None else time.time_ns())
-    event_id = payload.get("tool_use_id") or payload.get("generation_id")
+    event_id = payload.get("tool_use_id") or payload.get("generation_id") or uuid.uuid4().hex
     for index, path in enumerate(paths):
         if os.path.abspath(path) == os.path.abspath(journal):
             continue
@@ -258,12 +324,27 @@ def capture(provider, event, payload, state_dir, *, now_ns=None):
                 "time_ns": timestamp + index,
                 "agent": provider,
                 "provenance": f"{provider}.{event}.{tool}"[:120],
-                "event_id": f"{event_id or uuid.uuid4().hex}:{index}"[:160],
+                "event_id": f"{event_id}:{hashlib.sha256(path.encode('utf-8')).hexdigest()[:24]}"[:160],
             })
         except OSError:
             continue
         captured += 1
     return captured
+
+
+def _mark_gap(provider, event, tool, state_dir, now_ns=None):
+    timestamp = int(now_ns if now_ns is not None else time.time_ns())
+    journal = Path(state_dir) / JOURNAL_NAME
+    try:
+        _bounded_upsert(journal, {
+            "time_ns": timestamp,
+            "agent": provider,
+            "provenance": f"{provider}.{event}.{tool}.unverified"[:120],
+            "event_id": f"gap:{provider}:{event}:{uuid.uuid4().hex}",
+            "gap": "unverified or failed write event",
+        })
+    except OSError:
+        pass
 
 
 def main():

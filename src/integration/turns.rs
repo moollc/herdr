@@ -71,6 +71,23 @@ pub(super) fn cursor_registered(script: &Path) -> bool {
                 .iter()
                 .any(|entry| entry.get("command").and_then(Value::as_str) == Some(command.as_str()))
         })
+        && settings
+            .as_ref()
+            .and_then(|s| s.get("hooks"))
+            .and_then(|h| h.get("postToolUse"))
+            .and_then(Value::as_array)
+            .is_some_and(|entries| {
+                let command = format!(
+                    "python3 {} cursor postToolUse",
+                    shell_single_quote(
+                        &dir.join(RECENT_AGENT_FILES_HOOK_NAME).display().to_string()
+                    )
+                );
+                entries.iter().any(|entry| {
+                    entry.get("command").and_then(Value::as_str) == Some(command.as_str())
+                        && entry.get("matcher").and_then(Value::as_str) == Some("Shell")
+                })
+            })
 }
 pub(super) fn uninstall_cursor() -> io::Result<Vec<String>> {
     let dir = cursor_dir()?;
@@ -118,6 +135,20 @@ fn cursor_hooks(dir: &Path, remove: bool) -> io::Result<()> {
     entries.retain(|entry| entry.get("command").and_then(Value::as_str) != Some(command.as_str()));
     if !remove {
         entries.push(json!({"command": command}));
+    }
+    if entries.is_empty() {
+        hooks.remove(event);
+    }
+    let event = "postToolUse";
+    let command = format!("python3 {recent_script} cursor {event}");
+    let entries = hooks
+        .entry(event.to_string())
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| io::Error::other("cursor postToolUse hooks must be an array"))?;
+    entries.retain(|entry| entry.get("command").and_then(Value::as_str) != Some(command.as_str()));
+    if !remove {
+        entries.push(json!({"command": command, "matcher": "Shell"}));
     }
     if entries.is_empty() {
         hooks.remove(event);
@@ -256,7 +287,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("hooks.json"),
-            r#"{"version":1,"hooks":{"stop":[{"command":"echo keep","loop_limit":3}]}}"#,
+            r#"{"version":1,"hooks":{"stop":[{"command":"echo keep","loop_limit":3}],"postToolUse":[{"command":"echo audit","matcher":"Shell"}]}}"#,
         )
         .unwrap();
         cursor_hooks(&dir, false).unwrap();
@@ -272,6 +303,22 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("cursor afterFileEdit"));
+        assert!(parsed["hooks"]["postToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["command"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cursor postToolUse")
+                    && entry["matcher"] == "Shell"
+            }));
+        assert!(parsed["hooks"]["postToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| { entry["command"] == "echo audit" && entry["matcher"] == "Shell" }));
         cursor_hooks(&dir, true).unwrap();
         let restored: Value =
             serde_json::from_str(&fs::read_to_string(dir.join("hooks.json")).unwrap()).unwrap();
@@ -281,5 +328,9 @@ mod tests {
         );
         assert!(restored["hooks"].get("sessionStart").is_none());
         assert!(restored["hooks"].get("afterFileEdit").is_none());
+        assert_eq!(
+            restored["hooks"]["postToolUse"],
+            json!([{"command":"echo audit","matcher":"Shell"}])
+        );
     }
 }

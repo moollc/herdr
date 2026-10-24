@@ -46,6 +46,18 @@ class RecentAgentFilesHookTests(unittest.TestCase):
         self.assertNotIn("harmless fixture content", journal)
         self.assertNotIn("private", journal)
 
+    def test_same_generation_cursor_edits_keep_each_path(self):
+        first = self.base / "generation-a.html"
+        second = self.base / "generation-b.md"
+        first.write_text("a")
+        second.write_text("b")
+        for path in (first, second):
+            self.assertEqual(hook.capture("cursor", "afterFileEdit", {
+                "file_path": str(path), "generation_id": "same-generation",
+            }, self.state, now_ns=100), 1)
+        self.assertEqual({row["path"] for row in self.records()}, {str(first), str(second)})
+        self.assertEqual(len({row["event_id"] for row in self.records()}), 2)
+
     def test_codex_successful_shell_output_outside_cwd_is_registered_by_post_tool_event(self):
         target = self.base / "shell output.txt"
         command = "printf 'tiny safe fixture' > " + subprocess.list2cmdline([str(target)])
@@ -61,6 +73,37 @@ class RecentAgentFilesHookTests(unittest.TestCase):
         self.assertEqual(self.records()[0]["path"], str(target))
         self.assertEqual(self.records()[0]["provenance"], "codex.PostToolUse.exec")
         self.assertNotIn("tiny safe fixture", (self.state / hook.JOURNAL_NAME).read_text())
+
+    def test_failed_codex_cp_and_apply_patch_do_not_claim_existing_destinations(self):
+        self.output.write_text("pre-existing")
+        cp = {
+            "tool_name": "Bash", "tool_use_id": "failed-cp", "cwd": str(self.cwd),
+            "tool_input": {"command": "cp missing.txt " + str(self.output)},
+            "tool_response": {"exit_code": 1},
+        }
+        patch = {
+            "tool_name": "apply_patch", "tool_use_id": "failed-patch", "cwd": str(self.cwd),
+            "tool_input": {"command": "*** Begin Patch\n*** Update File: " + str(self.output) + "\n@@\n-old\n+new\n*** End Patch"},
+            "tool_response": {"success": False},
+        }
+        self.assertEqual(hook.capture("codex", "PostToolUse", cp, self.state), 0)
+        self.assertEqual(hook.capture("codex", "PostToolUse", patch, self.state), 0)
+        rows = self.records()
+        self.assertFalse(any(row.get("path") == str(self.output) for row in rows))
+        self.assertTrue(any(row.get("gap") for row in rows))
+
+    def test_cursor_shell_success_requires_json_exit_code_and_uses_cwd(self):
+        target = self.cwd / "cursor shell result.txt"
+        target.write_text("existing")
+        payload = {
+            "tool_name": "Shell", "tool_use_id": "cursor-shell", "cwd": str(self.cwd),
+            "tool_input": {"command": "echo ok > 'cursor shell result.txt'"},
+            "tool_output": json.dumps({"exitCode": 0}),
+        }
+        self.assertEqual(hook.capture("cursor", "postToolUse", payload, self.state), 1)
+        self.assertEqual(self.records()[0]["path"], str(target))
+        payload["tool_output"] = json.dumps({"exitCode": 1})
+        self.assertEqual(hook.capture("cursor", "postToolUse", payload, self.state), 0)
 
     def test_other_process_write_alone_does_not_create_an_agent_event(self):
         self.output.write_text("process-only fixture")
@@ -99,6 +142,39 @@ class RecentAgentFilesHookTests(unittest.TestCase):
             "tool_input": {"command": "touch " + str(self.output)},
         }, self.state), 0)
         self.assertEqual(self.records(), [])
+
+    def test_shell_parser_rejects_cd_context_and_reads_redirects_safely(self):
+        self.assertEqual(hook._shell_destinations("cd OTHER && echo hi > out.txt"), [])
+        self.assertEqual(hook._shell_destinations("echo 2 > report.txt"), ["report.txt"])
+        self.assertEqual(hook._shell_destinations("echo hi 1> report.txt"), ["report.txt"])
+        self.assertEqual(hook._shell_destinations("echo hi 2> errors.txt"), [])
+        self.assertEqual(hook._shell_destinations("echo hi &> both.txt"), ["both.txt"])
+        self.assertEqual(hook._shell_destinations("echo hi &>> both.txt"), ["both.txt"])
+
+        target = self.cwd / "out.txt"
+        target.write_text("existing decoy")
+        payload = {
+            "tool_name": "exec", "tool_use_id": "cd-context", "cwd": str(self.cwd),
+            "tool_input": {"command": "cd OTHER && echo hi > out.txt"},
+            "tool_response": {"exit_code": 0},
+        }
+        self.assertEqual(hook.capture("codex", "PostToolUse", payload, self.state), 0)
+        rows = self.records()
+        self.assertFalse(any(row.get("path") == str(target) for row in rows))
+        self.assertTrue(any(row.get("gap") for row in rows))
+
+    def test_codex_workdir_overrides_hook_cwd_for_relative_target(self):
+        workdir = self.base / "explicit workdir"
+        workdir.mkdir()
+        target = workdir / "result.txt"
+        target.write_text("existing")
+        payload = {
+            "tool_name": "exec", "cwd": str(self.cwd),
+            "tool_input": {"command": "echo ok > result.txt", "workdir": str(workdir)},
+            "tool_response": {"exit_code": 0},
+        }
+        self.assertEqual(hook.capture("codex", "PostToolUse", payload, self.state), 1)
+        self.assertEqual(self.records()[0]["path"], str(target))
 
     def test_bounded_journal_keeps_newest_records_and_marks_lost_history(self):
         old_limit = hook.MAX_RECORDS

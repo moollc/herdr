@@ -400,7 +400,14 @@ mod tests {
     fn malformed_partial_state_is_reported_instead_of_claimed_complete() {
         let base = fixture_dir("partial");
         let journal = base.join(JOURNAL_NAME);
-        fs::write(&journal, "{bad json}\n").expect("journal");
+        let gap = serde_json::json!({
+            "gap": "unverified or failed write event",
+            "time_ns": 1,
+            "agent": "codex",
+            "provenance": "codex.PostToolUse.Bash.unverified",
+            "event_id": "gap:fixture",
+        });
+        fs::write(&journal, format!("{{bad json}}\n{}\n", gap)).expect("journal");
         let (files, truncated, error) = read_journal(&journal).expect("read partial state");
         assert!(files.is_empty());
         assert!(truncated);
