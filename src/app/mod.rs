@@ -156,6 +156,7 @@ pub struct App {
     pub(crate) overseer_service: crate::overseer::Service,
     pub(crate) guard_run: allowance_guard::GuardRuntime,
     pub(crate) tasks_watcher: crate::tasks::TasksWatcher,
+    pub(crate) recent_files_watcher: crate::recent_files::RecentFilesWatcher,
     pub(crate) last_player_snapshot: crate::ui::player::PlayerSnapshot,
     pub(crate) last_player_playlist: crate::ui::player::PlaylistSnapshot,
     pub(crate) last_player_density: crate::ui::player::PlayerDensity,
@@ -487,6 +488,7 @@ impl App {
             request_reload_config: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
+            request_open_recent_file: None,
             requested_new_tab_name: None,
             requested_new_tab_goal: None,
             rename_pane_target: None,
@@ -602,6 +604,7 @@ impl App {
             usage_snapshot: None,
             board: crate::board::BoardSnapshot::default(),
             tasks: crate::tasks::TasksSnapshot::default(),
+            recent_files: crate::recent_files::RecentFilesSnapshot::default(),
             tasks_collapsed: restored_tasks_collapsed,
             agents_compact: restored_agents_compact,
             state_colors: config.ui.state_colors,
@@ -699,6 +702,7 @@ impl App {
             tasks_watcher: crate::tasks::TasksWatcher::new(crate::tasks::configured_path(
                 config.tasks_file.as_deref(),
             )),
+            recent_files_watcher: crate::recent_files::RecentFilesWatcher::new(),
             board_watcher: crate::board::BoardWatcher::new(crate::board::configured_path(
                 config.board_file.as_deref(),
             )),

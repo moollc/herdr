@@ -479,6 +479,10 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn open_file(path: &Path) -> std::io::Result<()> {
+    super::dispatch_file_opener("open", path, |mut command| command.spawn().map(|_| ()))
+}
+
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
     let path = std::env::temp_dir().join(format!(
         "herdr-clipboard-image-{}-{}.png",

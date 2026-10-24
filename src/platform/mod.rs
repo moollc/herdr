@@ -81,6 +81,21 @@ pub(crate) fn read_limited_reader(
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn dispatch_file_opener(
+    program: &str,
+    path: &std::path::Path,
+    spawn: impl FnOnce(std::process::Command) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut command = std::process::Command::new(program);
+    command
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    spawn(command)
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
@@ -204,6 +219,53 @@ mod tests {
             read_limited_reader(input, 16).expect("limited read"),
             LimitedRead::Complete(b"image".to_vec())
         );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn opener_dispatches_one_literal_path_argument() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::path::Path::new("/tmp/a space/écho;$(not-a-command).html");
+        let mut observed = None;
+        dispatch_file_opener("fake-open", path, |command| {
+            observed = Some((
+                command.get_program().to_owned(),
+                command
+                    .get_args()
+                    .map(|arg| arg.to_owned())
+                    .collect::<Vec<_>>(),
+            ));
+            Ok(())
+        })
+        .expect("fake opener");
+        let (program, args) = observed.expect("captured argv");
+        assert_eq!(program, "fake-open");
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].as_bytes(), path.as_os_str().as_bytes());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn opener_failure_is_returned() {
+        let error = dispatch_file_opener("fake-open", std::path::Path::new("report.html"), |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "fake opener missing",
+            ))
+        })
+        .expect_err("fake opener failure");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn real_default_app_open_acceptance_for_harmless_text_file() {
+        let Ok(path) = std::env::var("HERDR_TEST_DEFAULT_OPEN_PATH") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        assert!(crate::recent_files::is_regular_file(&path));
+        open_file(&path).expect("macOS default app opener accepts harmless text file");
     }
 }
 

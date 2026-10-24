@@ -540,8 +540,19 @@ impl App {
     }
 
     pub(crate) fn poll_board_if_due(&mut self, now: Instant) -> bool {
+        let recent_files_root = if self.state.tasks.configured {
+            self.state
+                .active
+                .and_then(|index| self.state.workspaces.get(index))
+                .map(|workspace| workspace.identity_cwd.clone())
+        } else {
+            None
+        };
         self.board_watcher.poll(now, &mut self.state.board)
             | self.tasks_watcher.poll(now, &mut self.state.tasks)
+            | self
+                .recent_files_watcher
+                .poll(now, recent_files_root, &mut self.state.recent_files)
     }
 
     pub(crate) fn poll_player_if_due(&mut self, now: Instant) -> bool {
@@ -955,10 +966,14 @@ impl App {
             include_git_refresh.then_some(self.last_player_poll + PLAYER_POLL_INTERVAL),
             include_git_refresh
                 .then(|| {
-                    [self.board_watcher.deadline(), self.tasks_watcher.deadline()]
-                        .into_iter()
-                        .flatten()
-                        .min()
+                    [
+                        self.board_watcher.deadline(),
+                        self.tasks_watcher.deadline(),
+                        self.recent_files_watcher.deadline(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min()
                 })
                 .flatten(),
             include_git_refresh

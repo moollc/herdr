@@ -207,6 +207,10 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn open_file(path: &std::path::Path) -> std::io::Result<()> {
+    super::dispatch_file_opener("xdg-open", path, |mut command| command.spawn().map(|_| ()))
+}
+
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
     for (mime, extension) in [
         ("image/png", "png"),

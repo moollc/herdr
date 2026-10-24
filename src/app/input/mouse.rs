@@ -229,6 +229,15 @@ impl AppState {
             return None;
         }
 
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if let Some(index) = crate::ui::recent_file_at(self, mouse.column, mouse.row) {
+                self.recent_files.keyboard_focus = false;
+                self.recent_files.selected = Some(index);
+                self.recent_files.open_error = None;
+                self.request_open_recent_file = Some(index);
+                return None;
+            }
+        }
         if crate::ui::tasks_mouse(self, mouse) {
             return None;
         }

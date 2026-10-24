@@ -50,6 +50,18 @@ impl App {
             return;
         }
 
+        if matches!(key.code, KeyCode::Char('f' | 'F'))
+            && key.modifiers.is_empty()
+            && self.state.tasks.configured
+        {
+            self.state.recent_files.keyboard_focus = true;
+            self.state.recent_files.selected =
+                (!self.state.recent_files.files.is_empty()).then_some(0);
+            self.state.recent_files.scroll_offset = 0;
+            leave_command_mode(&mut self.state);
+            return;
+        }
+
         if let Some(action) = action_for_key(&self.state, raw_key, BindingDispatch::Prefix) {
             if action == NavigateAction::EditScrollback {
                 let previous_mode = self.state.mode;

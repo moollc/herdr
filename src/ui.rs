@@ -7,7 +7,10 @@ use ratatui::{
 
 mod agent_table;
 mod tasks;
-pub(crate) use tasks::{has_animation as tasks_has_animation, mouse as tasks_mouse};
+pub(crate) use tasks::{
+    has_animation as tasks_has_animation, mouse as tasks_mouse, recent_file_at,
+    recent_file_viewport,
+};
 mod commander;
 mod composer;
 mod describe_dialog;

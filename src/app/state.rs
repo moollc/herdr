@@ -1878,6 +1878,7 @@ pub struct AppState {
     /// Set when UI interaction requested a clipboard write that must be
     /// handled by the outer App/event loop instead of directly from AppState.
     pub request_clipboard_write: Option<Vec<u8>>,
+    pub request_open_recent_file: Option<usize>,
     pub requested_new_tab_name: Option<String>,
     pub requested_new_tab_goal: Option<String>,
     pub rename_pane_target: Option<PaneId>,
@@ -2030,6 +2031,7 @@ pub struct AppState {
     /// Pure snapshot of the optional file-backed Tasks panel.
     pub board: crate::board::BoardSnapshot,
     pub tasks: crate::tasks::TasksSnapshot,
+    pub recent_files: crate::recent_files::RecentFilesSnapshot,
     pub tasks_collapsed: bool,
     pub agents_compact: bool,
     pub state_colors: bool,
@@ -2404,6 +2406,7 @@ impl AppState {
             request_reload_config: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
+            request_open_recent_file: None,
             requested_new_tab_name: None,
             requested_new_tab_goal: None,
             rename_pane_target: None,
@@ -2506,6 +2509,7 @@ impl AppState {
             usage_snapshot: None,
             board: crate::board::BoardSnapshot::default(),
             tasks: crate::tasks::TasksSnapshot::default(),
+            recent_files: crate::recent_files::RecentFilesSnapshot::default(),
             tasks_collapsed: false,
             agents_compact: false,
             state_colors: true,

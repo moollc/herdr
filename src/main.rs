@@ -54,6 +54,7 @@ mod product_announcements;
 mod protocol;
 mod pty;
 mod raw_input;
+mod recent_files;
 mod release_notes;
 mod remote;
 mod render_prof;

@@ -148,6 +148,64 @@ pub(crate) fn mouse(app: &mut AppState, event: MouseEvent) -> bool {
     true
 }
 
+/// Return the actual file row represented by this cell after the current task
+/// rows and completion history have been laid out.
+pub(crate) fn recent_file_viewport(app: &AppState) -> Option<(u16, usize)> {
+    let area = app.view.tasks_rect;
+    if area.is_empty() || folded(app, area) {
+        return None;
+    }
+    let mut y = area.y.saturating_add(1);
+    if let Some(tasks) = &app.tasks.tasks {
+        for _task in tasks.rows.iter().filter(|task| task.mark != Mark::Done) {
+            if y >= area.bottom() {
+                break;
+            }
+            y += 1;
+        }
+        let done_count = tasks
+            .rows
+            .iter()
+            .filter(|task| task.mark == Mark::Done)
+            .count();
+        if done_count > 0 && y < area.bottom() {
+            y += 1;
+            for _ in tasks
+                .rows
+                .iter()
+                .filter(|task| task.mark == Mark::Done)
+                .skip(done_count.saturating_sub(3))
+            {
+                if y >= area.bottom() {
+                    break;
+                }
+                y += 1;
+            }
+        }
+    } else if app.tasks.error.is_some() && y < area.bottom() {
+        y += 1;
+    }
+    if y > area.y + 1 && y < area.bottom() {
+        y += 1;
+    }
+    let first_file_row = y.saturating_add(1);
+    (first_file_row < area.bottom())
+        .then_some((first_file_row, (area.bottom() - first_file_row) as usize))
+}
+
+pub(crate) fn recent_file_at(app: &AppState, column: u16, row: u16) -> Option<usize> {
+    let area = app.view.tasks_rect;
+    if column <= area.x || column >= area.right() || app.recent_files.files.is_empty() {
+        return None;
+    }
+    let (first_file_row, visible) = recent_file_viewport(app)?;
+    if row < first_file_row || usize::from(row - first_file_row) >= visible {
+        return None;
+    }
+    let index = app.recent_files.scroll_offset + usize::from(row - first_file_row);
+    (index < app.recent_files.files.len()).then_some(index)
+}
+
 fn fit(text: &str, width: usize) -> String {
     let clean: String = text
         .chars()
@@ -270,6 +328,110 @@ pub(super) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
                 Paragraph::new(fit(error, content.width as usize)).style(dim),
                 Rect::new(content.x, y, content.width, 1),
             );
+            y += 1;
+        }
+    }
+    if y < area.bottom() {
+        if y > area.y + 1 {
+            frame.render_widget(
+                Paragraph::new("─".repeat(content.width as usize)).style(divider),
+                Rect::new(content.x, y, content.width, 1),
+            );
+            y += 1;
+        }
+        if y < area.bottom() {
+            let heading = if app.recent_files.keyboard_focus {
+                " recent files · ↑↓ Enter · Esc"
+            } else {
+                " recent files · prefix+f"
+            };
+            frame.render_widget(
+                Paragraph::new(fit(heading, content.width as usize)).style(dim),
+                Rect::new(content.x, y, content.width, 1),
+            );
+            y += 1;
+            if y < area.bottom() {
+                if let Some(error) = &app.recent_files.open_error {
+                    frame.render_widget(
+                        Paragraph::new(fit(error, content.width as usize))
+                            .style(Style::default().fg(app.palette.red)),
+                        Rect::new(content.x, y, content.width, 1),
+                    );
+                } else if app.recent_files.loading {
+                    frame.render_widget(
+                        Paragraph::new(" indexing project files…").style(dim),
+                        Rect::new(content.x, y, content.width, 1),
+                    );
+                } else if let Some(error) = &app.recent_files.error {
+                    frame.render_widget(
+                        Paragraph::new(fit(error, content.width as usize)).style(dim),
+                        Rect::new(content.x, y, content.width, 1),
+                    );
+                } else if app.recent_files.files.is_empty() {
+                    frame.render_widget(
+                        Paragraph::new(" no recent files").style(dim),
+                        Rect::new(content.x, y, content.width, 1),
+                    );
+                } else {
+                    let visible = area.bottom().saturating_sub(y) as usize;
+                    let start = app
+                        .recent_files
+                        .scroll_offset
+                        .min(app.recent_files.files.len().saturating_sub(1));
+                    for (offset, file) in app
+                        .recent_files
+                        .files
+                        .iter()
+                        .skip(start)
+                        .take(visible)
+                        .enumerate()
+                    {
+                        let line_y = y + offset as u16;
+                        let selected = app.recent_files.keyboard_focus
+                            && app.recent_files.selected == Some(start + offset);
+                        let prefix = if selected { "› " } else { "  " };
+                        let now =
+                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(app.usage_now);
+                        let age = crate::recent_files::age(file.modified, now);
+                        let suffix = format!(" {age}");
+                        let width = content.width as usize;
+                        let available = width.saturating_sub(prefix.width() + suffix.width());
+                        let filename = crate::recent_files::display_name(&file.path, available);
+                        let root = app
+                            .recent_files
+                            .root
+                            .as_deref()
+                            .unwrap_or(std::path::Path::new(""));
+                        let relative = file.path.strip_prefix(root).unwrap_or(&file.path);
+                        let parent = relative
+                            .parent()
+                            .filter(|path| !path.as_os_str().is_empty())
+                            .map(|path| format!(" {}", path.display()))
+                            .unwrap_or_default();
+                        let parent = fit(&parent, available.saturating_sub(filename.width()));
+                        let name_style = if selected {
+                            Style::default()
+                                .fg(app.palette.accent)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(app.palette.text)
+                        };
+                        let mut spans = vec![
+                            Span::raw(prefix),
+                            Span::styled(filename, name_style),
+                            Span::styled(parent, dim),
+                            Span::styled(suffix, dim),
+                        ];
+                        if app.recent_files.truncated && offset + 1 == visible {
+                            spans.push(Span::styled(" …", dim));
+                        }
+                        frame.render_widget(
+                            Paragraph::new(Line::from(spans)),
+                            Rect::new(content.x, line_y, content.width, 1),
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -588,5 +750,84 @@ mod tests {
             }
         }
         std::fs::write(output, serde_json::to_vec_pretty(&cells).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn recent_file_rows_render_below_tasks_and_hit_testing_tracks_newest_insertions() {
+        let mut app = state();
+        app.recent_files = crate::recent_files::RecentFilesSnapshot {
+            root: Some("/project".into()),
+            files: ["/project/reports/first.md", "/project/reports/second.html"]
+                .into_iter()
+                .map(|path| crate::recent_files::RecentFile {
+                    path: path.into(),
+                    modified: std::time::SystemTime::now(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let buf = draw(&mut app, 160, 24);
+        let area = app.view.tasks_rect;
+        let rendered = text(&buf);
+        assert!(rendered.contains("recent files"));
+        assert!(
+            rendered.contains("Task 0"),
+            "top-priority task remains visible"
+        );
+        assert!(
+            rendered.contains("reports"),
+            "relative parent path is discoverable"
+        );
+        let find_row = |buffer: &ratatui::buffer::Buffer, needle: &str| {
+            (area.y..area.bottom())
+                .find(|y| {
+                    (area.x..area.right())
+                        .map(|x| buffer[(x, *y)].symbol())
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .unwrap_or_else(|| panic!("{needle} missing; rendered: {}", text(buffer)))
+        };
+        let first = find_row(&buf, "first.md");
+        assert_eq!(recent_file_at(&app, area.x + 1, first), Some(0));
+
+        app.recent_files.files.insert(
+            0,
+            crate::recent_files::RecentFile {
+                path: "/project/reports/new.webp".into(),
+                modified: std::time::SystemTime::now(),
+            },
+        );
+        let buf = draw(&mut app, 160, 24);
+        let newest = find_row(&buf, "new.webp");
+        assert_eq!(recent_file_at(&app, area.x + 1, newest), Some(0));
+        let first_after = find_row(&buf, "first.md");
+        assert_eq!(recent_file_at(&app, area.x + 1, first_after), Some(1));
+        app.recent_files.scroll_offset = 1;
+        let scrolled = draw(&mut app, 160, 24);
+        let first_visible = find_row(&scrolled, "first.md");
+        assert_eq!(recent_file_at(&app, area.x + 1, first_visible), Some(1));
+
+        if let Ok(path) = std::env::var("HERDR_RECENT_FILES_RENDER_OUTPUT") {
+            let cells = (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| {
+                            let cell = &buf[(x, y)];
+                            serde_json::json!({
+                                "text": cell.symbol(),
+                                "fg": format!("{:?}", cell.fg),
+                                "bold": cell.modifier.contains(Modifier::BOLD)
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            std::fs::write(
+                path,
+                serde_json::to_vec_pretty(&cells).expect("serialize rendered cells"),
+            )
+            .expect("write rendered UI capture");
+        }
     }
 }

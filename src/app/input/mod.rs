@@ -79,6 +79,9 @@ impl App {
         }
         match self.state.mode {
             Mode::Terminal => {
+                if self.state.recent_files.keyboard_focus && self.handle_recent_files_key(key) {
+                    return;
+                }
                 if handle_player_link_key(&mut self.state, key) {
                     return;
                 }
@@ -151,6 +154,62 @@ impl App {
                     }
                     Mode::Terminal => unreachable!(),
                 }
+            }
+        }
+    }
+
+    fn handle_recent_files_key(&mut self, key: TerminalKey) -> bool {
+        let event = key.as_key_event();
+        if event.kind == crossterm::event::KeyEventKind::Release {
+            return true;
+        }
+        match event.code {
+            KeyCode::Esc => {
+                self.state.recent_files.keyboard_focus = false;
+                true
+            }
+            KeyCode::Up | KeyCode::Down => {
+                let visible = crate::ui::recent_file_viewport(&self.state)
+                    .map(|(_, count)| count)
+                    .unwrap_or(1);
+                crate::recent_files::move_selection(
+                    &mut self.state.recent_files,
+                    event.code == KeyCode::Down,
+                    visible,
+                );
+                true
+            }
+            KeyCode::Enter => {
+                if let Some(index) =
+                    crate::recent_files::selected_for_open(&self.state.recent_files)
+                {
+                    self.open_recent_file(index);
+                }
+                true
+            }
+            _ => {
+                self.state.recent_files.keyboard_focus = false;
+                false
+            }
+        }
+    }
+
+    pub(crate) fn open_recent_file(&mut self, index: usize) {
+        let Some(file) = self.state.recent_files.files.get(index) else {
+            self.state.recent_files.open_error = Some("File is no longer available".into());
+            return;
+        };
+        let path = file.path.clone();
+        if !crate::recent_files::is_regular_file(&path) {
+            self.state.recent_files.open_error = Some("File is no longer available".into());
+            return;
+        }
+        match crate::platform::open_file(&path) {
+            Ok(()) => self.state.recent_files.open_error = None,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "failed to open recent file");
+                self.state.recent_files.open_error =
+                    Some("Could not open file on the session host".into());
             }
         }
     }
@@ -437,6 +496,9 @@ impl App {
                     }
                 }
             }
+        }
+        if let Some(index) = self.state.request_open_recent_file.take() {
+            self.open_recent_file(index);
         }
         self.flush_refresh_summary_prompt_save();
         if previous_settings_section != crate::app::state::SettingsSection::Integrations
