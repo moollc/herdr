@@ -70,6 +70,16 @@ impl RecentFilesWatcher {
         root: Option<PathBuf>,
         snapshot: &mut RecentFilesSnapshot,
     ) -> bool {
+        self.poll_at(now, SystemTime::now(), root, snapshot)
+    }
+
+    fn poll_at(
+        &mut self,
+        now: Instant,
+        wall_now: SystemTime,
+        root: Option<PathBuf>,
+        snapshot: &mut RecentFilesSnapshot,
+    ) -> bool {
         let mut changed = false;
         if root != self.root {
             self.root = root.clone();
@@ -93,7 +103,7 @@ impl RecentFilesWatcher {
                 len: metadata.len(),
             })
         });
-        if current_stamp == self.stamp && !changed {
+        if current_stamp == self.stamp && !changed && !snapshot.truncated {
             return false;
         }
         self.stamp = current_stamp;
@@ -101,7 +111,7 @@ impl RecentFilesWatcher {
             .selected
             .and_then(|index| snapshot.files.get(index))
             .map(|file| file.path.clone());
-        let (files, truncated, error) = match read_journal(&self.journal) {
+        let (files, truncated, error) = match read_journal_at(&self.journal, wall_now) {
             Ok(result) => result,
             Err(error) => (Vec::new(), true, Some(error)),
         };
@@ -128,6 +138,13 @@ impl RecentFilesWatcher {
 }
 
 fn read_journal(journal: &Path) -> Result<(Vec<RecentFile>, bool, Option<String>), String> {
+    read_journal_at(journal, SystemTime::now())
+}
+
+fn read_journal_at(
+    journal: &Path,
+    wall_now: SystemTime,
+) -> Result<(Vec<RecentFile>, bool, Option<String>), String> {
     let bytes = match fs::read(journal) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -161,7 +178,7 @@ fn read_journal(journal: &Path) -> Result<(Vec<RecentFile>, bool, Option<String>
                 partial = true;
                 continue;
             };
-            let age = SystemTime::now()
+            let age = wall_now
                 .duration_since(UNIX_EPOCH + Duration::from_nanos(time_ns))
                 .unwrap_or_default();
             partial |= age <= GAP_MAX_AGE;
@@ -447,6 +464,52 @@ mod tests {
         assert!(files.is_empty());
         assert!(!truncated);
         assert_eq!(error, None);
+    }
+
+    #[test]
+    fn watcher_refreshes_expired_gap_without_journal_write() {
+        let base = fixture_dir("watcher-expired-gap");
+        let journal = base.join(JOURNAL_NAME);
+        let observed_at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let gap = serde_json::json!({
+            "gap": "unverified or failed write event",
+            "time_ns": observed_at.duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64,
+            "agent": "codex",
+            "provenance": "codex.PostToolUse.Bash.unverified",
+            "event_id": "gap:watcher-expiry",
+        });
+        fs::write(&journal, gap.to_string()).expect("journal");
+        let original_stamp = fs::metadata(&journal)
+            .expect("journal metadata")
+            .modified()
+            .expect("journal modified time");
+        let mut watcher = RecentFilesWatcher::with_journal_path(journal.clone());
+        let mut snapshot = RecentFilesSnapshot::default();
+        let monotonic_start = Instant::now();
+        assert!(watcher.poll_at(
+            monotonic_start,
+            observed_at,
+            Some(base.clone()),
+            &mut snapshot
+        ));
+        assert!(snapshot.truncated);
+        assert!(snapshot.error.is_some());
+
+        assert!(watcher.poll_at(
+            monotonic_start + Duration::from_secs(1),
+            observed_at + GAP_MAX_AGE + Duration::from_secs(1),
+            Some(base),
+            &mut snapshot,
+        ));
+        assert!(!snapshot.truncated);
+        assert_eq!(snapshot.error, None);
+        assert_eq!(
+            fs::metadata(&journal)
+                .expect("journal remains")
+                .modified()
+                .expect("journal modified time remains"),
+            original_stamp,
+        );
     }
 
     #[test]

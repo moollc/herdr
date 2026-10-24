@@ -93,6 +93,30 @@ def _shell_uses_unsupported_context(command):
     return bool(re.search(r"(?:^|[;&|]\s*)(?:cd|bash|sh|zsh|env|sudo|command|xargs)\b|[()]", command))
 
 
+def _shell_has_candidate_write(command):
+    """Identify likely writes before trusting a result, without treating reads as gaps."""
+    if _shell_destinations(command):
+        return True
+    if not isinstance(command, str) or len(command) > MAX_INPUT:
+        return False
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    write_commands = {"tee", "touch", "cp", "mv", "install"}
+    if any(os.path.basename(token) in write_commands for token in tokens):
+        return True
+    # A destination in an unsupported wrapper or directory context remains a
+    # candidate, but is never resolved to a file by this conservative check.
+    return re.search(r"(?:^|\s)(?:\d+)?(?:>>|>)\s*\S+|(?:^|\s)&(?:>>|>)\s*\S+", command) is not None
+
+
+def _is_supported_write_tool(tool_name):
+    name = str(tool_name or "").casefold()
+    return any(word in name for word in ("write", "edit", "patch", "create"))
+
+
 def _patch_paths(value):
     if isinstance(value, dict):
         value = value.get("command") or value.get("patch") or ""
@@ -154,10 +178,12 @@ def _event_paths(provider, event, payload):
         tool = str(payload.get("tool_name") or "postToolUse")
         if tool.casefold() != "shell":
             return [], tool
-        if not _cursor_shell_succeeded(payload.get("tool_output")):
-            return [], "gap:" + tool
         tool_input = payload.get("tool_input")
         command = tool_input.get("command") if isinstance(tool_input, dict) else None
+        if not _shell_has_candidate_write(command):
+            return [], tool
+        if not _cursor_shell_succeeded(payload.get("tool_output")):
+            return [], "gap:" + tool
         if isinstance(tool_input, dict):
             workdir = tool_input.get("workdir")
             if isinstance(workdir, str) and Path(workdir).is_absolute():
@@ -169,17 +195,19 @@ def _event_paths(provider, event, payload):
         tool_name = payload.get("tool_name")
         tool_input = payload.get("tool_input")
         tool = str(tool_name or "PostToolUse")
-        if not _codex_tool_succeeded(payload.get("tool_response")):
-            relevant = any(word in tool.casefold() for word in ("write", "edit", "patch", "create")) or tool.casefold() in ("bash", "exec", "exec_command", "shell")
-            return [], ("gap:" if relevant else "") + tool
-        paths.extend(_direct_paths(tool_name, tool_input))
         normalized_name = str(tool_name or "").casefold()
+        command = (
+            (tool_input.get("command") or tool_input.get("cmd"))
+            if isinstance(tool_input, dict)
+            else tool_input
+        )
+        candidate = _is_supported_write_tool(tool_name)
         if normalized_name in ("bash", "exec", "exec_command", "shell"):
-            command = (
-                (tool_input.get("command") or tool_input.get("cmd"))
-                if isinstance(tool_input, dict)
-                else tool_input
-            )
+            candidate = candidate or _shell_has_candidate_write(command)
+        if not _codex_tool_succeeded(payload.get("tool_response")):
+            return [], ("gap:" if candidate else "") + tool
+        paths.extend(_direct_paths(tool_name, tool_input))
+        if normalized_name in ("bash", "exec", "exec_command", "shell"):
             if isinstance(tool_input, dict):
                 workdir = tool_input.get("workdir")
                 if isinstance(workdir, str) and Path(workdir).is_absolute():
@@ -220,10 +248,9 @@ def _codex_tool_succeeded(value):
     response = _response_object(value)
     if response is None:
         if isinstance(value, str):
-            # Codex shell rollouts render their result as text with this footer.
-            # Live PostToolUse delivery still needs confirmation; accept only
-            # the explicit zero-exit footer, never arbitrary output text.
-            return re.search(r"(?:^|\n)Process exited with code 0\s*$", value) is not None
+            # Accept only an explicit status line, wherever it appears. Plain
+            # stdout and rollout formatting labels are not exit evidence.
+            return re.search(r"(?:^|\n)Process exited with code 0\r?(?:\n|$)", value) is not None
         return False
     if response.get("success") is False or str(response.get("status", "")).casefold() in ("failed", "failure", "error"):
         return False

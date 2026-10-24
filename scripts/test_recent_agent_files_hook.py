@@ -74,22 +74,35 @@ class RecentAgentFilesHookTests(unittest.TestCase):
         self.assertEqual(self.records()[0]["provenance"], "codex.PostToolUse.exec")
         self.assertNotIn("tiny safe fixture", (self.state / hook.JOURNAL_NAME).read_text())
 
-    def test_codex_plain_text_and_json_success_shapes_capture_shell_writes(self):
-        targets = [self.base / "plain result.txt", self.base / "json result.txt"]
+    def test_codex_explicit_status_line_and_structured_success_capture_shell_writes(self):
+        targets = [self.base / "middle status result.txt", self.base / "json result.txt", self.base / "end status result.txt"]
         for target in targets:
             target.write_text("existing harmless fixture")
         payload = {
             "tool_name": "Bash", "cwd": str(self.cwd),
             "tool_input": {"command": "echo ok > '" + str(targets[0]) + "'"},
-            "tool_response": "fixture output\nProcess exited with code 0",
+            "tool_response": "Process exited with code 0\nOutput: fixture output",
         }
-        self.assertEqual(hook.capture("codex", "PostToolUse", payload, self.state), 1)
+        self.run_hook("codex", "PostToolUse", payload)
         payload["tool_use_id"] = "json-success"
         payload["tool_input"] = {"command": "echo ok > '" + str(targets[1]) + "'"}
         payload["tool_response"] = {"exitCode": 0}
-        self.assertEqual(hook.capture("codex", "PostToolUse", payload, self.state), 1)
+        self.run_hook("codex", "PostToolUse", payload)
+        payload["tool_use_id"] = "line-end-status"
+        payload["tool_input"] = {"command": "echo ok > '" + str(targets[2]) + "'"}
+        payload["tool_response"] = "fixture output\nProcess exited with code 0"
+        self.run_hook("codex", "PostToolUse", payload)
         self.assertEqual({row["path"] for row in self.records()}, {str(path) for path in targets})
         self.assertFalse(any(row.get("gap") for row in self.records()))
+
+    def test_unknown_text_read_only_command_creates_neither_file_nor_gap(self):
+        payload = {
+            "tool_name": "Bash", "cwd": str(self.cwd),
+            "tool_input": {"command": "ls -la"},
+            "tool_response": "ordinary successful command output",
+        }
+        self.run_hook("codex", "PostToolUse", payload)
+        self.assertEqual(self.records(), [])
 
     def test_unknown_codex_text_does_not_claim_success(self):
         target = self.base / "unknown result.txt"
@@ -99,9 +112,18 @@ class RecentAgentFilesHookTests(unittest.TestCase):
             "tool_input": {"command": "echo ok > '" + str(target) + "'"},
             "tool_response": "completed without an exit status",
         }
-        self.assertEqual(hook.capture("codex", "PostToolUse", payload, self.state), 0)
+        self.run_hook("codex", "PostToolUse", payload)
         self.assertFalse(any(row.get("path") == str(target) for row in self.records()))
         self.assertTrue(any(row.get("gap") for row in self.records()))
+
+    def test_cursor_unknown_read_only_shell_response_does_not_create_gap(self):
+        payload = {
+            "tool_name": "Shell", "cwd": str(self.cwd),
+            "tool_input": {"command": "ls -la"},
+            "tool_output": "plain output without structured status",
+        }
+        self.run_hook("cursor", "postToolUse", payload)
+        self.assertEqual(self.records(), [])
 
     def test_failed_codex_cp_and_apply_patch_do_not_claim_existing_destinations(self):
         self.output.write_text("pre-existing")
@@ -115,8 +137,8 @@ class RecentAgentFilesHookTests(unittest.TestCase):
             "tool_input": {"command": "*** Begin Patch\n*** Update File: " + str(self.output) + "\n@@\n-old\n+new\n*** End Patch"},
             "tool_response": {"success": False},
         }
-        self.assertEqual(hook.capture("codex", "PostToolUse", cp, self.state), 0)
-        self.assertEqual(hook.capture("codex", "PostToolUse", patch, self.state), 0)
+        self.run_hook("codex", "PostToolUse", cp)
+        self.run_hook("codex", "PostToolUse", patch)
         rows = self.records()
         self.assertFalse(any(row.get("path") == str(self.output) for row in rows))
         self.assertTrue(any(row.get("gap") for row in rows))
