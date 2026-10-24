@@ -54,10 +54,8 @@ impl App {
             && key.modifiers.is_empty()
             && self.state.tasks.configured
         {
-            self.state.recent_files.keyboard_focus = true;
-            self.state.recent_files.selected =
-                (!self.state.recent_files.files.is_empty()).then_some(0);
-            self.state.recent_files.scroll_offset = 0;
+            let viewport = crate::ui::recent_file_viewport(&self.state);
+            crate::recent_files::begin_keyboard_focus(&mut self.state.recent_files, viewport);
             leave_command_mode(&mut self.state);
             return;
         }

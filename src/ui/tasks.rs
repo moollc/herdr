@@ -340,10 +340,12 @@ pub(super) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
             y += 1;
         }
         if y < area.bottom() {
-            let heading = if app.recent_files.keyboard_focus {
-                " recent files · ↑↓ Enter · Esc"
+            let heading = if app.recent_files.truncated {
+                " agent files · partial"
+            } else if app.recent_files.keyboard_focus {
+                " agent files · ↑↓ Enter · Esc"
             } else {
-                " recent files · prefix+f"
+                " agent files · prefix+f"
             };
             frame.render_widget(
                 Paragraph::new(fit(heading, content.width as usize)).style(dim),
@@ -359,7 +361,7 @@ pub(super) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
                     );
                 } else if app.recent_files.loading {
                     frame.render_widget(
-                        Paragraph::new(" indexing project files…").style(dim),
+                        Paragraph::new(" reading agent activity…").style(dim),
                         Rect::new(content.x, y, content.width, 1),
                     );
                 } else if let Some(error) = &app.recent_files.error {
@@ -369,7 +371,7 @@ pub(super) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
                     );
                 } else if app.recent_files.files.is_empty() {
                     frame.render_widget(
-                        Paragraph::new(" no recent files").style(dim),
+                        Paragraph::new(" no captured agent files").style(dim),
                         Rect::new(content.x, y, content.width, 1),
                     );
                 } else {
@@ -393,8 +395,14 @@ pub(super) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
                         let now =
                             std::time::UNIX_EPOCH + std::time::Duration::from_secs(app.usage_now);
                         let age = crate::recent_files::age(file.modified, now);
-                        let suffix = format!(" {age}");
                         let width = content.width as usize;
+                        // Keep the path readable in a narrow sidebar. The
+                        // provider label appears when there is room for it.
+                        let suffix = if width >= 32 {
+                            format!(" {age} {}", file.agent)
+                        } else {
+                            format!(" {age}")
+                        };
                         let available = width.saturating_sub(prefix.width() + suffix.width());
                         let filename = crate::recent_files::display_name(&file.path, available);
                         let root = app
@@ -762,6 +770,7 @@ mod tests {
                 .map(|path| crate::recent_files::RecentFile {
                     path: path.into(),
                     modified: std::time::SystemTime::now(),
+                    agent: "codex".into(),
                 })
                 .collect(),
             ..Default::default()
@@ -769,11 +778,18 @@ mod tests {
         let buf = draw(&mut app, 160, 24);
         let area = app.view.tasks_rect;
         let rendered = text(&buf);
-        assert!(rendered.contains("recent files"));
+        if let Ok(path) = std::env::var("HERDR_RECENT_AGENT_FILES_RENDER") {
+            std::fs::write(path, rendered.as_bytes()).expect("write recent agent file render");
+        }
+        assert!(rendered.contains("agent files"));
         assert!(
             rendered.contains("Task 0"),
             "top-priority task remains visible"
         );
+        app.recent_files.truncated = true;
+        let partial_rendered = text(&draw(&mut app, 160, 24));
+        assert!(partial_rendered.contains("partial"));
+        app.recent_files.truncated = false;
         assert!(
             rendered.contains("reports"),
             "relative parent path is discoverable"
@@ -796,6 +812,7 @@ mod tests {
             crate::recent_files::RecentFile {
                 path: "/project/reports/new.webp".into(),
                 modified: std::time::SystemTime::now(),
+                agent: "cursor".into(),
             },
         );
         let buf = draw(&mut app, 160, 24);

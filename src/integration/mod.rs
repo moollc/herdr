@@ -27,7 +27,9 @@ const CLAUDE_INTEGRATION_VERSION: u32 = 7;
 const CLAUDE_CONFIG_DIR_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
 const CODEX_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
 const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/herdr-agent-state.sh");
-const CODEX_INTEGRATION_VERSION: u32 = 7;
+const RECENT_AGENT_FILES_HOOK_NAME: &str = "herdr-recent-agent-files.py";
+const RECENT_AGENT_FILES_HOOK_ASSET: &str = include_str!("assets/recent-agent-files.py");
+const CODEX_INTEGRATION_VERSION: u32 = 8;
 const CODEX_HOME_ENV_VAR: &str = "CODEX_HOME";
 const KIMI_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
 const KIMI_HOOK_ASSET: &str = include_str!("assets/kimi/herdr-agent-state.sh");
@@ -273,6 +275,7 @@ pub(crate) struct HermesUninstallResult {
 pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, pane_id: PaneId) {
     cmd.env(crate::api::SOCKET_PATH_ENV_VAR, crate::api::socket_path());
     cmd.env(HERDR_PANE_ID_ENV_VAR, format!("p_{}", pane_id.raw()));
+    cmd.env("HERDR_STATE_DIR", crate::config::state_dir());
 }
 
 pub(crate) fn install_target(
@@ -849,7 +852,7 @@ fn integration_specs() -> Vec<(
         (
             crate::api::schema::IntegrationTarget::Cursor,
             turns::cursor_dir().map(|dir| dir.join("herdr-agent-state.sh")),
-            1,
+            2,
         ),
         (
             crate::api::schema::IntegrationTarget::Pi,
@@ -1224,6 +1227,10 @@ fn install_codex_at(dir: &Path) -> io::Result<CodexInstallPaths> {
     let hook_path = dir.join(CODEX_HOOK_INSTALL_NAME);
     fs::write(&hook_path, CODEX_HOOK_ASSET)?;
     make_executable(&hook_path)?;
+    fs::write(
+        dir.join(RECENT_AGENT_FILES_HOOK_NAME),
+        RECENT_AGENT_FILES_HOOK_ASSET,
+    )?;
     turns::write_helper(
         hook_path
             .parent()
@@ -1281,6 +1288,13 @@ fn install_codex_at(dir: &Path) -> io::Result<CodexInstallPaths> {
         format!("bash {quoted_hook_path} started"),
         10,
         None,
+    )?;
+    ensure_command_hook(
+        hooks,
+        "PostToolUse",
+        format!("bash {quoted_hook_path} recent-files PostToolUse"),
+        10,
+        Some(".*"),
     )?;
     fs::write(&hooks_path, serde_json::to_string_pretty(&hooks_file)?)?;
 
@@ -1715,6 +1729,11 @@ fn uninstall_codex_at(codex_dir: &Path) -> io::Result<CodexUninstallResult> {
                 hooks,
                 "UserPromptSubmit",
                 &format!("bash {quoted_hook_path} working"),
+            )?;
+            updated_hooks |= remove_command_hook(
+                hooks,
+                "PostToolUse",
+                &format!("bash {quoted_hook_path} recent-files PostToolUse"),
             )?;
             updated_hooks |= remove_command_hook(
                 hooks,
@@ -3794,6 +3813,13 @@ mod tests {
         assert!(hooks["hooks"]["UserPromptSubmit"]
             .as_array()
             .is_some_and(|v| v.len() == 1));
+        assert_eq!(hooks["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
+        assert!(hooks["hooks"]["PostToolUse"][0]["matcher"] == ".*");
+        assert!(hooks["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("recent-files PostToolUse"));
+        assert!(codex_dir.join(RECENT_AGENT_FILES_HOOK_NAME).is_file());
         assert!(hooks["hooks"].get("PreToolUse").is_none());
         assert!(hooks["hooks"].get("PermissionRequest").is_none());
         assert!(hooks["hooks"].get("Stop").is_none());

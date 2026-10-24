@@ -2,11 +2,17 @@
 use super::*;
 const CURSOR_HOOK: &str = include_str!("assets/cursor/herdr-agent-state.sh");
 const TURN_HELPER: &str = include_str!("assets/turn-report.py");
+const RECENT_AGENT_FILES_HOOK_NAME: &str = "herdr-recent-agent-files.py";
+const RECENT_AGENT_FILES_HOOK_ASSET: &str = include_str!("assets/recent-agent-files.py");
 const BEGIN: &str = "# >>> herdr turn notifications";
 const END: &str = "# <<< herdr turn notifications";
 
 pub(super) fn write_helper(dir: &Path) -> io::Result<()> {
-    fs::write(dir.join("herdr-turn-report.py"), TURN_HELPER)
+    fs::write(dir.join("herdr-turn-report.py"), TURN_HELPER)?;
+    fs::write(
+        dir.join(RECENT_AGENT_FILES_HOOK_NAME),
+        RECENT_AGENT_FILES_HOOK_ASSET,
+    )
 }
 
 pub(super) fn cursor_dir() -> io::Result<PathBuf> {
@@ -51,7 +57,20 @@ pub(super) fn cursor_registered(script: &Path) -> bool {
                     .iter()
                     .any(|e| e.get("command").and_then(Value::as_str) == Some(command.as_str()))
             })
-    })
+    }) && settings
+        .as_ref()
+        .and_then(|s| s.get("hooks"))
+        .and_then(|h| h.get("afterFileEdit"))
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            let command = format!(
+                "python3 {} cursor afterFileEdit",
+                shell_single_quote(&dir.join(RECENT_AGENT_FILES_HOOK_NAME).display().to_string())
+            );
+            entries
+                .iter()
+                .any(|entry| entry.get("command").and_then(Value::as_str) == Some(command.as_str()))
+        })
 }
 pub(super) fn uninstall_cursor() -> io::Result<Vec<String>> {
     let dir = cursor_dir()?;
@@ -86,6 +105,22 @@ fn cursor_hooks(dir: &Path, remove: bool) -> io::Result<()> {
         if entries.is_empty() {
             hooks.remove(event);
         }
+    }
+    let recent_script =
+        shell_single_quote(&dir.join(RECENT_AGENT_FILES_HOOK_NAME).display().to_string());
+    let event = "afterFileEdit";
+    let command = format!("python3 {recent_script} cursor {event}");
+    let entries = hooks
+        .entry(event.to_string())
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| io::Error::other("cursor afterFileEdit hooks must be an array"))?;
+    entries.retain(|entry| entry.get("command").and_then(Value::as_str) != Some(command.as_str()));
+    if !remove {
+        entries.push(json!({"command": command}));
+    }
+    if entries.is_empty() {
+        hooks.remove(event);
     }
     fs::write(path, serde_json::to_string_pretty(&settings)?)
 }
@@ -229,6 +264,14 @@ mod tests {
         let parsed: Value =
             serde_json::from_str(&fs::read_to_string(dir.join("hooks.json")).unwrap()).unwrap();
         assert_eq!(parsed["hooks"]["stop"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            parsed["hooks"]["afterFileEdit"].as_array().unwrap().len(),
+            1
+        );
+        assert!(parsed["hooks"]["afterFileEdit"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("cursor afterFileEdit"));
         cursor_hooks(&dir, true).unwrap();
         let restored: Value =
             serde_json::from_str(&fs::read_to_string(dir.join("hooks.json")).unwrap()).unwrap();
@@ -237,5 +280,6 @@ mod tests {
             json!([{"command":"echo keep","loop_limit":3}])
         );
         assert!(restored["hooks"].get("sessionStart").is_none());
+        assert!(restored["hooks"].get("afterFileEdit").is_none());
     }
 }

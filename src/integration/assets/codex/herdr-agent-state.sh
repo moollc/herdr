@@ -3,12 +3,16 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=codex
-# HERDR_INTEGRATION_VERSION=7
+# HERDR_INTEGRATION_VERSION=8
 
 set -eu
 
 action="${1:-}"
 case "$action" in
+  recent-files)
+    command -v python3 >/dev/null 2>&1 || exit 0
+    exec python3 "$(dirname "$0")/herdr-recent-agent-files.py" codex "${2:-}"
+    ;;
   started|ended|notify)
     command -v python3 >/dev/null 2>&1 || exit 0
     exec python3 "$(dirname "$0")/herdr-turn-report.py" codex "$action" "${2:-}"

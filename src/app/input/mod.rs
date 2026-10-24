@@ -163,6 +163,11 @@ impl App {
         if event.kind == crossterm::event::KeyEventKind::Release {
             return true;
         }
+        if crate::ui::recent_file_viewport(&self.state).is_none() {
+            self.state.recent_files.keyboard_focus = false;
+            self.state.recent_files.selected = None;
+            return true;
+        }
         match event.code {
             KeyCode::Esc => {
                 self.state.recent_files.keyboard_focus = false;

@@ -1,26 +1,21 @@
-//! Bounded background indexing for user-facing files in the selected space.
+//! Durable, provenance-based list of files explicitly written by agent hooks.
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, TryRecvError},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const RESCAN: Duration = Duration::from_secs(20);
-const MAX_DIRECTORIES: usize = 2_000;
-const MAX_FILES: usize = 20_000;
-const MAX_DEPTH: usize = 10;
+const MAX_JOURNAL_BYTES: u64 = 512 * 1024;
+const MAX_JOURNAL_RECORDS: usize = 500;
 const MAX_RESULTS: usize = 100;
+const JOURNAL_NAME: &str = "recent-agent-files.jsonl";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecentFile {
     pub path: PathBuf,
     pub modified: SystemTime,
+    pub agent: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -36,31 +31,30 @@ pub(crate) struct RecentFilesSnapshot {
     pub keyboard_focus: bool,
 }
 
-struct ScanResult {
-    root: PathBuf,
-    files: Vec<RecentFile>,
-    truncated: bool,
-    error: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JournalStamp {
+    modified: SystemTime,
+    len: u64,
 }
 
 pub(crate) struct RecentFilesWatcher {
     root: Option<PathBuf>,
-    next_scan: Option<Instant>,
+    journal: PathBuf,
+    stamp: Option<JournalStamp>,
     next_poll: Instant,
-    result_rx: Option<Receiver<ScanResult>>,
-    cancel: Option<Arc<AtomicBool>>,
-    in_flight: bool,
 }
 
 impl RecentFilesWatcher {
     pub fn new() -> Self {
+        Self::with_journal_path(crate::config::state_dir().join(JOURNAL_NAME))
+    }
+
+    fn with_journal_path(journal: PathBuf) -> Self {
         Self {
             root: None,
-            next_scan: None,
+            journal,
+            stamp: None,
             next_poll: Instant::now(),
-            result_rx: None,
-            cancel: None,
-            in_flight: false,
         }
     }
 
@@ -68,6 +62,7 @@ impl RecentFilesWatcher {
         self.root.as_ref().map(|_| self.next_poll)
     }
 
+    /// Read only Herdr's bounded activity journal; never traverse workspace paths.
     pub fn poll(
         &mut self,
         now: Instant,
@@ -76,223 +71,152 @@ impl RecentFilesWatcher {
     ) -> bool {
         let mut changed = false;
         if root != self.root {
-            if let Some(cancel) = self.cancel.take() {
-                cancel.store(true, Ordering::Relaxed);
-            }
             self.root = root.clone();
-            self.result_rx = None;
-            self.in_flight = false;
-            self.next_scan = root.as_ref().map(|_| now);
-            *snapshot = RecentFilesSnapshot {
-                root: root.clone(),
-                loading: root.is_some(),
-                ..RecentFilesSnapshot::default()
-            };
+            if root.is_none() {
+                *snapshot = RecentFilesSnapshot::default();
+                self.stamp = None;
+                return true;
+            }
+            snapshot.root = root.clone();
+            snapshot.loading = true;
             changed = true;
         }
-        if let Some(receiver) = &self.result_rx {
-            match receiver.try_recv() {
-                Ok(result) => {
-                    self.result_rx = None;
-                    self.in_flight = false;
-                    self.next_scan = Some(now + RESCAN);
-                    if self.root.as_ref() == Some(&result.root) {
-                        snapshot.files = result.files;
-                        snapshot.truncated = result.truncated;
-                        snapshot.error = result.error;
-                        snapshot.loading = false;
-                        snapshot.selected = snapshot
-                            .selected
-                            .filter(|index| *index < snapshot.files.len());
-                        if snapshot.selected.is_none() && snapshot.keyboard_focus {
-                            snapshot.selected = (!snapshot.files.is_empty()).then_some(0);
-                        }
-                        snapshot.scroll_offset = snapshot
-                            .scroll_offset
-                            .min(snapshot.files.len().saturating_sub(1));
-                        changed = true;
-                    }
-                }
-                Err(TryRecvError::Disconnected) => {
-                    self.result_rx = None;
-                    self.in_flight = false;
-                    self.next_scan = Some(now + RESCAN);
-                    snapshot.loading = false;
-                    snapshot.error = Some("Recent files could not be indexed".into());
-                    changed = true;
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-        }
-        if self.root.is_some()
-            && !self.in_flight
-            && self.next_scan.is_some_and(|deadline| now >= deadline)
-        {
-            self.start_scan();
+        if root.is_none() || now < self.next_poll {
+            return changed;
         }
         self.next_poll = now + Duration::from_secs(1);
+
+        let current_stamp = fs::metadata(&self.journal).ok().and_then(|metadata| {
+            Some(JournalStamp {
+                modified: metadata.modified().ok()?,
+                len: metadata.len(),
+            })
+        });
+        if current_stamp == self.stamp && !changed {
+            return false;
+        }
+        self.stamp = current_stamp;
+        let old_selected = snapshot
+            .selected
+            .and_then(|index| snapshot.files.get(index))
+            .map(|file| file.path.clone());
+        let (files, truncated, error) = match read_journal(&self.journal) {
+            Ok(result) => result,
+            Err(error) => (Vec::new(), true, Some(error)),
+        };
+        snapshot.files = files;
+        snapshot.truncated = truncated;
+        snapshot.error = error;
+        snapshot.loading = false;
+        snapshot.selected = old_selected
+            .and_then(|path| snapshot.files.iter().position(|file| file.path == path))
+            .or_else(|| {
+                snapshot
+                    .selected
+                    .filter(|index| *index < snapshot.files.len())
+            });
+        if snapshot.selected.is_none() && snapshot.keyboard_focus {
+            snapshot.selected = (!snapshot.files.is_empty()).then_some(0);
+        }
+        snapshot.scroll_offset = snapshot
+            .scroll_offset
+            .min(snapshot.files.len().saturating_sub(1));
+        changed = true;
         changed
     }
-
-    fn start_scan(&mut self) {
-        let Some(root) = self.root.clone() else {
-            return;
-        };
-        let (tx, rx) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = cancel.clone();
-        thread::spawn(move || {
-            let _ = tx.send(scan_root_cancellable(&root, &worker_cancel));
-        });
-        self.result_rx = Some(rx);
-        self.cancel = Some(cancel);
-        self.in_flight = true;
-        self.next_scan = None;
-    }
 }
 
-fn ignored_directory(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        ".git"
-            | ".herdr"
-            | ".codex"
-            | ".claude"
-            | ".config"
-            | ".secrets"
-            | ".credentials"
-            | ".ssh"
-            | ".aws"
-            | ".kube"
-            | ".npm"
-            | ".cargo"
-            | "target"
-            | "node_modules"
-            | "dist"
-            | "build"
-            | "out"
-            | "coverage"
-            | "logs"
-            | "log"
-            | "cache"
-            | ".cache"
-            | ".next"
-            | ".turbo"
-            | "vendor"
-            | "config"
-            | "configs"
-            | "configuration"
-            | "auth"
-            | "secrets"
-            | "credentials"
-            | "tmp"
-            | "temp"
-    )
-}
-
-fn ignored_file(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.starts_with(".env")
-        || lower == ".npmrc"
-        || lower == ".pypirc"
-        || ["credential", "secret"]
-            .iter()
-            .any(|part| lower.contains(part))
-        || lower == "auth"
-        || lower.starts_with("auth.")
-        || lower.starts_with("auth_")
-        || lower == "token"
-        || lower.starts_with("token.")
-        || lower.starts_with("token_")
-        || lower.starts_with("id_rsa")
-        || lower.starts_with("id_ed25519")
-        || [".pem", ".key", ".p12", ".pfx", ".mobileprovision"]
-            .iter()
-            .any(|ext| lower.ends_with(ext))
-        || matches!(
-            lower.as_str(),
-            "config.toml" | "settings.json" | "credentials.json" | "secrets.json"
-        )
-}
-
-#[cfg(test)]
-fn scan_root(root: &Path) -> ScanResult {
-    scan_root_cancellable(root, &AtomicBool::new(false))
-}
-
-fn scan_root_cancellable(root: &Path, cancel: &AtomicBool) -> ScanResult {
-    let mut result = ScanResult {
-        root: root.to_path_buf(),
-        files: Vec::new(),
-        truncated: false,
-        error: None,
+fn read_journal(journal: &Path) -> Result<(Vec<RecentFile>, bool, Option<String>), String> {
+    let bytes = match fs::read(journal) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), false, None));
+        }
+        Err(_) => return Err("Agent file activity journal is unavailable".into()),
     };
-    match fs::metadata(root) {
-        Ok(metadata) if metadata.is_dir() => {}
-        _ => {
-            result.error = Some("Project folder is unavailable".into());
-            return result;
-        }
+    if bytes.len() as u64 > MAX_JOURNAL_BYTES {
+        return Err("Agent file activity journal exceeded its size limit".into());
     }
-    let mut pending = vec![(root.to_path_buf(), 0usize)];
-    let (mut dirs, mut files) = (0usize, 0usize);
-    while let Some((directory, depth)) = pending.pop() {
-        if cancel.load(Ordering::Relaxed) {
-            break;
+
+    let journal_absolute = fs::canonicalize(journal).ok();
+    let mut by_path: HashMap<PathBuf, RecentFile> = HashMap::new();
+    let mut partial = false;
+    let mut record_count = 0;
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
         }
-        dirs += 1;
-        if dirs > MAX_DIRECTORIES {
-            result.truncated = true;
-            break;
-        }
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(_) if directory == root => {
-                result.error = Some("Project folder is unavailable".into());
-                return result;
-            }
-            Err(_) => continue,
+        record_count += 1;
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(line) else {
+            partial = true;
+            continue;
         };
-        for entry in entries.flatten() {
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            if kind.is_dir() {
-                if !ignored_directory(&name) {
-                    if depth < MAX_DEPTH {
-                        pending.push((path, depth + 1));
-                    } else {
-                        result.truncated = true;
-                    }
-                }
-            } else if kind.is_file() && !ignored_file(&name) {
-                files += 1;
-                if files > MAX_FILES {
-                    result.truncated = true;
-                    pending.clear();
-                    break;
-                }
-                if let Ok(metadata) = entry.metadata() {
-                    if let Ok(modified) = metadata.modified() {
-                        result.files.push(RecentFile { path, modified });
-                    }
-                }
+        partial |= record
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let Some(path) = record.get("path").and_then(serde_json::Value::as_str) else {
+            partial = true;
+            continue;
+        };
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            partial = true;
+            continue;
+        }
+        if path == journal
+            || fs::canonicalize(&path)
+                .ok()
+                .as_ref()
+                .is_some_and(|path| journal_absolute.as_ref() == Some(path))
+        {
+            continue;
+        }
+        let Some(time_ns) = record.get("time_ns").and_then(serde_json::Value::as_u64) else {
+            partial = true;
+            continue;
+        };
+        let Some(agent) = record.get("agent").and_then(serde_json::Value::as_str) else {
+            partial = true;
+            continue;
+        };
+        if record
+            .get("provenance")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            partial = true;
+            continue;
+        }
+        if !matches!(agent, "codex" | "cursor") || !is_regular_file(&path) {
+            partial = true;
+            continue;
+        }
+        let file = RecentFile {
+            path: path.clone(),
+            modified: UNIX_EPOCH + Duration::from_nanos(time_ns),
+            agent: agent.to_string(),
+        };
+        match by_path.get(&path) {
+            Some(current) if current.modified >= file.modified => {}
+            _ => {
+                by_path.insert(path, file);
             }
         }
     }
-    result.files.sort_by(|a, b| {
+    if record_count > MAX_JOURNAL_RECORDS {
+        partial = true;
+    }
+    let mut files: Vec<_> = by_path.into_values().collect();
+    files.sort_by(|a, b| {
         b.modified
             .cmp(&a.modified)
             .then_with(|| a.path.cmp(&b.path))
     });
-    result.truncated |= result.files.len() > MAX_RESULTS;
-    result.files.truncate(MAX_RESULTS);
-    result
+    let truncated = partial || files.len() > MAX_RESULTS;
+    files.truncate(MAX_RESULTS);
+    let error = partial.then(|| "Some agent file events were incomplete or unsupported".into());
+    Ok((files, truncated, error))
 }
 
 pub(crate) fn display_name(path: &Path, width: usize) -> String {
@@ -374,117 +298,165 @@ pub(crate) fn selected_for_open(snapshot: &RecentFilesSnapshot) -> Option<usize>
         .filter(|index| *index < snapshot.files.len())
 }
 
+pub(crate) fn begin_keyboard_focus(
+    snapshot: &mut RecentFilesSnapshot,
+    viewport: Option<(u16, usize)>,
+) {
+    if viewport.is_some_and(|(_, visible)| visible > 0) {
+        snapshot.keyboard_focus = true;
+        snapshot.selected = (!snapshot.files.is_empty()).then_some(0);
+        snapshot.scroll_offset = 0;
+    } else {
+        snapshot.keyboard_focus = false;
+        snapshot.selected = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn indexes_untracked_files_newest_first_and_excludes_private_and_generated_paths() {
-        let root = std::env::temp_dir().join(format!(
-            "herdr-recent-files-{}-{}",
+    fn fixture_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-recent-journal-{label}-{}-{}",
             std::process::id(),
             SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
+                .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        fs::create_dir_all(root.join("reports")).expect("reports dir");
-        fs::create_dir_all(root.join("target")).expect("target dir");
-        fs::create_dir_all(root.join(".git")).expect("git dir");
-        fs::create_dir_all(root.join("reports/assets")).expect("asset directory");
-        fs::write(root.join("reports/older report.md"), "old").expect("old report");
-        fs::write(root.join("reports/assets/preview.webp"), "image").expect("image output");
-        thread::sleep(Duration::from_millis(15));
-        fs::write(root.join("reports/最新.html"), "new").expect("new report");
-        fs::write(root.join("reports/.env.local"), "secret").expect("secret file");
-        fs::write(root.join("target/generated.webp"), "generated").expect("generated file");
-        fs::write(root.join(".git/index"), "git").expect("git file");
-        let result = scan_root(&root);
-        assert_eq!(result.files.len(), 3);
-        assert_eq!(
-            result.files[0].path.file_name().unwrap().to_string_lossy(),
-            "最新.html"
-        );
-        assert!(result.files[0].modified >= result.files[1].modified);
-        assert!(display_name(Path::new("long report name.webp"), 12).ends_with(".webp"));
+        fs::create_dir_all(&path).expect("fixture dir");
+        path
+    }
+
+    fn event(path: &Path, time_ns: u64, agent: &str) -> serde_json::Value {
+        serde_json::json!({
+            "path": path,
+            "time_ns": time_ns,
+            "agent": agent,
+            "provenance": format!("{agent}.PostToolUse.fixture"),
+            "event_id": format!("fixture-{time_ns}"),
+        })
     }
 
     #[test]
-    fn changing_workspace_discards_old_rows_and_shows_the_new_root() {
-        let a = std::env::temp_dir().join(format!("herdr-recent-a-{}", std::process::id()));
-        let b = std::env::temp_dir().join(format!("herdr-recent-b-{}", std::process::id()));
-        fs::create_dir_all(&a).expect("first workspace");
-        fs::create_dir_all(&b).expect("second workspace");
-        fs::write(a.join("one.md"), "one").expect("first file");
-        fs::write(b.join("two.md"), "two").expect("second file");
-        let mut watcher = RecentFilesWatcher::new();
-        let mut snapshot = RecentFilesSnapshot::default();
-        let now = Instant::now();
-        watcher.poll(now, Some(a), &mut snapshot);
-        watcher.poll(
-            now + Duration::from_millis(1),
-            Some(b.clone()),
-            &mut snapshot,
-        );
-        assert!(snapshot.files.is_empty());
-        assert_eq!(snapshot.root, Some(b.clone()));
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while snapshot.loading && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-            watcher.poll(Instant::now(), Some(b.clone()), &mut snapshot);
-        }
-        assert_eq!(snapshot.files.len(), 1);
-        assert_eq!(snapshot.files[0].path, b.join("two.md"));
+    fn journal_lists_untracked_outside_root_paths_and_deduplicates_by_latest_event() {
+        let base = fixture_dir("outside");
+        let workspace = base.join("workspace");
+        let outside = base.join("outside path").join("résumé.html");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(outside.parent().unwrap()).expect("outside");
+        fs::write(&outside, "tiny fixture").expect("file");
+        let journal = base.join("state").join(JOURNAL_NAME);
+        fs::create_dir_all(journal.parent().unwrap()).expect("state");
+        let records = [
+            event(&outside, 100, "cursor"),
+            event(&outside, 200, "codex"),
+        ];
+        fs::write(
+            &journal,
+            records
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("journal");
+        let (files, truncated, error) = read_journal(&journal).expect("read journal");
+        assert!(!truncated);
+        assert_eq!(error, None);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, outside);
+        assert_eq!(files[0].agent, "codex");
+        assert_eq!(files[0].modified, UNIX_EPOCH + Duration::from_nanos(200));
+    }
+
+    #[test]
+    fn another_process_change_without_a_journal_event_is_not_discovered() {
+        let base = fixture_dir("no-event");
+        let output = base.join("untracked.txt");
+        fs::write(&output, "process-only output").expect("file");
+        let (files, _, _) = read_journal(&base.join(JOURNAL_NAME)).expect("empty journal");
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn journal_survives_watcher_restart_and_ignores_its_own_path() {
+        let base = fixture_dir("restart");
+        let output = base.join("result.txt");
+        fs::write(&output, "text").expect("output");
+        let journal = base.join(JOURNAL_NAME);
+        let first = event(&output, 123, "cursor").to_string();
+        let self_event = event(&journal, 124, "codex").to_string();
+        fs::write(&journal, format!("{first}\n{self_event}\n")).expect("journal");
+        let (files, _, error) = read_journal(&journal).expect("first read");
+        assert_eq!(error, None);
+        assert_eq!(files.len(), 1);
+        let (after_restart, _, _) = read_journal(&journal).expect("restarted read");
+        assert_eq!(after_restart, files);
+    }
+
+    #[test]
+    fn malformed_partial_state_is_reported_instead_of_claimed_complete() {
+        let base = fixture_dir("partial");
+        let journal = base.join(JOURNAL_NAME);
+        fs::write(&journal, "{bad json}\n").expect("journal");
+        let (files, truncated, error) = read_journal(&journal).expect("read partial state");
+        assert!(files.is_empty());
+        assert!(truncated);
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn hidden_viewport_cannot_receive_keyboard_focus() {
+        let mut snapshot = RecentFilesSnapshot {
+            files: vec![RecentFile {
+                path: PathBuf::from("/tmp/not-visible.txt"),
+                modified: UNIX_EPOCH,
+                agent: "codex".into(),
+            }],
+            ..RecentFilesSnapshot::default()
+        };
+        begin_keyboard_focus(&mut snapshot, None);
+        assert!(!snapshot.keyboard_focus);
+        assert_eq!(selected_for_open(&snapshot), None);
     }
 
     #[test]
     fn updated_file_moves_to_top_once_and_keyboard_selection_targets_enter() {
-        let root = std::env::temp_dir().join(format!(
-            "herdr-recent-update-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&root).expect("project root");
-        let old = root.join("older.txt");
-        let current = root.join("current report.html");
-        fs::write(&old, "old").expect("old file");
-        thread::sleep(Duration::from_millis(15));
+        let base = fixture_dir("order");
+        let older = base.join("older report.txt");
+        let current = base.join("current report.html");
+        fs::write(&older, "old").expect("old file");
         fs::write(&current, "current").expect("current file");
-        let first_scan = scan_root(&root);
-        assert_eq!(first_scan.files[0].path, current);
-        assert_eq!(
-            first_scan
-                .files
+        let journal = base.join(JOURNAL_NAME);
+        let records = [
+            event(&older, 100, "cursor"),
+            event(&current, 200, "codex"),
+            event(&older, 300, "codex"),
+        ];
+        fs::write(
+            &journal,
+            records
                 .iter()
-                .filter(|file| file.path == current)
-                .count(),
-            1
-        );
-        thread::sleep(Duration::from_millis(15));
-        fs::write(&old, "updated").expect("update old file");
-        let second_scan = scan_root(&root);
-        assert_eq!(second_scan.files[0].path, old);
-        assert_eq!(
-            second_scan
-                .files
-                .iter()
-                .filter(|file| file.path == old)
-                .count(),
-            1
-        );
-
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("journal");
+        let (files, _, _) = read_journal(&journal).expect("read journal");
+        assert_eq!(files[0].path, older);
+        assert_eq!(files.iter().filter(|file| file.path == older).count(), 1);
         let mut snapshot = RecentFilesSnapshot {
-            files: second_scan.files,
+            files,
             selected: Some(0),
             keyboard_focus: true,
             ..RecentFilesSnapshot::default()
         };
         move_selection(&mut snapshot, true, 1);
         assert_eq!(selected_for_open(&snapshot), Some(1));
-        assert!(is_regular_file(&old));
-        assert!(!is_regular_file(&root.join("deleted before open.txt")));
+        assert!(is_regular_file(&older));
+        assert!(!is_regular_file(&base.join("deleted before open.txt")));
+        assert!(display_name(Path::new("long résumé report.webp"), 14).ends_with(".webp"));
     }
 }
