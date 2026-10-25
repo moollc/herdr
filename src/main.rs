@@ -307,6 +307,10 @@ state_colors = true
 # claude_statusline = false # display only; set true to print meters; usage is recorded either way
 # cursor_pools = "both" # both or tighter; table and sidebar, labelled cm and om. A pane header always shows the tighter pool (cm or om)
 # codex_home = "~/.codex" # read first; $CODEX_HOME, ~/.codex and pane Codex homes are read too
+# openrouter_codex_home = "~/.codex-openrouter" # panes running Codex with this home show OpenRouter, not GPT
+# openrouter_key_file = "" # owner-only (0600) file holding the OpenRouter inference key; read, never printed
+# openrouter_key_env = "" # or the name of an environment variable holding that key
+# openrouter_management_key_file = "" # optional owner-only Management key for the paid credit balance; without it credit reads "unknown"
 
 # Allowance guard. When a provider's five hour allowance is low or falls fast,
 # every working agent on it, in any space, gets one note to wind down, and at

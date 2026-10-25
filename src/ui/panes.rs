@@ -563,6 +563,7 @@ fn pane_chrome_title_for_pane(
         git: git_suffix(branch.as_deref(), status.as_deref()),
         usage: super::usage_bar::header_usage_for(
             app,
+            app.terminal_id_for_any_pane(pane_id).as_ref(),
             terminal.and_then(|terminal| terminal.effective_known_agent()),
         ),
     }
@@ -2248,6 +2249,7 @@ mod tests {
             taken_at: 1_000_000,
             providers: vec![ProviderUsage {
                 extra_spend: None,
+                openrouter: None,
                 provider: Provider::Claude,
                 windows: vec![
                     UsageWindow {

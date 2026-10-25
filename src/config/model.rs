@@ -745,6 +745,17 @@ pub struct UsageDisplayConfig {
     /// A pane header always draws the tighter pool, labelled `cm` or `om`.
     pub cursor_pools: CursorPools,
     pub codex_home: Option<String>,
+    /// Codex home of an OpenRouter-backed Codex. Its panes count as OpenRouter, not GPT.
+    /// Default: `~/.codex-openrouter`.
+    pub openrouter_codex_home: Option<String>,
+    /// Owner-only file with the OpenRouter inference key (one token line). Empty: none.
+    /// The key is read, never printed or stored. Nothing is requested without it.
+    pub openrouter_key_file: Option<String>,
+    /// Environment variable with the OpenRouter inference key, used when no key file is set.
+    pub openrouter_key_env: Option<String>,
+    /// Owner-only file with a separate OpenRouter Management key, for the paid credit balance.
+    /// Without it the credit reading says `?` and the free count still works.
+    pub openrouter_management_key_file: Option<String>,
     /// Program and arguments; the spoken phrase is appended as the final argument.
     pub alert_command: String,
 }
@@ -761,6 +772,10 @@ impl Default for UsageDisplayConfig {
             claude_statusline: false,
             cursor_pools: CursorPools::Both,
             codex_home: None,
+            openrouter_codex_home: None,
+            openrouter_key_file: None,
+            openrouter_key_env: None,
+            openrouter_management_key_file: None,
             alert_command: String::new(),
         }
     }

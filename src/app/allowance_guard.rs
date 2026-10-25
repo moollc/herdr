@@ -8,7 +8,7 @@ use crate::allowance_guard::{self, Event};
 use crate::app::App;
 use crate::detect::{Agent, AgentState};
 use crate::terminal::TerminalId;
-use crate::ui::usage_bar::{provider_for_agent, provider_name};
+use crate::ui::usage_bar::{provider_for_terminal, provider_name};
 use crate::usage::{Provider, UsageSnapshot};
 
 /// How often panes are looked at while the guard is active on a provider.
@@ -166,8 +166,10 @@ impl App {
             .terminals
             .iter()
             .filter(|(_, t)| t.state == AgentState::Working)
-            .filter(|(_, t)| {
-                t.effective_known_agent().and_then(provider_for_agent) == Some(provider)
+            .filter(|(id, t)| {
+                t.effective_known_agent()
+                    .and_then(|agent| provider_for_terminal(&self.state, Some(*id), agent))
+                    == Some(provider)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -477,6 +479,7 @@ mod tests {
             taken_at: at,
             providers: vec![ProviderUsage {
                 extra_spend: None,
+                openrouter: None,
                 provider,
                 windows: vec![UsageWindow {
                     kind: if provider == Provider::Cursor {

@@ -93,6 +93,15 @@ impl App {
             return;
         }
 
+        if let AppEvent::UsagePanesResolved { terminals } = ev {
+            if self.state.usage_openrouter_terminals != terminals {
+                self.state.usage_openrouter_terminals = terminals;
+                self.render_dirty.store(true, Ordering::Release);
+                self.render_notify.notify_one();
+            }
+            return;
+        }
+
         if let AppEvent::UsageRefreshed { snapshot, finished } = ev {
             if finished {
                 self.usage_refresh_landed(Instant::now());

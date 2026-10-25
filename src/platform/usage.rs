@@ -28,6 +28,25 @@ pub(crate) fn local_time(epoch: u64, format: &std::ffi::CStr) -> String {
     }
 }
 
+/// True when the opened file is a regular file owned by the current user, with no group or
+/// other permission bits. Judged on the open descriptor, so the check and the read see the
+/// same file. A symlink is judged by the file it opens to. Other hosts refuse every key file.
+#[cfg(unix)]
+pub(crate) fn key_file_is_private(file: &fs::File) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    meta.is_file() && meta.uid() == uid && meta.permissions().mode() & 0o077 == 0
+}
+
+#[cfg(not(unix))]
+pub(crate) fn key_file_is_private(_file: &fs::File) -> bool {
+    false
+}
+
 pub(crate) fn lock_statusline(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;

@@ -14,6 +14,7 @@ use ratatui::{
 use crate::app::AppState;
 use crate::usage::{
     countdown::countdown,
+    openrouter,
     palette::{self, EMPTY},
     Provider, ProviderUsage, UsageProblem, UsageSnapshot, WindowKind,
 };
@@ -30,6 +31,7 @@ const CURSOR_STALE_MARGIN_SECS: u64 = 60;
 pub(crate) fn stale_after_secs(provider: Provider) -> u64 {
     match provider {
         Provider::Claude | Provider::Codex => STALE_AFTER_SECS,
+        Provider::OpenRouter => openrouter::STALE_AFTER_SECS,
         Provider::Cursor => {
             crate::usage::CURSOR_MIN_INTERVAL_SECS
                 + crate::app::USAGE_REFRESH_INTERVAL.as_secs()
@@ -74,11 +76,27 @@ pub(crate) fn provider_for_agent(agent: crate::detect::Agent) -> Option<Provider
     }
 }
 
+/// The provider a terminal's agent runs on. A Codex pane whose process runs
+/// with the OpenRouter home is OpenRouter, never GPT.
+pub(crate) fn provider_for_terminal(
+    app: &AppState,
+    terminal_id: Option<&crate::terminal::TerminalId>,
+    agent: crate::detect::Agent,
+) -> Option<Provider> {
+    if agent == crate::detect::Agent::Codex
+        && terminal_id.is_some_and(|id| app.usage_openrouter_terminals.contains(id))
+    {
+        return Some(Provider::OpenRouter);
+    }
+    provider_for_agent(agent)
+}
+
 pub(crate) fn provider_name(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "Claude",
         Provider::Codex => "GPT",
         Provider::Cursor => "Cursor",
+        Provider::OpenRouter => "OpenRouter",
     }
 }
 
@@ -90,6 +108,8 @@ pub(crate) fn window_label(kind: WindowKind) -> &'static str {
         WindowKind::Auto => "cm",
         WindowKind::Named => "om",
         WindowKind::ExtraSpend => "$",
+        WindowKind::Daily => "1d",
+        WindowKind::Credit => "cr",
     }
 }
 
@@ -101,6 +121,8 @@ pub(crate) fn window_phrase(kind: WindowKind) -> &'static str {
         WindowKind::Auto => "models",
         WindowKind::Named => "other models",
         WindowKind::ExtraSpend => "extra spend",
+        WindowKind::Daily => "free daily",
+        WindowKind::Credit => "credit",
     }
 }
 
@@ -133,12 +155,26 @@ fn default_kinds(provider: Provider) -> &'static [WindowKind] {
     match provider {
         Provider::Claude | Provider::Codex => &[WindowKind::FiveHour, WindowKind::Weekly],
         Provider::Cursor => &[WindowKind::Auto, WindowKind::Named],
+        Provider::OpenRouter => &[WindowKind::Daily, WindowKind::Credit],
     }
 }
 
-pub(crate) fn is_stale(usage: &ProviderUsage, now: u64) -> bool {
-    usage
-        .seen_at
+/// When a window's reading was taken. OpenRouter's two readings each keep their own time.
+fn reading_seen(usage: &ProviderUsage, kind: WindowKind) -> Option<u64> {
+    if usage.provider != Provider::OpenRouter {
+        return usage.seen_at;
+    }
+    let detail = usage.openrouter.as_ref()?;
+    match kind {
+        WindowKind::Daily => detail.free.as_ref().map(|free| free.seen_at),
+        WindowKind::Credit => detail.credit.as_ref().map(|credit| credit.seen_at),
+        _ => None,
+    }
+}
+
+/// A window's reading is drawn dimmed once it is older than its provider allows.
+fn reading_stale(usage: &ProviderUsage, kind: WindowKind, now: u64) -> bool {
+    reading_seen(usage, kind)
         .is_some_and(|seen| now.saturating_sub(seen) > stale_after_secs(usage.provider))
 }
 
@@ -147,10 +183,63 @@ pub(crate) fn lit_squares(left_pct: Option<u8>) -> usize {
     left_pct.map_or(0, |left| usize::from(left.min(100)).div_ceil(10))
 }
 
+/// The OpenRouter row: two readings, each with its own age and problem. `1d` is the free
+/// requests left today, with a countdown to the next UTC day. `cr` is the paid balance in
+/// dollars. It has no reset, so it has no countdown.
+fn openrouter_meters(usage: &ProviderUsage, now: u64) -> Vec<Meter> {
+    let detail = usage.openrouter.clone().unwrap_or_default();
+    let windows = openrouter::windows(&detail, now);
+    [WindowKind::Daily, WindowKind::Credit]
+        .into_iter()
+        .map(|kind| {
+            let window = windows.iter().find(|w| w.kind == kind);
+            let left = window.and_then(|w| w.left_pct);
+            let resets_at = window.and_then(|w| w.resets_at);
+            let (mut number, stale) = openrouter::number_text(&detail, kind, now);
+            if number == "?" {
+                let problem = match kind {
+                    WindowKind::Credit => detail.credit_problem.as_ref(),
+                    _ => detail.free_problem.as_ref(),
+                };
+                if let Some(problem) = problem {
+                    number = problem_text(problem).into();
+                }
+            }
+            let text = match kind {
+                WindowKind::Credit => String::new(),
+                _ => countdown(resets_at, now).text,
+            };
+            Meter {
+                label: window_label(kind),
+                lit: lit_squares(left),
+                rgb: palette::level_rgb(usage.provider, kind, left),
+                number,
+                countdown: text,
+                stale,
+            }
+        })
+        .collect()
+}
+
+/// What a reading with no value says in place of `?`, so the reason shows.
+fn problem_text(problem: &UsageProblem) -> &'static str {
+    match problem {
+        UsageProblem::NoLogin => "no key",
+        UsageProblem::LoginExpired => "key rejected",
+        UsageProblem::PermissionDenied => "unknown",
+        UsageProblem::RateLimited => "rate limited",
+        UsageProblem::Offline => "offline",
+        UsageProblem::FormatChanged => "format changed",
+        UsageProblem::NoData => "?",
+    }
+}
+
 /// The meters for one provider. A provider with no windows yet gets
 /// placeholders so the bar says `?` rather than vanishing.
 pub(crate) fn meters_for(usage: &ProviderUsage, now: u64) -> Vec<Meter> {
-    let stale = is_stale(usage, now);
+    if usage.provider == Provider::OpenRouter {
+        return openrouter_meters(usage, now);
+    }
     let text_instead = match usage.problem {
         Some(UsageProblem::LoginExpired) => Some("login expired"),
         Some(UsageProblem::NoLogin) => Some("no login"),
@@ -180,7 +269,7 @@ pub(crate) fn meters_for(usage: &ProviderUsage, now: u64) -> Vec<Meter> {
             rgb: palette::level_rgb(usage.provider, kind, left),
             number,
             countdown: cd.text,
-            stale,
+            stale: reading_stale(usage, kind, now),
         }
     };
     if usage.windows.is_empty() {
@@ -252,6 +341,11 @@ fn rgb_color(rgb: (u8, u8, u8)) -> Color {
     Color::Rgb(rgb.0, rgb.1, rgb.2)
 }
 
+/// A meter with no countdown (credit) skips that part in every layout.
+fn countdown_shown(meter: &Meter, fit: Fit) -> bool {
+    fit.countdown && !meter.countdown.is_empty()
+}
+
 fn meter_width(meter: &Meter, fit: Fit) -> usize {
     let mut parts = Vec::new();
     if fit.labels {
@@ -263,7 +357,7 @@ fn meter_width(meter: &Meter, fit: Fit) -> usize {
     if fit.number {
         parts.push(meter.number.chars().count());
     }
-    if fit.countdown {
+    if countdown_shown(meter, fit) {
         parts.push(meter.countdown.chars().count());
     }
     parts.iter().sum::<usize>() + parts.len().saturating_sub(1)
@@ -393,7 +487,7 @@ fn meter_spans(meter: &Meter, fit: Fit, dim: Color, out: &mut Vec<Span<'static>>
         sep(out, &mut first);
         out.push(Span::styled(meter.number.clone(), lit));
     }
-    if fit.countdown {
+    if countdown_shown(meter, fit) {
         sep(out, &mut first);
         out.push(Span::styled(meter.countdown.clone(), dim_style));
     }
@@ -421,12 +515,13 @@ pub(crate) struct HeaderUsage {
 /// field is off, the pane has no known agent, or no snapshot has arrived.
 pub(crate) fn header_usage_for(
     app: &AppState,
+    terminal_id: Option<&crate::terminal::TerminalId>,
     agent: Option<crate::detect::Agent>,
 ) -> Option<HeaderUsage> {
     if !app.usage_headers_on() {
         return None;
     }
-    let provider = provider_for_agent(agent?)?;
+    let provider = provider_for_terminal(app, terminal_id, agent?)?;
     let snapshot = app.usage_snapshot.as_ref()?;
     let usage = snapshot.providers.iter().find(|u| u.provider == provider)?;
     Some(HeaderUsage {
@@ -461,7 +556,7 @@ pub(crate) fn table_meters_for(
         .terminals
         .get(terminal_id)
         .and_then(|terminal| terminal.effective_known_agent())
-        .and_then(provider_for_agent);
+        .and_then(|agent| provider_for_terminal(app, Some(terminal_id), agent));
     let (Some(provider), Some(snapshot)) = (provider, app.usage_snapshot.as_ref()) else {
         return Vec::new();
     };
@@ -507,19 +602,24 @@ pub(crate) const TABLE_MIN_WIDTH: usize = 10;
 
 /// Providers of the agents in panes, in a fixed order.
 pub(crate) fn providers_present(app: &AppState) -> Vec<Provider> {
-    let mut found = [false; 3];
-    for terminal in app.terminals.values() {
+    let mut found = [false; 4];
+    for (id, terminal) in app.terminals.iter() {
         if let Some(provider) = terminal
             .effective_known_agent()
-            .and_then(provider_for_agent)
+            .and_then(|agent| provider_for_terminal(app, Some(id), agent))
         {
             found[provider_index(provider)] = true;
         }
     }
-    [Provider::Claude, Provider::Codex, Provider::Cursor]
-        .into_iter()
-        .filter(|p| found[provider_index(*p)])
-        .collect()
+    [
+        Provider::Claude,
+        Provider::Codex,
+        Provider::Cursor,
+        Provider::OpenRouter,
+    ]
+    .into_iter()
+    .filter(|p| found[provider_index(*p)])
+    .collect()
 }
 
 fn provider_index(provider: Provider) -> usize {
@@ -527,11 +627,13 @@ fn provider_index(provider: Provider) -> usize {
         Provider::Claude => 0,
         Provider::Codex => 1,
         Provider::Cursor => 2,
+        Provider::OpenRouter => 3,
     }
 }
 
 /// Seconds until the next thing a visible meter shows changes: a countdown
-/// text, or a reading turning stale. `None` when nothing will.
+/// text, a reading turning stale, or the UTC day rolling over for OpenRouter's
+/// free count. `None` when nothing will.
 pub(crate) fn next_change_secs(
     snapshot: &UsageSnapshot,
     present: &[Provider],
@@ -549,10 +651,20 @@ pub(crate) fn next_change_secs(
                 take(secs);
             }
         }
-        if let Some(seen) = usage.seen_at {
-            let stale_at = seen + stale_after_secs(usage.provider) + 1;
-            if stale_at > now {
-                take(stale_at - now);
+        if usage.provider == Provider::OpenRouter {
+            take(openrouter::next_utc_midnight(now) - now);
+        }
+        let kinds: Vec<WindowKind> = if usage.windows.is_empty() {
+            default_kinds(usage.provider).to_vec()
+        } else {
+            usage.windows.iter().map(|w| w.kind).collect()
+        };
+        for kind in kinds {
+            if let Some(seen) = reading_seen(usage, kind) {
+                let stale_at = seen + stale_after_secs(usage.provider) + 1;
+                if stale_at > now {
+                    take(stale_at - now);
+                }
             }
         }
     }
@@ -737,6 +849,7 @@ mod tests {
     fn usage(provider: Provider, windows: Vec<UsageWindow>) -> ProviderUsage {
         ProviderUsage {
             extra_spend: None,
+            openrouter: None,
             provider,
             windows,
             seen_at: Some(NOW),
@@ -1185,7 +1298,6 @@ mod tests {
         let later = NOW + STALE_AFTER_SECS - 2;
         let snap = UsageSnapshot {
             providers: vec![ProviderUsage {
-                extra_spend: None,
                 windows: vec![],
                 ..usage(Provider::Claude, vec![])
             }],
@@ -1193,5 +1305,75 @@ mod tests {
         };
         assert_eq!(next_change_secs(&snap, &[Provider::Claude], later), Some(3));
         assert_eq!(next_change_secs(&snap, &[Provider::Cursor], later), None);
+    }
+
+    /// A free count from this UTC day and a paid balance: `91%` and `9.65$`.
+    fn openrouter_row(free_seen: u64, credit_seen: u64) -> ProviderUsage {
+        let detail = crate::usage::openrouter::OpenRouterDetail {
+            free: Some(crate::usage::openrouter::FreeDaily {
+                used: 87,
+                limit: 1000,
+                remaining: 913,
+                seen_at: free_seen,
+            }),
+            credit: Some(crate::usage::openrouter::CreditBalance {
+                total_micros: 10_000_000,
+                usage_micros: 342_938,
+                seen_at: credit_seen,
+            }),
+            ..Default::default()
+        };
+        ProviderUsage {
+            openrouter: Some(detail.clone()),
+            windows: openrouter::windows(&detail, NOW),
+            seen_at: Some(free_seen.max(credit_seen)),
+            ..usage(Provider::OpenRouter, Vec::new())
+        }
+    }
+
+    #[test]
+    fn openrouter_free_count_renews_daily_and_credit_has_no_countdown() {
+        let row = openrouter_row(NOW, NOW);
+        let ms = meters_for(&row, NOW);
+        assert_eq!(ms.len(), 2);
+        assert_eq!((ms[0].label, ms[0].number.as_str()), ("1d", "91%"));
+        assert!(
+            !ms[0].countdown.is_empty(),
+            "the free count counts to midnight"
+        );
+        assert_eq!((ms[1].label, ms[1].number.as_str()), ("cr", "9.65$"));
+        assert!(ms[1].countdown.is_empty(), "credit has no reset");
+        // A credit meter with no countdown does not reserve its separator.
+        let fit = Fit {
+            labels: true,
+            windows: 1,
+            squares: false,
+            number: true,
+            countdown: true,
+        };
+        assert_eq!(text(&ms[1..], fit), "cr 9.65$");
+    }
+
+    #[test]
+    fn openrouter_readings_age_on_their_own_clocks() {
+        // The free reading is 10 minutes old (stale), the credit reading is fresh.
+        let row = openrouter_row(NOW - 600, NOW);
+        let ms = meters_for(&row, NOW);
+        assert!(ms[0].stale, "free reading is past five minutes");
+        assert!(!ms[1].stale, "credit reading is fresh");
+    }
+
+    #[test]
+    fn openrouter_missing_readings_say_why() {
+        let mut row = usage(Provider::OpenRouter, Vec::new());
+        row.openrouter = Some(crate::usage::openrouter::OpenRouterDetail {
+            free_problem: Some(UsageProblem::NoLogin),
+            credit_problem: Some(UsageProblem::PermissionDenied),
+            ..Default::default()
+        });
+        let ms = meters_for(&row, NOW);
+        assert_eq!(ms[0].number, "no key");
+        assert_eq!(ms[1].number, "unknown");
+        assert_eq!(ms[1].lit, 0);
     }
 }

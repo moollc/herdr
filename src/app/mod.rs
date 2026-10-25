@@ -609,6 +609,7 @@ impl App {
             agents_compact: restored_agents_compact,
             state_colors: config.ui.state_colors,
             usage_now: 0,
+            usage_openrouter_terminals: Default::default(),
             pane_history_persistence: config.experimental.pane_history,
             refresh_summary_with_grok: config.ui.refresh_summary_with_grok,
             hide_attached_agents: config.ui.hide_attached_agents,

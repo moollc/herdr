@@ -9,6 +9,8 @@ pub fn window_rgb(provider: Provider, kind: WindowKind) -> (u8, u8, u8) {
         (Provider::Codex, WindowKind::FiveHour) => (0x6f, 0xd3, 0xb8),
         (Provider::Codex, _) => (0x14, 0x90, 0x7a),
         (Provider::Cursor, _) => (0x7a, 0x8c, 0xa8),
+        (Provider::OpenRouter, WindowKind::Daily) => (0x7c, 0xb8, 0xff),
+        (Provider::OpenRouter, _) => (0x4f, 0x8f, 0xf0),
     }
 }
 pub fn level_rgb(provider: Provider, kind: WindowKind, left_pct: Option<u8>) -> (u8, u8, u8) {

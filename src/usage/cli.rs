@@ -1,5 +1,6 @@
 use super::{
     countdown::countdown, local_time, read_json, Provider, UsageConfig, UsageSnapshot, UsageState,
+    WindowKind,
 };
 use std::io;
 pub fn run(args: &[String]) -> io::Result<()> {
@@ -40,6 +41,8 @@ fn run_readings(
     output: &mut impl io::Write,
 ) -> io::Result<()> {
     let want = wanted_providers(&config, now);
+    // OpenRouter stays cache-only here: the worker owns polling, so the CLI never fetches it
+    // and carries the shared reading through the snapshot write.
     let mut state = UsageState::new(config);
     let snapshot =
         state.refresh_with_sources_and_publish(&want, now, fetch, false, command, |_| {});
@@ -62,6 +65,24 @@ pub(super) fn write_plain(
     output: &mut impl io::Write,
 ) -> io::Result<()> {
     for p in &snapshot.providers {
+        if p.provider == Provider::OpenRouter {
+            match &p.openrouter {
+                Some(detail) => {
+                    writeln!(
+                        output,
+                        "openrouter 1d {}",
+                        super::openrouter::cli_line(detail, WindowKind::Daily, now)
+                    )?;
+                    writeln!(
+                        output,
+                        "openrouter cr {}",
+                        super::openrouter::cli_line(detail, WindowKind::Credit, now)
+                    )?;
+                }
+                None => writeln!(output, "openrouter: no reading")?,
+            }
+            continue;
+        }
         for w in &p.windows {
             let estimated = w
                 .resets_at
@@ -124,6 +145,78 @@ pub(super) fn wanted_providers(config: &UsageConfig, now: u64) -> Vec<Provider> 
 mod tests {
     use super::*;
     use crate::usage::{atomic_json, tests::config, unknown, UsageProblem};
+
+    #[test]
+    fn cached_openrouter_reading_survives_plain_and_json_cli_without_network() {
+        const NOW: u64 = 1_800_000_000;
+        for json in [false, true] {
+            let config = config();
+            let path = config.snapshot_file.clone();
+            let detail = super::super::openrouter::OpenRouterDetail {
+                free: Some(super::super::openrouter::FreeDaily {
+                    used: 87,
+                    limit: 1000,
+                    remaining: 913,
+                    seen_at: NOW,
+                }),
+                free_problem: None,
+                credit: Some(super::super::openrouter::CreditBalance {
+                    total_micros: 10_000_000,
+                    usage_micros: 342_938,
+                    seen_at: NOW,
+                }),
+                credit_problem: None,
+            };
+            let mut row = super::super::openrouter::placeholder();
+            row.windows = super::super::openrouter::windows(&detail, NOW);
+            row.openrouter = Some(detail.clone());
+            row.seen_at = Some(NOW);
+            let cached = UsageSnapshot {
+                version: 1,
+                taken_at: NOW,
+                providers: vec![row],
+            };
+            atomic_json(&path, &cached).expect("seed the worker's OpenRouter reading");
+            let mut output = Vec::new();
+            run_readings(
+                json,
+                config,
+                NOW,
+                |_| panic!("CLI must not poll Cursor here"),
+                |_| panic!("CLI must not run a login command"),
+                &mut output,
+            )
+            .expect("CLI output");
+            let text = String::from_utf8(output).expect("utf8 output");
+            if json {
+                let value: serde_json::Value = serde_json::from_str(&text).expect("JSON output");
+                let shown = value["providers"]
+                    .as_array()
+                    .expect("providers")
+                    .iter()
+                    .find(|p| p["provider"] == "openrouter")
+                    .expect("OpenRouter row in JSON");
+                assert_eq!(shown["openrouter"]["free"]["remaining"], 913);
+                assert_eq!(shown["openrouter"]["credit"]["total_micros"], 10_000_000);
+            } else {
+                assert!(
+                    text.contains("openrouter 1d 913 of 1000 free requests remain"),
+                    "{text}"
+                );
+                assert!(
+                    text.contains("openrouter cr 9.65$ balance, total 10.00$, used 0.34$"),
+                    "{text}"
+                );
+            }
+            let kept: UsageSnapshot = read_json(&path).expect("shared snapshot still readable");
+            let kept = kept
+                .providers
+                .iter()
+                .find(|p| p.provider == Provider::OpenRouter)
+                .expect("the shared snapshot keeps the OpenRouter row");
+            assert_eq!(kept.openrouter.as_ref(), Some(&detail));
+        }
+    }
 
     #[test]
     fn cli_plain_and_json_never_call_injected_login_or_spend_the_hour() {

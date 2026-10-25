@@ -301,6 +301,7 @@ impl App {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
             Provider::Cursor => "cursor",
+            Provider::OpenRouter => "openrouter",
         };
         if self.update_config_file("allowance settings", |content| {
             let mut out = crate::config::upsert_section_bool(

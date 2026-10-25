@@ -210,6 +210,8 @@ impl GuardConfig {
             Provider::Claude => self.claude,
             Provider::Codex => self.codex,
             Provider::Cursor => self.cursor,
+            // OpenRouter has no percentage pool to guard: its free count and dollar balance are not a limit.
+            Provider::OpenRouter => false,
         };
         let defaults = ProviderLimits {
             enabled,
@@ -678,6 +680,7 @@ mod tests {
     ) -> ProviderUsage {
         ProviderUsage {
             extra_spend: None,
+            openrouter: None,
             provider,
             windows: windows
                 .iter()
@@ -975,6 +978,7 @@ mod policy_tests {
     fn usage(short: u8, long: u8, now: u64) -> ProviderUsage {
         ProviderUsage {
             extra_spend: None,
+            openrouter: None,
             provider: Provider::Codex,
             seen_at: Some(now),
             source: "fixture".into(),
@@ -1095,6 +1099,7 @@ mod extra_spend_tests {
     fn sample(bonus: u64, demand: u64, at: u64) -> ProviderUsage {
         ProviderUsage {
             provider: Provider::Cursor,
+            openrouter: None,
             windows: vec![],
             seen_at: Some(at),
             source: "fixture".into(),

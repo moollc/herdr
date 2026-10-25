@@ -3225,6 +3225,7 @@ impl AppState {
                 Vec::new()
             }
             AppEvent::UsageRefreshed { .. } => Vec::new(),
+            AppEvent::UsagePanesResolved { .. } => Vec::new(),
             AppEvent::AgentModelRefreshed { .. } => Vec::new(),
             AppEvent::SummaryRefreshed { .. } => Vec::new(),
             AppEvent::CommanderRead { .. } => Vec::new(),

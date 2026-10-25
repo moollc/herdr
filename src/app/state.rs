@@ -2038,6 +2038,8 @@ pub struct AppState {
     /// Epoch seconds the countdowns are worked from. Set once per frame by
     /// `compute_view`, so drawing reads no clock.
     pub usage_now: u64,
+    /// Terminals whose Codex runs with the OpenRouter home. Set by the usage worker.
+    pub usage_openrouter_terminals: std::collections::HashSet<crate::terminal::TerminalId>,
     pub pane_history_persistence: bool,
     /// Refresh Summary asks a headless `grok -p` session for a 5–8 word
     /// headline. Off, it reads the latest prompt from the session log.
@@ -2514,6 +2516,7 @@ impl AppState {
             agents_compact: false,
             state_colors: true,
             usage_now: 0,
+            usage_openrouter_terminals: Default::default(),
             pane_history_persistence: false,
             refresh_summary_with_grok: false,
             hide_attached_agents: false,

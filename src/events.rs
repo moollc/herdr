@@ -129,6 +129,10 @@ pub enum AppEvent {
         /// Only the final event releases the guard, after login/refetch.
         finished: bool,
     },
+    /// The usage worker resolved which Codex panes run on the OpenRouter home.
+    UsagePanesResolved {
+        terminals: std::collections::HashSet<crate::terminal::TerminalId>,
+    },
     /// Background agent model info refresh completed for terminals.
     AgentModelRefreshed {
         results: Vec<crate::agent_model::AgentModelRefreshResult>,

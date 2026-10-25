@@ -15,6 +15,7 @@ pub mod countdown;
 pub mod cursor;
 mod login;
 mod login_refresh;
+pub mod openrouter;
 pub(crate) use login_refresh::saved as cursor_login_saved;
 pub mod palette;
 pub mod statusline;
@@ -45,6 +46,8 @@ pub enum Provider {
     Claude,
     Codex,
     Cursor,
+    /// OpenRouter free requests and paid credit. Its own provider, never GPT.
+    OpenRouter,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -58,6 +61,10 @@ pub enum WindowKind {
     Named,
     /// Guard-only dollar budget, never a provider percentage pool.
     ExtraSpend,
+    /// OpenRouter free models: requests left for the current UTC day.
+    Daily,
+    /// OpenRouter paid credit as a share of total credits. Has no reset.
+    Credit,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +74,10 @@ pub enum UsageProblem {
     LoginExpired,
     FormatChanged,
     Offline,
+    /// The key works but this reading needs more access (credits without a Management key).
+    PermissionDenied,
+    /// The provider asked us to slow down. The last good reading stays and dims with age.
+    RateLimited,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UsageWindow {
@@ -103,6 +114,9 @@ pub struct ProviderUsage {
     pub provider: Provider,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_spend: Option<CursorSpend>,
+    /// OpenRouter's two readings, each with its own age. Absent for other providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openrouter: Option<openrouter::OpenRouterDetail>,
     pub windows: Vec<UsageWindow>,
     pub seen_at: Option<u64>,
     pub source: String,
@@ -127,6 +141,18 @@ pub struct UsageConfig {
     #[serde(default)]
     pub codex_scan_all: bool,
     pub visibility_file: Option<PathBuf>,
+    /// Codex home of an OpenRouter-backed Codex. Its panes are OpenRouter, not GPT.
+    #[serde(default)]
+    pub openrouter_codex_home: PathBuf,
+    /// Owner-only file with the OpenRouter inference key. The key is never serialized.
+    #[serde(default)]
+    pub openrouter_key_file: Option<PathBuf>,
+    /// Name of the environment variable holding the OpenRouter inference key.
+    #[serde(default)]
+    pub openrouter_key_env: Option<String>,
+    /// Owner-only file with an OpenRouter Management key, for the credit balance.
+    #[serde(default)]
+    pub openrouter_management_key_file: Option<PathBuf>,
 }
 impl Default for UsageConfig {
     fn default() -> Self {
@@ -145,6 +171,10 @@ impl Default for UsageConfig {
             codex_scan_all: !cfg!(test),
             visibility_file: None,
             fixture: std::env::var_os("HERDR_USAGE_FIXTURE").map(PathBuf::from),
+            openrouter_codex_home: home.join(".codex-openrouter"),
+            openrouter_key_file: None,
+            openrouter_key_env: None,
+            openrouter_management_key_file: None,
         }
     }
 }
@@ -178,21 +208,51 @@ impl UsageConfig {
         homes
     }
 
+    /// True when an OpenRouter key source is configured. Without one nothing is requested.
+    pub fn openrouter_configured(&self) -> bool {
+        self.openrouter_key_file.is_some()
+            || self.openrouter_key_env.is_some()
+            || self.openrouter_management_key_file.is_some()
+    }
+
     pub fn configured() -> Self {
         let mut config = Self::default();
         let display = crate::config::Config::load().config.ui.usage;
         config.claude_statusline = display.claude_statusline;
         config.visibility_file = Some(statusline::visibility_file());
         if let Some(path) = display.codex_home {
-            config.codex_home = if let Some(rest) = path.strip_prefix("~/") {
-                PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest)
-            } else {
-                PathBuf::from(path)
-            };
+            config.codex_home = expand_home(&path);
         }
+        if let Some(path) = display
+            .openrouter_codex_home
+            .filter(|p| !p.trim().is_empty())
+        {
+            config.openrouter_codex_home = expand_home(&path);
+        }
+        config.openrouter_key_file = display
+            .openrouter_key_file
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| expand_home(&p));
+        config.openrouter_key_env = display
+            .openrouter_key_env
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty());
+        config.openrouter_management_key_file = display
+            .openrouter_management_key_file
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| expand_home(&p));
         config
     }
 }
+
+/// A configured path with a leading `~/` made absolute from `$HOME`.
+fn expand_home(path: &str) -> PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(rest),
+        None => PathBuf::from(path),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UsageState {
     config: UsageConfig,
@@ -203,12 +263,28 @@ pub struct UsageState {
     cursor_good: Option<ProviderUsage>,
     cursor_login: login::RefreshState,
     alerts: HashMap<(Provider, WindowKind), Option<u64>>,
+    /// When the last OpenRouter request started. Memory only, so a restart polls at once.
+    #[serde(skip)]
+    openrouter_last_fetch: Option<u64>,
+    /// The last merged OpenRouter row. Restored from the snapshot at start.
+    #[serde(default)]
+    openrouter_result: Option<ProviderUsage>,
+    /// Set only by the app worker and the CLI. The default state never reaches the network.
+    #[serde(skip)]
+    openrouter_live: bool,
+    /// Test-only OpenRouter answers, one per due poll.
+    #[cfg(test)]
+    #[serde(skip)]
+    openrouter_fixtures: std::collections::VecDeque<openrouter::Fetched>,
     /// Shell pids of panes showing a Codex agent, set by the app worker.
     #[serde(skip)]
     codex_pane_pids: Vec<u32>,
     /// `CODEX_HOME` of each Codex process already looked at, by its pid.
     #[serde(skip)]
     codex_pid_homes: HashMap<u32, PathBuf>,
+    /// The Codex home of each Codex pane's shell, from the latest resolution.
+    #[serde(skip)]
+    codex_shell_homes: Vec<(u32, PathBuf)>,
 }
 impl UsageState {
     /// The shell pids of the panes that run Codex. The worker resolves each to
@@ -216,12 +292,34 @@ impl UsageState {
     pub(crate) fn set_codex_panes(&mut self, shell_pids: Vec<u32>) {
         self.codex_pane_pids = shell_pids;
     }
+    /// App worker: the shell pids of Codex panes whose process runs with the
+    /// OpenRouter home. Those panes are OpenRouter, not GPT.
+    pub(crate) fn resolve_openrouter_panes(&mut self) -> Vec<u32> {
+        self.load_config_paths();
+        let _ = self.codex_pane_homes();
+        let home = &self.config.openrouter_codex_home;
+        self.codex_shell_homes
+            .iter()
+            .filter(|(_, path)| path == home)
+            .map(|(pid, _)| *pid)
+            .collect()
+    }
+    /// Copies the paths that come from the configuration. Called on every refresh.
+    fn load_config_paths(&mut self) {
+        let configured = UsageConfig::configured();
+        self.config.codex_home = configured.codex_home;
+        self.config.openrouter_codex_home = configured.openrouter_codex_home;
+        self.config.openrouter_key_file = configured.openrouter_key_file;
+        self.config.openrouter_key_env = configured.openrouter_key_env;
+        self.config.openrouter_management_key_file = configured.openrouter_management_key_file;
+    }
     /// Homes of Codex processes running in panes. The environment is read once
     /// per Codex pid (one sysctl on macOS, one file read on Linux).
     fn codex_pane_homes(&mut self) -> Vec<PathBuf> {
         let user = std::env::var_os("HOME").map(PathBuf::from);
         let mut live = Vec::new();
         let mut homes = Vec::new();
+        self.codex_shell_homes.clear();
         for shell in &self.codex_pane_pids {
             let Some(job) = crate::detect::foreground_job(*shell) else {
                 continue;
@@ -253,8 +351,11 @@ impl UsageState {
                     .or_else(|| user.as_ref().map(|u| u.join(".codex")))
                     .unwrap_or_default()
             });
-            if !home.as_os_str().is_empty() && !homes.contains(&*home) {
-                homes.push(home.clone());
+            if !home.as_os_str().is_empty() {
+                self.codex_shell_homes.push((*shell, home.clone()));
+                if !homes.contains(&*home) {
+                    homes.push(home.clone());
+                }
             }
         }
         self.codex_pid_homes.retain(|pid, _| live.contains(pid));
@@ -285,6 +386,14 @@ impl UsageState {
             .as_ref()
             .and_then(|s| s.providers.iter().find(|p| p.provider == Provider::Cursor))
             .cloned();
+        let openrouter_result = cached
+            .as_ref()
+            .and_then(|s| {
+                s.providers
+                    .iter()
+                    .find(|p| p.provider == Provider::OpenRouter)
+            })
+            .cloned();
         let last_cursor_fetch = cursor_fetch_time(&config);
         let cursor_good = cursor_result
             .as_ref()
@@ -299,11 +408,18 @@ impl UsageState {
             cursor_result,
             cursor_good,
             alerts: HashMap::new(),
+            openrouter_last_fetch: None,
+            openrouter_result,
+            openrouter_live: false,
+            #[cfg(test)]
+            openrouter_fixtures: std::collections::VecDeque::new(),
             codex_pane_pids: Vec::new(),
             codex_pid_homes: HashMap::new(),
+            codex_shell_homes: Vec::new(),
         }
     }
     /// Fetch readings without importing a login or spending its hourly attempt.
+    /// OpenRouter is not requested here: this path never touches the network.
     pub fn refresh(&mut self, want: &[Provider], now: u64) -> UsageSnapshot {
         self.refresh_with_sources_and_publish(
             want,
@@ -321,7 +437,8 @@ impl UsageState {
         now: u64,
         publish: impl FnMut(UsageSnapshot),
     ) -> UsageSnapshot {
-        self.config.codex_home = UsageConfig::configured().codex_home;
+        self.load_config_paths();
+        self.openrouter_live = true;
         self.refresh_worker_with_sources(
             want,
             now,
@@ -389,6 +506,15 @@ impl UsageState {
         self.sync_saved_cursor_login();
         let cursor_was_due = want.contains(&Provider::Cursor)
             && cursor_due(&self.config, self.last_cursor_fetch, now);
+        // One pass over the Codex panes serves both the Codex and the OpenRouter rows.
+        let active = if want
+            .iter()
+            .any(|p| matches!(p, Provider::Codex | Provider::OpenRouter))
+        {
+            self.codex_pane_homes()
+        } else {
+            Vec::new()
+        };
         let mut providers = Vec::new();
         for provider in want {
             if providers
@@ -400,16 +526,33 @@ impl UsageState {
             let usage = match provider {
                 Provider::Claude => claude::read(&self.config.claude_state_file, now),
                 Provider::Codex => {
-                    let active = self.codex_pane_homes();
-                    codex::read_homes(&self.config.codex_homes(active), now)
+                    // Panes running with the OpenRouter home are OpenRouter, never GPT.
+                    let homes: Vec<codex::Home> = self
+                        .config
+                        .codex_homes(active.clone())
+                        .into_iter()
+                        .filter(|h| h.path != self.config.openrouter_codex_home)
+                        .collect();
+                    codex::read_homes(&homes, now)
                 }
                 Provider::Cursor => self.refresh_cursor_reading(now, &mut fetch),
+                Provider::OpenRouter => self.refresh_openrouter(now),
             };
             providers.push(usage);
         }
         if !providers.iter().any(|p| p.provider == Provider::Cursor) {
             if let Some(cursor) = &self.cursor_result {
                 providers.push(cursor.clone());
+            }
+        }
+        // OpenRouter is not polled this round: keep the shared reading, so the snapshot write
+        // does not erase it. Its windows are recomputed for the current UTC day.
+        if !providers.iter().any(|p| p.provider == Provider::OpenRouter) {
+            if let Some(row) = self.openrouter_result.as_mut() {
+                if let Some(detail) = row.openrouter.as_ref() {
+                    row.windows = openrouter::windows(detail, now);
+                }
+                providers.push(row.clone());
             }
         }
         let mut snapshot = UsageSnapshot {
@@ -434,6 +577,94 @@ impl UsageState {
             publish(snapshot.clone());
         }
         snapshot
+    }
+    /// The OpenRouter row. A request starts only when the poll interval has passed,
+    /// so at most one per interval. Between polls the merged row is returned as is.
+    fn refresh_openrouter(&mut self, now: u64) -> ProviderUsage {
+        let due = self
+            .openrouter_last_fetch
+            .is_none_or(|last| now.saturating_sub(last) >= openrouter::POLL_MIN_INTERVAL_SECS);
+        if due {
+            self.openrouter_last_fetch = Some(now);
+            let fetched = self.fetch_openrouter(now);
+            self.store_openrouter(fetched, now);
+        }
+        self.openrouter_result
+            .clone()
+            .unwrap_or_else(openrouter::placeholder)
+    }
+    /// Live network only in the worker and the CLI. Tests take their answers from the fixture queue.
+    fn fetch_openrouter(&mut self, now: u64) -> openrouter::Fetched {
+        #[cfg(test)]
+        {
+            if let Some(next) = self.openrouter_fixtures.pop_front() {
+                return next;
+            }
+        }
+        if self.openrouter_live {
+            openrouter::fetch_live(&self.config, now)
+        } else {
+            openrouter::Fetched::none()
+        }
+    }
+    /// Merges one poll into the last row. A good reading replaces its part. A rate limit or an
+    /// offline poll keeps the last good free count and credit balance, which then dim with age.
+    /// Any other failure clears that part: an old number never stands in for a refused one.
+    fn store_openrouter(&mut self, fetched: openrouter::Fetched, now: u64) {
+        let mut detail = self
+            .openrouter_result
+            .as_ref()
+            .and_then(|row| row.openrouter.clone())
+            .unwrap_or_default();
+        match fetched.free {
+            Ok(free) => {
+                detail.free = Some(free);
+                detail.free_problem = None;
+            }
+            Err(problem) => {
+                if !matches!(problem, UsageProblem::Offline | UsageProblem::RateLimited) {
+                    detail.free = None;
+                }
+                detail.free_problem = Some(problem);
+            }
+        }
+        match fetched.credit {
+            Ok(credit) => {
+                detail.credit = Some(credit);
+                detail.credit_problem = None;
+            }
+            Err(problem) => {
+                if !matches!(problem, UsageProblem::Offline | UsageProblem::RateLimited) {
+                    detail.credit = None;
+                }
+                detail.credit_problem = Some(problem);
+            }
+        }
+        let windows = openrouter::windows(&detail, now);
+        let seen_at = [
+            detail.free.as_ref().map(|free| free.seen_at),
+            detail.credit.as_ref().map(|credit| credit.seen_at),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        let problem = if detail.free.is_some() || detail.credit.is_some() {
+            None
+        } else {
+            detail
+                .free_problem
+                .clone()
+                .or_else(|| detail.credit_problem.clone())
+        };
+        self.openrouter_result = Some(ProviderUsage {
+            provider: Provider::OpenRouter,
+            extra_spend: None,
+            openrouter: Some(detail),
+            windows,
+            seen_at,
+            source: "openrouter api".into(),
+            problem,
+        });
     }
     fn sync_saved_cursor_login(&mut self) {
         let revision = login_refresh::revision(&self.config);
@@ -594,6 +825,10 @@ impl UsageState {
                 continue;
             }
             for w in &p.windows {
+                // Credit is a dollar balance with no reset. It never speaks as a percentage alert.
+                if w.kind == WindowKind::Credit {
+                    continue;
+                }
                 if !w.left_pct.is_some_and(|left| left <= 10)
                     || w.resets_at.is_some_and(|reset| reset <= snapshot.taken_at)
                 {
@@ -699,13 +934,14 @@ fn provider_blocks_recovery(usage: &ProviderUsage) -> bool {
     )
 }
 pub(super) fn unknown(provider: Provider, problem: UsageProblem) -> ProviderUsage {
-    let kinds: &[WindowKind] = if provider == Provider::Cursor {
-        &[WindowKind::Auto, WindowKind::Named]
-    } else {
-        &[WindowKind::FiveHour, WindowKind::Weekly]
+    let kinds: &[WindowKind] = match provider {
+        Provider::Cursor => &[WindowKind::Auto, WindowKind::Named],
+        Provider::OpenRouter => &[WindowKind::Daily, WindowKind::Credit],
+        Provider::Claude | Provider::Codex => &[WindowKind::FiveHour, WindowKind::Weekly],
     };
     ProviderUsage {
         extra_spend: None,
+        openrouter: None,
         provider,
         windows: kinds
             .iter()
@@ -722,6 +958,7 @@ pub(super) fn unknown(provider: Provider, problem: UsageProblem) -> ProviderUsag
             Provider::Claude => "claude status line",
             Provider::Codex => "codex log",
             Provider::Cursor => "cursor usage-summary",
+            Provider::OpenRouter => "openrouter api",
         }
         .into(),
         problem: Some(problem),

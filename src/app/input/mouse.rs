@@ -2858,6 +2858,7 @@ mod tests {
             providers: vec![crate::usage::ProviderUsage {
                 provider: crate::usage::Provider::Codex,
                 extra_spend: None,
+                openrouter: None,
                 windows: vec![crate::usage::UsageWindow {
                     kind: crate::usage::WindowKind::Weekly,
                     left_pct: Some(62),

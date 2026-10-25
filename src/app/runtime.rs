@@ -617,18 +617,20 @@ impl App {
         self.usage_refresh_in_flight = true;
         let event_tx = self.event_tx.clone();
         let usage = std::sync::Arc::clone(&self.usage_state);
-        let codex_panes: Vec<u32> = if want.contains(&crate::usage::Provider::Codex) {
-            self.state
-                .terminals
-                .iter()
-                .filter(|(_, t)| t.effective_known_agent() == Some(crate::detect::Agent::Codex))
-                .filter_map(|(id, _)| self.terminal_runtimes.get(id))
-                .map(|runtime| runtime.child_pid())
-                .filter(|pid| *pid > 0)
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // Every Codex pane, not only when GPT is wanted: an OpenRouter pane is a Codex
+        // process too, and only the worker can tell the two apart.
+        let codex_terminals: Vec<(crate::terminal::TerminalId, u32)> = self
+            .state
+            .terminals
+            .iter()
+            .filter(|(_, t)| t.effective_known_agent() == Some(crate::detect::Agent::Codex))
+            .filter_map(|(id, _)| {
+                self.terminal_runtimes
+                    .get(id)
+                    .map(|runtime| (id.clone(), runtime.child_pid()))
+            })
+            .filter(|(_, pid)| *pid > 0)
+            .collect();
         let alerts_on = self.state.usage_config.alerts;
         let alert_command = self.state.usage_config.alert_command.clone();
         std::thread::spawn(move || {
@@ -637,8 +639,25 @@ impl App {
                 let mut usage = usage
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                usage.set_codex_panes(codex_panes);
-                let snapshot = usage.refresh_worker(&want, epoch, |snapshot| {
+                let shell_pids: Vec<u32> = codex_terminals.iter().map(|(_, pid)| *pid).collect();
+                usage.set_codex_panes(shell_pids);
+                let openrouter_pids = usage.resolve_openrouter_panes();
+                let openrouter_terminals: std::collections::HashSet<crate::terminal::TerminalId> =
+                    codex_terminals
+                        .iter()
+                        .filter(|(_, pid)| openrouter_pids.contains(pid))
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                let _ = event_tx.blocking_send(AppEvent::UsagePanesResolved {
+                    terminals: openrouter_terminals,
+                });
+                let mut providers = want.clone();
+                if !openrouter_pids.is_empty()
+                    && !providers.contains(&crate::usage::Provider::OpenRouter)
+                {
+                    providers.push(crate::usage::Provider::OpenRouter);
+                }
+                let snapshot = usage.refresh_worker(&providers, epoch, |snapshot| {
                     let _ = event_tx.blocking_send(AppEvent::UsageRefreshed {
                         snapshot: Some(snapshot),
                         finished: false,
@@ -1294,6 +1313,7 @@ mod usage_refresh_tests {
         };
         let usage = |provider, windows, problem| ProviderUsage {
             extra_spend: None,
+            openrouter: None,
             provider,
             windows,
             seen_at: Some(1_000),

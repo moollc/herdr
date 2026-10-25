@@ -2374,6 +2374,7 @@ mod tests {
         };
         let usage = |provider, windows| ProviderUsage {
             extra_spend: None,
+            openrouter: None,
             provider,
             windows,
             seen_at: Some(USAGE_NOW),
