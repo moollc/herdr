@@ -300,6 +300,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneSplit(_) => "pane.split",
         Method::PaneList(_) => "pane.list",
         Method::PaneGet(_) => "pane.get",
+        Method::PaneContext(_) => "pane.context",
+        Method::PaneBindReportingAlias(_) => "pane.bind_reporting_alias",
         Method::PaneRename(_) => "pane.rename",
         Method::PanePinModel(_) => "pane.pin_model",
         Method::PaneRestartAgent(_) => "pane.restart_agent",

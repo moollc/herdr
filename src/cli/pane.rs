@@ -1,7 +1,8 @@
 use crate::api::schema::{
-    Method, PaneListParams, PanePinModelParams, PaneReadParams, PaneRenameParams,
-    PaneReportAgentParams, PaneReportMetadataParams, PaneSendInputParams, PaneSendKeysParams,
-    PaneSendTextParams, PaneSplitParams, PaneTarget, ReadFormat, ReadSource, Request,
+    Method, PaneBindReportingAliasParams, PaneListParams, PanePinModelParams, PaneReadParams,
+    PaneRenameParams, PaneReportAgentParams, PaneReportMetadataParams, PaneSendInputParams,
+    PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneTarget, ReadFormat, ReadSource,
+    Request,
 };
 
 pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
@@ -13,6 +14,7 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
     match subcommand {
         "list" => pane_list(&args[1..]),
         "get" => pane_get(&args[1..]),
+        "bind-reporting-alias" => pane_bind_reporting_alias(&args[1..]),
         "read" => pane_read(&args[1..]),
         "rename" => pane_rename(&args[1..]),
         "pin-model" => pane_pin_model(&args[1..]),
@@ -76,6 +78,22 @@ fn pane_get(args: &[String]) -> std::io::Result<i32> {
         id: "cli:pane:get".into(),
         method: Method::PaneGet(PaneTarget {
             pane_id: super::normalize_pane_id(raw_pane_id),
+        }),
+    })?)
+}
+
+fn pane_bind_reporting_alias(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: herdr pane bind-reporting-alias p_<raw> <terminal_id> [--apply]";
+    if !(args.len() == 2 || args.len() == 3 && args[2] == "--apply") {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:pane:bind-reporting-alias".into(),
+        method: Method::PaneBindReportingAlias(PaneBindReportingAliasParams {
+            raw_pane_id: args[0].clone(),
+            terminal_id: args[1].clone(),
+            apply: args.len() == 3,
         }),
     })?)
 }
@@ -758,6 +776,7 @@ fn print_pane_help() {
     eprintln!("herdr pane commands:");
     eprintln!("  herdr pane list [--workspace <workspace_id>]");
     eprintln!("  herdr pane get <pane_id>");
+    eprintln!("  herdr pane bind-reporting-alias p_<raw> <terminal_id> [--apply]");
     eprintln!("  herdr pane rename <pane_id> <label>|--clear");
     eprintln!("  herdr pane pin-model <pane_id> <model> [effort] [--launcher <program>] [-- <flags>...]|--clear");
     eprintln!("  herdr pane restart-agent <pane_id> [--timeout SECONDS]");

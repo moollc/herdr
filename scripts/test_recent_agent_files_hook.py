@@ -174,6 +174,50 @@ class RecentAgentFilesHookTests(unittest.TestCase):
         self.run_hook("cursor", "afterFileEdit", {"file_path": str(path), "generation_id": "gen-a"})
         self.assertEqual(self.records()[0]["path"], str(path.resolve()))
 
+    def test_pi_native_tool_execution_events_use_tool_call_id_and_pi_provenance(self):
+        path = self.cwd / "pi-native-write.txt"
+        before = {
+            "tool_name": "write",
+            "tool_call_id": "pi-call-01",
+            "cwd": str(self.cwd),
+            "tool_input": {"path": str(path), "content": "must not be journaled"},
+        }
+        self.run_hook("pi", "PreToolUse", before)
+        path.write_text("native Pi fixture")
+        self.run_hook("pi", "PostToolUse", {**before, "tool_error": False})
+        row = next(record for record in self.records() if record.get("path"))
+        self.assertEqual(row["agent"], "pi")
+        self.assertTrue(row["provenance"].startswith("pi.PostToolUse."))
+        journal = (self.state / hook.JOURNAL_NAME).read_text()
+        self.assertNotIn("must not be journaled", journal)
+        self.assertNotIn("native Pi fixture", journal)
+
+    def test_missing_state_dir_is_resolved_from_the_live_socket_context(self):
+        class FakeSocket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def settimeout(self, _timeout):
+                pass
+
+            def connect(self, path):
+                self.path = path
+
+            def sendall(self, _payload):
+                pass
+
+            def recv(self, _size):
+                return b'{"id":"recent-agent-files-context","result":{"state_dir":"/tmp/herdr-state","session_name":"pilot"}}\n'
+
+        with patch.dict(os.environ, {
+            "HERDR_STATE_DIR": "", "HERDR_SOCKET_PATH": "/tmp/active/herdr.sock",
+            "HERDR_PANE_ID": "p_4",
+        }, clear=False), patch.object(hook.socket, "socket", return_value=FakeSocket()):
+            self.assertEqual(hook._resolve_state_dir(), "/tmp/herdr-state/sessions/pilot")
+
     def test_read_only_shell_redirections_and_command_arguments_are_not_candidates(self):
         cases = (("ls -la 2>/dev/null", []), ("ls -la 2>&1 | head", []),
                  ("grep foo file.txt > /dev/null", []), ("grep -r cp src", []),

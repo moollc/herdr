@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import socket
 import stat
 import sys
 import tempfile
@@ -208,7 +209,7 @@ def _candidate_paths(provider, event, payload):
     if provider == "cursor" and event in ("afterFileEdit", "afterTabFileEdit"):
         paths.append(payload.get("file_path"))
         candidate = True
-    elif provider == "codex" and event in ("PreToolUse", "PostToolUse"):
+    elif provider in ("codex", "pi") and event in ("PreToolUse", "PostToolUse"):
         command = (tool_input.get("command") or tool_input.get("cmd")) if isinstance(tool_input, dict) else tool_input
         candidate = _is_supported_write_tool(tool_name)
         if normalized_name in ("bash", "exec", "exec_command", "shell"):
@@ -252,7 +253,7 @@ def _fingerprint(path):
 
 
 def _event_key(provider, payload):
-    event_id = payload.get("tool_use_id") if isinstance(payload, dict) else None
+    event_id = (payload.get("tool_use_id") or payload.get("tool_call_id")) if isinstance(payload, dict) else None
     if not isinstance(event_id, str) or not event_id or len(event_id) > 1024:
         return None
     return hashlib.sha256((provider + "\0" + event_id).encode("utf-8")).hexdigest()
@@ -406,13 +407,52 @@ def _bounded_upsert(journal, record):
         finally:
             os.close(dir_fd)
 def _is_tool_event(provider, event):
-    return (provider == "codex" and event in ("PreToolUse", "PostToolUse")) or (
+    return (provider in ("codex", "pi") and event in ("PreToolUse", "PostToolUse")) or (
         provider == "cursor" and event in ("preToolUse", "postToolUse", "postToolUseFailure")
     )
 
 
+def _resolve_state_dir():
+    explicit = os.environ.get("HERDR_STATE_DIR")
+    if explicit:
+        return explicit
+    socket_path = os.environ.get("HERDR_SOCKET_PATH")
+    pane_id = os.environ.get("HERDR_PANE_ID")
+    if not socket_path or not pane_id:
+        return None
+    request = {
+        "id": "recent-agent-files-context",
+        "method": "pane.context",
+        "params": {"pane_id": pane_id},
+    }
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(0.3)
+            client.connect(socket_path)
+            client.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
+            chunks = []
+            while True:
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if b"\n" in chunk:
+                    break
+        response = json.loads(b"".join(chunks).split(b"\n", 1)[0])
+        result = response.get("result", {})
+        state_dir = result.get("state_dir")
+        session_name = result.get("session_name", "default")
+        if not isinstance(state_dir, str) or not os.path.isabs(state_dir):
+            return None
+        if session_name != "default":
+            state_dir = str(Path(state_dir) / "sessions" / session_name)
+        return state_dir
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def capture(provider, event, payload, state_dir, *, now_ns=None):
-    if provider not in ("codex", "cursor"):
+    if provider not in ("codex", "cursor", "pi"):
         return 0
     if not isinstance(payload, dict):
         if _is_tool_event(provider, event):
@@ -429,8 +469,8 @@ def capture(provider, event, payload, state_dir, *, now_ns=None):
         return sum(_record_observed(provider, event, tool, key, path, state_dir, timestamp + index)
                    for index, path in enumerate(paths) if _fingerprint(path) is not None)
 
-    pre_event = event == "PreToolUse" if provider == "codex" else event == "preToolUse"
-    post_event = event == "PostToolUse" if provider == "codex" else event in ("postToolUse", "postToolUseFailure")
+    pre_event = event == "PreToolUse" if provider in ("codex", "pi") else event == "preToolUse"
+    post_event = event == "PostToolUse" if provider in ("codex", "pi") else event in ("postToolUse", "postToolUseFailure")
     if not (pre_event or post_event):
         return 0
     event_key = _event_key(provider, payload)
@@ -500,22 +540,25 @@ def _mark_gap(provider, event, tool, state_dir, now_ns=None):
 def main():
     if os.environ.get("HERDR_ENV") != "1":
         return
-    if not os.environ.get("HERDR_PANE_ID") or not os.environ.get("HERDR_STATE_DIR"):
+    if not os.environ.get("HERDR_PANE_ID"):
         return
     provider = sys.argv[1] if len(sys.argv) > 1 else ""
     event = sys.argv[2] if len(sys.argv) > 2 else ""
+    state_dir = _resolve_state_dir()
+    if not state_dir:
+        return
     raw = sys.stdin.buffer.read(MAX_INPUT + 1)
     if len(raw) > MAX_INPUT:
         if _is_tool_event(provider, event):
-            _mark_gap(provider, event, "oversize-input", os.environ["HERDR_STATE_DIR"])
+            _mark_gap(provider, event, "oversize-input", state_dir)
         return
     try:
         payload = json.loads(raw) if raw.strip() else {}
     except (ValueError, TypeError):
         if _is_tool_event(provider, event):
-            _mark_gap(provider, event, "malformed-input", os.environ["HERDR_STATE_DIR"])
+            _mark_gap(provider, event, "malformed-input", state_dir)
         return
-    capture(provider, event, payload, os.environ["HERDR_STATE_DIR"])
+    capture(provider, event, payload, state_dir)
 
 
 if __name__ == "__main__":

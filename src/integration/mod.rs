@@ -13,6 +13,8 @@ use crate::layout::PaneId;
 pub(crate) const HERDR_PANE_ID_ENV_VAR: &str = "HERDR_PANE_ID";
 const PI_EXTENSION_INSTALL_NAME: &str = "herdr-agent-state.ts";
 const PI_EXTENSION_ASSET: &str = include_str!("assets/pi/herdr-agent-state.ts");
+const PI_RECENT_FILES_HOOK_NAME: &str = "herdr-recent-agent-files.py";
+const PI_RECENT_FILES_HOOK_ASSET: &str = include_str!("assets/recent-agent-files.py");
 const PI_INTEGRATION_VERSION: u32 = 2;
 const OMP_EXTENSION_INSTALL_NAME: &str = "herdr-omp-agent-state.ts";
 const OMP_EXTENSION_ASSET: &str = include_str!("assets/omp/herdr-agent-state.ts");
@@ -1021,6 +1023,10 @@ pub(crate) fn install_pi() -> io::Result<PathBuf> {
 
     let path = dir.join(PI_EXTENSION_INSTALL_NAME);
     fs::write(&path, PI_EXTENSION_ASSET)?;
+    fs::write(
+        dir.join(PI_RECENT_FILES_HOOK_NAME),
+        PI_RECENT_FILES_HOOK_ASSET,
+    )?;
     Ok(path)
 }
 
@@ -1550,8 +1556,13 @@ pub(crate) fn install_hermes() -> io::Result<HermesInstallPaths> {
 }
 
 pub(crate) fn uninstall_pi() -> io::Result<PiUninstallResult> {
-    let extension_path = pi_extension_dir()?.join(PI_EXTENSION_INSTALL_NAME);
+    let dir = pi_extension_dir()?;
+    let extension_path = dir.join(PI_EXTENSION_INSTALL_NAME);
     let removed_extension = remove_file_if_exists(&extension_path)?;
+    let helper_path = dir.join(PI_RECENT_FILES_HOOK_NAME);
+    if fs::read_to_string(&helper_path).ok().as_deref() == Some(PI_RECENT_FILES_HOOK_ASSET) {
+        remove_file_if_exists(&helper_path)?;
+    }
 
     Ok(PiUninstallResult {
         extension_path,
@@ -3035,6 +3046,10 @@ mod tests {
 
         assert_eq!(path, ext_dir.join(PI_EXTENSION_INSTALL_NAME));
         assert_eq!(content, PI_EXTENSION_ASSET);
+        assert_eq!(
+            fs::read_to_string(ext_dir.join(PI_RECENT_FILES_HOOK_NAME)).unwrap(),
+            PI_RECENT_FILES_HOOK_ASSET
+        );
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
@@ -3222,6 +3237,11 @@ mod tests {
         let ext_dir = home.join(".pi/agent/extensions");
         fs::create_dir_all(&ext_dir).unwrap();
         fs::write(ext_dir.join(PI_EXTENSION_INSTALL_NAME), PI_EXTENSION_ASSET).unwrap();
+        fs::write(
+            ext_dir.join(PI_RECENT_FILES_HOOK_NAME),
+            PI_RECENT_FILES_HOOK_ASSET,
+        )
+        .unwrap();
         std::env::set_var("HOME", &home);
 
         let result = uninstall_pi().unwrap();
@@ -3232,6 +3252,7 @@ mod tests {
         );
         assert!(result.removed_extension);
         assert!(!result.extension_path.exists());
+        assert!(!ext_dir.join(PI_RECENT_FILES_HOOK_NAME).exists());
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
@@ -4743,6 +4764,9 @@ mod tests {
         assert!(PI_EXTENSION_ASSET.contains("agent_session_path: currentAgentSessionPath"));
         assert!(PI_EXTENSION_ASSET.contains("agent_session_id: currentAgentSessionId"));
         assert!(PI_EXTENSION_ASSET.contains("publishState(true)"));
+        assert!(PI_EXTENSION_ASSET.contains("tool_execution_start"));
+        assert!(PI_EXTENSION_ASSET.contains("tool_execution_end"));
+        assert!(PI_EXTENSION_ASSET.contains("tool_call_id: event.toolCallId"));
         assert!(CLAUDE_HOOK_ASSET.contains("agent_session_id"));
         assert!(CLAUDE_HOOK_ASSET.contains("pane.report_agent_session"));
         assert!(!CLAUDE_HOOK_ASSET.contains("\"state\": action"));

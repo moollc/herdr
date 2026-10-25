@@ -690,6 +690,10 @@ impl App {
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
             Method::PaneList(params) => return self.handle_pane_list(request.id, params),
             Method::PaneGet(target) => return self.handle_pane_get(request.id, target),
+            Method::PaneBindReportingAlias(params) => {
+                return self.handle_pane_bind_reporting_alias(request.id, params);
+            }
+            Method::PaneContext(target) => return self.handle_pane_context(request.id, target),
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
             Method::PanePinModel(params) => return self.handle_pane_pin_model(request.id, params),
             Method::PaneRestartAgent(target) => {
@@ -759,6 +763,105 @@ impl App {
 mod tests {
     use super::*;
     use crate::detect::{Agent, AgentState};
+
+    #[test]
+    fn reporting_alias_preview_apply_idempotence_and_handoff_persistence() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("aliases")];
+        app.state.ensure_test_terminals();
+        let target = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal = app
+            .state
+            .terminal_id_for_any_pane(target)
+            .unwrap()
+            .to_string();
+        let raw = format!("p_{}", target.raw());
+        let collision_pane = crate::layout::PaneId::alloc();
+        let collision_terminal = crate::terminal::TerminalId::alloc();
+        app.state
+            .detached_agents
+            .push(crate::app::state::DetachedAgent {
+                pane_id: collision_pane,
+                pane: crate::pane::PaneState::new(collision_terminal.clone()),
+            });
+        app.state.ensure_test_terminals();
+        app.state
+            .pane_id_aliases
+            .insert(target.raw(), collision_pane);
+        let params = || crate::api::schema::PaneBindReportingAliasParams {
+            raw_pane_id: raw.clone(),
+            terminal_id: terminal.clone(),
+            apply: false,
+        };
+
+        let preview: serde_json::Value =
+            serde_json::from_str(&app.handle_pane_bind_reporting_alias("preview".into(), params()))
+                .unwrap();
+        assert_eq!(preview["result"]["type"], "pane_reporting_alias");
+        assert_eq!(preview["result"]["applied"], false);
+        assert_eq!(
+            preview["result"]["before_terminal_id"],
+            collision_terminal.to_string()
+        );
+        assert_eq!(
+            app.state.pane_id_aliases.get(&target.raw()),
+            Some(&collision_pane)
+        );
+
+        let mut apply = params();
+        apply.apply = true;
+        let first: serde_json::Value = serde_json::from_str(
+            &app.handle_pane_bind_reporting_alias("apply".into(), apply.clone()),
+        )
+        .unwrap();
+        let second: serde_json::Value =
+            serde_json::from_str(&app.handle_pane_bind_reporting_alias("again".into(), apply))
+                .unwrap();
+        assert_eq!(first["result"]["after_terminal_id"], terminal);
+        assert_eq!(second["result"]["before_terminal_id"], terminal);
+        assert_eq!(app.state.pane_id_aliases.get(&target.raw()), Some(&target));
+        let context: serde_json::Value = serde_json::from_str(&app.handle_pane_context(
+            "context".into(),
+            crate::api::schema::PaneTarget {
+                pane_id: raw.clone(),
+            },
+        ))
+        .unwrap();
+        assert_eq!(context["result"]["type"], "pane_context");
+        assert_eq!(context["result"]["terminal_id"], terminal);
+        let snapshot =
+            crate::persist::capture(&app.state, &crate::terminal::TerminalRuntimeRegistry::new());
+        assert_eq!(
+            snapshot.handoff_pane_terminals[&target.raw()].to_string(),
+            terminal
+        );
+
+        let invalid = app.handle_pane_bind_reporting_alias(
+            "invalid".into(),
+            crate::api::schema::PaneBindReportingAliasParams {
+                raw_pane_id: "wrong".into(),
+                terminal_id: terminal.clone(),
+                apply: true,
+            },
+        );
+        assert!(invalid.contains("invalid_reporting_alias"));
+        let missing = app.handle_pane_bind_reporting_alias(
+            "missing".into(),
+            crate::api::schema::PaneBindReportingAliasParams {
+                raw_pane_id: "p_42424242".into(),
+                terminal_id: "term_missing".into(),
+                apply: true,
+            },
+        );
+        assert!(missing.contains("terminal_not_found"));
+    }
 
     fn init_repo(path: &std::path::Path) {
         let status = std::process::Command::new("git")

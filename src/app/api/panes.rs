@@ -1,11 +1,12 @@
 use bytes::Bytes;
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, PaneAckOrientationParams, PaneClearAgentAuthorityParams,
-    PaneListParams, PanePinModelParams, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
-    PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
-    PaneReportMetadataParams, PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams,
-    PaneSplitParams, PaneTarget, ReadFormat, ReadSource, ResponseResult,
+    EventData, EventEnvelope, EventKind, PaneAckOrientationParams, PaneBindReportingAliasParams,
+    PaneClearAgentAuthorityParams, PaneListParams, PanePinModelParams, PaneReadParams,
+    PaneReadResult, PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams,
+    PaneReportAgentSessionParams, PaneReportMetadataParams, PaneSendInputParams,
+    PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneTarget, ReadFormat, ReadSource,
+    ResponseResult,
 };
 use crate::app::{App, Mode};
 
@@ -99,6 +100,106 @@ impl App {
         };
 
         encode_success(id, ResponseResult::PaneInfo { pane })
+    }
+
+    pub(super) fn handle_pane_context(&mut self, id: String, target: PaneTarget) -> String {
+        let Some((_, pane_id)) = self.parse_pane_id(&target.pane_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
+        let Some(terminal_id) = self.state.terminal_id_for_any_pane(pane_id) else {
+            return pane_not_found(id, &target.pane_id);
+        };
+        encode_success(
+            id,
+            ResponseResult::PaneContext {
+                terminal_id: terminal_id.to_string(),
+                state_dir: crate::session::active_name()
+                    .map(|name| crate::config::state_dir().join("sessions").join(name))
+                    .unwrap_or_else(crate::config::state_dir)
+                    .display()
+                    .to_string(),
+                session_name: crate::session::active_name()
+                    .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string()),
+            },
+        )
+    }
+
+    pub(super) fn handle_pane_bind_reporting_alias(
+        &mut self,
+        id: String,
+        params: PaneBindReportingAliasParams,
+    ) -> String {
+        let Some(raw) = params
+            .raw_pane_id
+            .strip_prefix("p_")
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            return encode_error(
+                id,
+                "invalid_reporting_alias",
+                "raw pane id must be p_<number>".to_string(),
+            );
+        };
+        if params.raw_pane_id != format!("p_{raw}") {
+            return encode_error(
+                id,
+                "invalid_reporting_alias",
+                "raw pane id must use its canonical decimal form".to_string(),
+            );
+        }
+        let target = self.state.terminals.keys().find_map(|terminal| {
+            if terminal.to_string() != params.terminal_id {
+                return None;
+            }
+            let pane_id = self
+                .state
+                .workspaces
+                .iter()
+                .find_map(|workspace| {
+                    workspace.tabs.iter().find_map(|tab| {
+                        tab.panes.iter().find_map(|(pane_id, pane)| {
+                            (pane.attached_terminal_id == *terminal).then_some(*pane_id)
+                        })
+                    })
+                })
+                .or_else(|| {
+                    self.state.detached_agents.iter().find_map(|agent| {
+                        (agent.pane.attached_terminal_id == *terminal).then_some(agent.pane_id)
+                    })
+                })?;
+            Some((pane_id, terminal.to_string()))
+        });
+        let Some((target_pane, target_terminal)) = target else {
+            return encode_error(
+                id,
+                "terminal_not_found",
+                "terminal id is not present in this Herdr session".to_string(),
+            );
+        };
+        let before_terminal_id = self
+            .state
+            .pane_id_aliases
+            .get(&raw)
+            .copied()
+            .or_else(|| {
+                let direct = crate::layout::PaneId::from_raw(raw);
+                self.state.terminal_id_for_any_pane(direct).map(|_| direct)
+            })
+            .and_then(|pane| self.state.terminal_id_for_any_pane(pane))
+            .map(|terminal| terminal.to_string());
+        if params.apply {
+            self.state.pane_id_aliases.insert(raw, target_pane);
+            self.schedule_session_save();
+        }
+        encode_success(
+            id,
+            ResponseResult::PaneReportingAlias {
+                raw_pane_id: format!("p_{raw}"),
+                before_terminal_id,
+                after_terminal_id: target_terminal,
+                applied: params.apply,
+            },
+        )
     }
 
     pub(super) fn handle_pane_rename(&mut self, id: String, params: PaneRenameParams) -> String {

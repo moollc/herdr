@@ -6,11 +6,39 @@
 // @ts-nocheck
 
 import { createConnection } from "node:net";
+import { spawnSync } from "node:child_process";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const HERDR_ENV = process.env.HERDR_ENV;
 const socketPath = process.env.HERDR_SOCKET_PATH;
 const paneId = process.env.HERDR_PANE_ID;
 const source = "herdr:pi";
+const recentFilesHelper = join(dirname(fileURLToPath(import.meta.url)), "herdr-recent-agent-files.py");
+
+function captureToolEvent(event: any, ctx: any, phase: "PreToolUse" | "PostToolUse"): void {
+  if (!event || typeof event.toolCallId !== "string" || typeof event.toolName !== "string") return;
+  const payload = {
+    tool_call_id: event.toolCallId,
+    tool_name: event.toolName,
+    tool_input: event.args,
+    cwd: typeof ctx?.cwd === "string" ? ctx.cwd : undefined,
+    tool_error: phase === "PostToolUse" ? event.isError === true : undefined,
+  };
+  spawnSync("python3", [recentFilesHelper, "pi", phase], {
+    input: JSON.stringify(payload),
+    encoding: "utf8",
+    timeout: 500,
+    env: {
+      PATH: process.env.PATH || "/usr/bin:/bin",
+      HERDR_ENV,
+      HERDR_PANE_ID: paneId,
+      HERDR_SOCKET_PATH: socketPath,
+      HERDR_STATE_DIR: process.env.HERDR_STATE_DIR,
+    },
+    stdio: ["pipe", "ignore", "ignore"],
+  });
+}
 
 function enabled() {
   return HERDR_ENV === "1" && !!socketPath && !!paneId;
@@ -253,6 +281,16 @@ export default function (pi) {
   pi.on("session_start", (_event, ctx) => {
     updateSessionRef(ctx);
     publishState(true);
+  });
+
+  pi.on("tool_execution_start", (event, ctx) => {
+    updateSessionRef(ctx);
+    captureToolEvent(event, ctx, "PreToolUse");
+  });
+
+  pi.on("tool_execution_end", (event, ctx) => {
+    updateSessionRef(ctx);
+    captureToolEvent(event, ctx, "PostToolUse");
   });
 
   function holdForRetry(message: string) {

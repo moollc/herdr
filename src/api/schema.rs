@@ -78,6 +78,10 @@ pub enum Method {
     PaneList(PaneListParams),
     #[serde(rename = "pane.get")]
     PaneGet(PaneTarget),
+    #[serde(rename = "pane.context")]
+    PaneContext(PaneTarget),
+    #[serde(rename = "pane.bind_reporting_alias")]
+    PaneBindReportingAlias(PaneBindReportingAliasParams),
     #[serde(rename = "pane.rename")]
     PaneRename(PaneRenameParams),
     #[serde(rename = "pane.pin_model")]
@@ -413,6 +417,14 @@ pub enum SplitDirection {
 pub struct PaneListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneBindReportingAliasParams {
+    pub raw_pane_id: String,
+    pub terminal_id: String,
+    #[serde(default)]
+    pub apply: bool,
 }
 
 /// Pin a pane to a model, or clear the pin (no `model`). Herdr passes a pin
@@ -917,6 +929,17 @@ pub enum ResponseResult {
     },
     PaneInfo {
         pane: PaneInfo,
+    },
+    PaneReportingAlias {
+        raw_pane_id: String,
+        before_terminal_id: Option<String>,
+        after_terminal_id: String,
+        applied: bool,
+    },
+    PaneContext {
+        terminal_id: String,
+        state_dir: String,
+        session_name: String,
     },
     PaneList {
         panes: Vec<PaneInfo>,
