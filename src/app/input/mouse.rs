@@ -2810,6 +2810,88 @@ mod tests {
         workspace::Workspace,
     };
 
+    #[test]
+    fn recent_file_click_requests_the_selected_file_open() {
+        let mut app = app_for_mouse_test();
+        app.state.view.layout = ViewLayout::Desktop;
+        app.state.view.tasks_rect = Rect::new(0, 0, 64, 12);
+        app.state.tasks_collapsed = false;
+        app.state.recent_files = crate::recent_files::RecentFilesSnapshot {
+            root: Some("/fixture".into()),
+            files: vec![crate::recent_files::RecentFile {
+                path: "/fixture/research-summary.md".into(),
+                modified: std::time::SystemTime::now(),
+                agent: "codex".into(),
+            }],
+            ..Default::default()
+        };
+
+        let (row, _) = crate::ui::recent_file_viewport(&app.state).unwrap();
+        assert_eq!(crate::ui::recent_file_at(&app.state, 2, row), Some(0));
+        app.state.handle_mouse(
+            &mut app.terminal_runtimes,
+            mouse(MouseEventKind::Down(MouseButton::Left), 2, row),
+        );
+
+        assert_eq!(app.state.request_open_recent_file, Some(0));
+        assert_eq!(app.state.recent_files.selected, Some(0));
+        assert!(!app.state.recent_files.keyboard_focus);
+    }
+
+    #[test]
+    fn right_clicking_codex_allowance_opens_its_settings() {
+        let mut app = app_for_mouse_test();
+        app.state.view.sidebar_rect = Rect::new(0, 0, 42, 40);
+        app.state.usage_config.sidebar = true;
+        let workspace = Workspace::test_new("fixture");
+        let terminal_id = workspace.tabs[0]
+            .terminal_id(workspace.tabs[0].root_pane)
+            .unwrap()
+            .clone();
+        let mut terminal =
+            crate::terminal::TerminalState::new(terminal_id.clone(), std::env::temp_dir());
+        terminal.detected_agent = Some(Agent::Codex);
+        app.state.terminals.insert(terminal_id, terminal);
+        app.state.usage_snapshot = Some(crate::usage::UsageSnapshot {
+            version: 1,
+            taken_at: crate::usage::now(),
+            providers: vec![crate::usage::ProviderUsage {
+                provider: crate::usage::Provider::Codex,
+                extra_spend: None,
+                windows: vec![crate::usage::UsageWindow {
+                    kind: crate::usage::WindowKind::Weekly,
+                    left_pct: Some(62),
+                    resets_at: None,
+                    note: None,
+                    reset: false,
+                }],
+                seen_at: Some(crate::usage::now()),
+                source: "fixture".into(),
+                problem: None,
+            }],
+        });
+        let row = (0..40)
+            .find(|row| {
+                crate::ui::usage_bar::provider_at(&app.state, 1, *row)
+                    == Some(crate::usage::Provider::Codex)
+            })
+            .expect("Codex allowance row is visible");
+
+        app.state.handle_mouse(
+            &mut app.terminal_runtimes,
+            mouse(MouseEventKind::Down(MouseButton::Right), 1, row),
+        );
+
+        assert_eq!(app.state.mode, Mode::Settings);
+        assert_eq!(
+            app.state
+                .allowance_settings
+                .as_ref()
+                .map(|panel| panel.provider),
+            Some(crate::usage::Provider::Codex)
+        );
+    }
+
     #[tokio::test]
     async fn terminal_wheel_uses_configured_mouse_scroll_lines() {
         let mut app = app_for_mouse_test();
