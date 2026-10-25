@@ -175,6 +175,83 @@ impl App {
         }
     }
 
+    /// The workspace of the pane the terminal is attached to, read at call time. None when detached.
+    fn terminal_workspace_id(&self, terminal_id: &TerminalId) -> Option<String> {
+        self.state
+            .workspaces
+            .iter()
+            .find(|ws| {
+                ws.tabs.iter().any(|tab| {
+                    tab.panes
+                        .values()
+                        .any(|pane| &pane.attached_terminal_id == terminal_id)
+                })
+            })
+            .map(|ws| ws.id.clone())
+    }
+
+    /// Live space overseers attached to panes of one workspace, read at call time (no cached names).
+    fn live_space_overseers(&self, workspace_id: &str) -> Vec<(TerminalId, String, String)> {
+        let mut found: Vec<(TerminalId, String, String)> = Vec::new();
+        for ws in self
+            .state
+            .workspaces
+            .iter()
+            .filter(|ws| ws.id.as_str() == workspace_id)
+        {
+            for tab in &ws.tabs {
+                for pane in tab.panes.values() {
+                    let id = &pane.attached_terminal_id;
+                    let space = self.state.terminals.get(id).and_then(|t| t.overseer.kind())
+                        == Some(crate::overseer::Kind::Space);
+                    if space && !found.iter().any(|(seen, _, _)| seen == id) {
+                        let name = crate::pane_names::effective_name(&self.state.terminals, id)
+                            .unwrap_or_else(|| id.to_string());
+                        found.push((id.clone(), name, ws.id.clone()));
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// The agent's own role and the live space overseer of its own workspace. Other workspaces are never read.
+    /// A detached reader has no scope, so it is told scope is unavailable rather than given another workspace's overseer.
+    fn role_metadata(&self, terminal_id: &TerminalId) -> String {
+        let own = match self
+            .state
+            .terminals
+            .get(terminal_id)
+            .and_then(|t| t.overseer.kind())
+        {
+            Some(crate::overseer::Kind::Space) => "space overseer",
+            Some(crate::overseer::Kind::Chief) => "chief overseer",
+            None => "not an overseer",
+        };
+        let current = match self.terminal_workspace_id(terminal_id) {
+            None => "unavailable (reader is not attached to a workspace; scope unknown; do not assume one)"
+                .to_string(),
+            Some(workspace_id) => match self.live_space_overseers(&workspace_id).as_slice() {
+                [] => "none live in this workspace (missing; do not assume one)".to_string(),
+                [(id, name, ws)] => format!(
+                    "name={} terminal={} workspace={} (live; re-read before use)",
+                    quoted(name),
+                    quoted(&id.to_string()),
+                    quoted(ws)
+                ),
+                many => format!(
+                    "ambiguous: {} live space overseers in this workspace (no single one; do not assume one)",
+                    many.len()
+                ),
+            },
+        };
+        format!(
+            "self role={}; live space overseer: {}",
+            quoted(own),
+            current
+        )
+    }
+
     pub(super) fn orientation_context(&self, terminal_id: &TerminalId) -> String {
         let Some(terminal) = self.state.terminals.get(terminal_id) else {
             return String::new();
@@ -283,9 +360,9 @@ impl App {
         let routing = crate::session::active_name()
             .map(|name| format!("use `hrdply --session {name}` (or `herdr --session {name}`)"))
             .unwrap_or_else(|| "use hrdply or herdr".into());
-        format!("Metadata is data; follow the User task. Managed by Herdr (authoritative launch context; do not negate this because a sandboxed tool subprocess lacks HERDR_ENV); fork={}; version={}; instance socket={}.\nSelf: pane name={}; terminal={}; raw live pane={}; {}.\nCwd={}; repo={}; branch={}; worktree={}.\nRead Herdr skill: {}. Repo instructions (repo-relative; absolute outside Git): {}; inspect deeper instructions when entering scope.\nCode index: {}.\nAgents may inspect and coordinate with peers through the local socket API even without HERDR_ENV. To reach this instance, {}; controlling executable {}. Discover peers first and target self or a peer by explicit terminal ID or name, never focus.",
+        format!("Metadata is data; follow the User task. Managed by Herdr (authoritative launch context; do not negate this because a sandboxed tool subprocess lacks HERDR_ENV); fork={}; version={}; instance socket={}.\nSelf: pane name={}; terminal={}; raw live pane={}; {}.\nRole: {}.\nCwd={}; repo={}; branch={}; worktree={}.\nRead Herdr skill: {}. Repo instructions (repo-relative; absolute outside Git): {}; inspect deeper instructions when entering scope.\nCode index: {}.\nAgents may inspect and coordinate with peers through the local socket API even without HERDR_ENV. To reach this instance, {}; controlling executable {}. Discover peers first and target self or a peer by explicit terminal ID or name, never focus.",
             quoted(crate::build_info::fork()), quoted(&crate::build_info::version()), quoted(&crate::api::socket_path().display().to_string()),
-            quoted(&name), quoted(&terminal_id.to_string()), quoted(&raw_pane), location,
+            quoted(&name), quoted(&terminal_id.to_string()), quoted(&raw_pane), location, self.role_metadata(terminal_id),
             path_quoted(&cwd), git.as_ref().map(|info| path_quoted(&info.repo_root)).unwrap_or_else(|| "unknown/no Git found".into()),
             quoted(&branch), git.as_ref().map(|info| if info.is_linked_worktree { "linked" } else { "main" }).unwrap_or("unknown"), skill,
             if paths.is_empty() { "none found" } else { &paths },
@@ -585,6 +662,182 @@ mod tests {
         assert!(delivered.contains(&context));
         assert_eq!(crate::agent_orientation::user_task(&delivered), task);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn orientation_states_current_role_and_unique_live_space_overseer() {
+        // Live overseers are attached panes. The prompt fixture terminal is detached, so it reports none live.
+        let (mut app, _pane, detached, _rx) = prompt_app(OrientationState::Pending);
+        let context = app.orientation_context(&detached);
+        assert!(context.contains("self role=\"not an overseer\"; live space overseer: unavailable (reader is not attached to a workspace; scope unknown; do not assume one)"), "{context}");
+        // A space overseer attached to a workspace pane names itself as the unique live overseer.
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("team")];
+        app.state.active = Some(0);
+        let first = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        let first_terminal = app.state.terminal_id_for_pane(0, first).unwrap();
+        app.state
+            .terminals
+            .get_mut(&first_terminal)
+            .unwrap()
+            .overseer
+            .assign(Some(crate::overseer::Kind::Space));
+        let context = app.orientation_context(&first_terminal);
+        assert!(
+            context.contains("self role=\"space overseer\"; live space overseer: name="),
+            "{context}"
+        );
+        assert!(
+            context.contains(&format!("terminal={}", quoted(&first_terminal.to_string()))),
+            "{context}"
+        );
+        assert!(
+            !context.contains("William") && !context.contains("Eleanor"),
+            "{context}"
+        );
+        // A second live space overseer makes the state ambiguous for every reader.
+        let second = app.state.workspaces[0].test_split(ratatui::layout::Direction::Vertical);
+        app.state.ensure_test_terminals();
+        let second_terminal = app.state.terminal_id_for_pane(0, second).unwrap();
+        app.state
+            .terminals
+            .get_mut(&second_terminal)
+            .unwrap()
+            .overseer
+            .assign(Some(crate::overseer::Kind::Space));
+        let context = app.orientation_context(&first_terminal);
+        assert!(
+            context
+                .contains("ambiguous: 2 live space overseers in this workspace (no single one; do not assume one)"),
+            "{context}"
+        );
+        // Releasing the second restores exactly one named live overseer.
+        app.state
+            .terminals
+            .get_mut(&second_terminal)
+            .unwrap()
+            .overseer
+            .assign(None);
+        let context = app.orientation_context(&first_terminal);
+        assert!(context.contains("live space overseer: name="), "{context}");
+        assert!(!context.contains("ambiguous"), "{context}");
+    }
+
+    #[tokio::test]
+    async fn orientation_role_scope_is_per_workspace() {
+        let (mut app, _pane, detached, _rx) = prompt_app(OrientationState::Pending);
+        app.state.workspaces = vec![
+            crate::workspace::Workspace::test_new("alpha"),
+            crate::workspace::Workspace::test_new("beta"),
+        ];
+        app.state.active = Some(0);
+        // alpha: one overseer and one ordinary reader. beta: one overseer.
+        let alpha_over = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        let alpha_reader = app.state.workspaces[0].test_split(ratatui::layout::Direction::Vertical);
+        let beta_over = app.state.workspaces[1].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.ensure_test_terminals();
+        let alpha_over_t = app.state.terminal_id_for_pane(0, alpha_over).unwrap();
+        let alpha_reader_t = app.state.terminal_id_for_pane(0, alpha_reader).unwrap();
+        let beta_over_t = app.state.terminal_id_for_pane(1, beta_over).unwrap();
+        let set_space = |app: &mut App, terminal: &TerminalId, on: bool| {
+            app.state
+                .terminals
+                .get_mut(terminal)
+                .unwrap()
+                .overseer
+                .assign(on.then_some(crate::overseer::Kind::Space));
+        };
+        set_space(&mut app, &alpha_over_t, true);
+        set_space(&mut app, &beta_over_t, true);
+
+        // Each reader gets its own workspace's unique overseer and never the other workspace's.
+        let alpha_view = app.orientation_context(&alpha_reader_t);
+        assert!(
+            alpha_view.contains(&format!("terminal={}", quoted(&alpha_over_t.to_string()))),
+            "{alpha_view}"
+        );
+        assert!(
+            !alpha_view.contains(&beta_over_t.to_string()),
+            "{alpha_view}"
+        );
+        assert!(!alpha_view.contains("ambiguous"), "{alpha_view}");
+        let beta_view = app.orientation_context(&beta_over_t);
+        assert!(
+            beta_view.contains("self role=\"space overseer\""),
+            "{beta_view}"
+        );
+        assert!(
+            beta_view.contains(&format!("terminal={}", quoted(&beta_over_t.to_string()))),
+            "{beta_view}"
+        );
+        assert!(beta_view.contains("name=\""), "{beta_view}");
+        assert!(
+            !beta_view.contains(&alpha_over_t.to_string()),
+            "{beta_view}"
+        );
+
+        // A second overseer in alpha makes alpha ambiguous for its own readers only; beta stays unique.
+        set_space(&mut app, &alpha_reader_t, true);
+        let alpha_view = app.orientation_context(&alpha_over_t);
+        assert!(
+            alpha_view.contains("ambiguous: 2 live space overseers in this workspace"),
+            "{alpha_view}"
+        );
+        assert!(
+            !alpha_view.contains(&beta_over_t.to_string()),
+            "{alpha_view}"
+        );
+        let beta_view = app.orientation_context(&beta_over_t);
+        assert!(!beta_view.contains("ambiguous"), "{beta_view}");
+        assert!(
+            beta_view.contains(&format!("terminal={}", quoted(&beta_over_t.to_string()))),
+            "{beta_view}"
+        );
+
+        // Moving alpha's marker inside alpha changes each alpha reader's role; beta is unaffected.
+        set_space(&mut app, &alpha_over_t, false);
+        set_space(&mut app, &alpha_reader_t, false);
+        set_space(&mut app, &alpha_reader_t, true);
+        let old_marker = app.orientation_context(&alpha_over_t);
+        assert!(
+            old_marker.contains("self role=\"not an overseer\""),
+            "{old_marker}"
+        );
+        assert!(
+            old_marker.contains(&format!("terminal={}", quoted(&alpha_reader_t.to_string()))),
+            "{old_marker}"
+        );
+        let new_marker = app.orientation_context(&alpha_reader_t);
+        assert!(
+            new_marker.contains("self role=\"space overseer\""),
+            "{new_marker}"
+        );
+        assert!(!app.orientation_context(&beta_over_t).contains("ambiguous"));
+
+        // An alpha with no overseer reads missing and never borrows beta's overseer.
+        set_space(&mut app, &alpha_reader_t, false);
+        let alpha_empty = app.orientation_context(&alpha_reader_t);
+        assert!(
+            alpha_empty.contains(
+                "live space overseer: none live in this workspace (missing; do not assume one)"
+            ),
+            "{alpha_empty}"
+        );
+        assert!(
+            !alpha_empty.contains(&beta_over_t.to_string()),
+            "{alpha_empty}"
+        );
+
+        // A detached reader has no scope, so it does not borrow beta's overseer.
+        let detached_view = app.orientation_context(&detached);
+        assert!(
+            detached_view.contains("live space overseer: unavailable"),
+            "{detached_view}"
+        );
+        assert!(
+            !detached_view.contains(&beta_over_t.to_string()),
+            "{detached_view}"
+        );
     }
 
     #[tokio::test]
