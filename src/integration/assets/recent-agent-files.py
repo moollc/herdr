@@ -17,13 +17,11 @@ MAX_INPUT = 1024 * 1024
 MAX_JOURNAL_BYTES = 512 * 1024
 MAX_RECORDS = 500
 JOURNAL_NAME = "recent-agent-files.jsonl"
-
-
-def _is_regular_file(path):
-    try:
-        return stat.S_ISREG(os.lstat(path).st_mode)
-    except OSError:
-        return False
+PENDING_NAME = "recent-agent-files-pending.json"
+MAX_PENDING_EVENTS = 64
+MAX_PENDING_BYTES = 512 * 1024
+MAX_CANDIDATE_PATHS = 64
+PENDING_TTL_NS = 120 * 1_000_000_000
 
 
 def _shell_destinations(command):
@@ -104,6 +102,8 @@ def _shell_has_candidate_write(command):
         return True
     if not isinstance(command, str) or len(command) > MAX_INPUT:
         return False
+    raw_command = command
+    command = re.sub(r"(?<!\S)(\d+)(?=(?:>>|>))", r"HERDR_FD_\1", command)
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
         tokens = list(lexer)
@@ -135,12 +135,17 @@ def _shell_has_candidate_write(command):
             previous = tokens[index - 1] if index else ""
             if not previous.startswith("HERDR_FD_2"):
                 return True
+    if _shell_uses_unsupported_context(raw_command) and re.search(
+        r"(?<!\S)(?!(?:2(?:>>|>)))(?:\d*(?:>>|>)|&>>|&>)(?!&)\s*(?!/dev/null\b)[^\s;&|]+",
+        raw_command,
+    ):
+        return True
     return False
 
 
 def _is_supported_write_tool(tool_name):
     name = str(tool_name or "").casefold()
-    return any(word in name for word in ("write", "edit", "patch", "create"))
+    return any(word in name for word in ("write", "edit", "patch", "create", "replace"))
 
 
 def _patch_paths(value):
@@ -166,7 +171,7 @@ def _direct_paths(tool_name, tool_input):
     name = str(tool_name or "").casefold()
     if name in ("apply_patch", "applypatch"):
         return _patch_paths(tool_input)
-    if not any(word in name for word in ("write", "edit", "patch", "create")):
+    if not any(word in name for word in ("write", "edit", "patch", "create", "replace")):
         return []
     paths = []
     for key in ("file_path", "path", "target_path", "destination"):
@@ -177,7 +182,7 @@ def _direct_paths(tool_name, tool_input):
 
 
 def _normalize_path(raw_path, cwd):
-    if not isinstance(raw_path, str) or not raw_path or len(raw_path) > 16 * 1024:
+    if not isinstance(raw_path, str) or not raw_path or len(raw_path) > 4096:
         return None
     if "\x00" in raw_path:
         return None
@@ -186,103 +191,142 @@ def _normalize_path(raw_path, cwd):
         if not isinstance(cwd, str) or not cwd or not Path(cwd).is_absolute():
             return None
         candidate = Path(cwd) / candidate
-    return os.path.abspath(os.fspath(candidate))
+    try:
+        return str(candidate.resolve(strict=False))
+    except OSError:
+        return None
 
 
-def _event_paths(provider, event, payload):
+def _candidate_paths(provider, event, payload):
     if not isinstance(payload, dict):
-        return [], ""
+        return [], "", False
     cwd = payload.get("cwd")
     paths = []
-    if provider == "cursor" and event == "afterFileEdit":
+    tool_name = str(payload.get("tool_name") or event or "unknown")
+    normalized_name = tool_name.casefold()
+    tool_input = payload.get("tool_input")
+    if provider == "cursor" and event in ("afterFileEdit", "afterTabFileEdit"):
         paths.append(payload.get("file_path"))
-        tool = "afterFileEdit"
-    elif provider == "cursor" and event == "afterTabFileEdit":
-        paths.append(payload.get("file_path"))
-        tool = "afterTabFileEdit"
-    elif provider == "cursor" and event == "postToolUse":
-        tool = str(payload.get("tool_name") or "postToolUse")
-        if tool.casefold() != "shell":
-            return [], tool
-        tool_input = payload.get("tool_input")
-        command = tool_input.get("command") if isinstance(tool_input, dict) else None
-        if not _shell_has_candidate_write(command):
-            return [], tool
-        if not _cursor_shell_succeeded(payload.get("tool_output")):
-            return [], "gap:" + tool
+        candidate = True
+    elif provider == "codex" and event in ("PreToolUse", "PostToolUse"):
+        command = (tool_input.get("command") or tool_input.get("cmd")) if isinstance(tool_input, dict) else tool_input
+        candidate = _is_supported_write_tool(tool_name)
+        if normalized_name in ("bash", "exec", "exec_command", "shell"):
+            candidate = candidate or _shell_has_candidate_write(command)
+            paths.extend(_shell_destinations(command))
+        paths.extend(_direct_paths(tool_name, tool_input))
         if isinstance(tool_input, dict):
             workdir = tool_input.get("workdir")
             if isinstance(workdir, str) and Path(workdir).is_absolute():
                 cwd = workdir
-        paths.extend(_shell_destinations(command))
-        if not paths and _shell_uses_unsupported_context(command):
-            return [], "gap:" + tool
-    elif provider == "codex" and event == "PostToolUse":
-        tool_name = payload.get("tool_name")
-        tool_input = payload.get("tool_input")
-        tool = str(tool_name or "PostToolUse")
-        normalized_name = str(tool_name or "").casefold()
-        command = (
-            (tool_input.get("command") or tool_input.get("cmd"))
-            if isinstance(tool_input, dict)
-            else tool_input
-        )
+    elif provider == "cursor" and event in ("preToolUse", "postToolUse", "postToolUseFailure"):
+        command = tool_input.get("command") if isinstance(tool_input, dict) else None
         candidate = _is_supported_write_tool(tool_name)
-        if normalized_name in ("bash", "exec", "exec_command", "shell"):
+        if normalized_name == "shell":
             candidate = candidate or _shell_has_candidate_write(command)
-        if not _codex_tool_succeeded(payload.get("tool_response")):
-            return [], ("gap:" if candidate else "") + tool
-        paths.extend(_direct_paths(tool_name, tool_input))
-        if normalized_name in ("bash", "exec", "exec_command", "shell"):
-            if isinstance(tool_input, dict):
-                workdir = tool_input.get("workdir")
-                if isinstance(workdir, str) and Path(workdir).is_absolute():
-                    cwd = workdir
             paths.extend(_shell_destinations(command))
-            if not paths and _shell_uses_unsupported_context(command):
-                return [], "gap:" + tool
+        paths.extend(_direct_paths(tool_name, tool_input))
+        if isinstance(tool_input, dict):
+            workdir = tool_input.get("cwd") or tool_input.get("workdir")
+            if isinstance(workdir, str) and Path(workdir).is_absolute():
+                cwd = workdir
     else:
-        return [], "unsupported:" + str(event or "unknown")
+        return [], tool_name, False
 
     normalized = []
     for raw_path in paths:
         path = _normalize_path(raw_path, cwd)
-        if path and path not in normalized and _is_regular_file(path):
+        if path and path not in normalized and path not in ("/dev/null",):
             normalized.append(path)
-    return normalized, tool
+    return normalized, tool_name, candidate
 
 
-def _response_object(value):
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
+def _fingerprint(path):
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    return [info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
+def _event_key(provider, payload):
+    event_id = payload.get("tool_use_id") if isinstance(payload, dict) else None
+    if not isinstance(event_id, str) or not event_id or len(event_id) > 1024:
+        return None
+    return hashlib.sha256((provider + "\0" + event_id).encode("utf-8")).hexdigest()
+
+
+def _pending_update(path, change, *, consume=True):
+    """Atomically update short-lived metadata; never persist command or file contents."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("a", encoding="utf-8") as lock:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            parsed = json.loads(value)
-        except (ValueError, TypeError):
-            return None
-        return parsed if isinstance(parsed, dict) else None
-    return None
+            state = json.loads(path.read_text()) if path.exists() else {}
+        except (OSError, ValueError, TypeError):
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        now = time.time_ns()
+        stale = [key for key, item in state.items()
+                 if not isinstance(item, dict) or type(item.get("started_ns")) is not int
+                 or now - item["started_ns"] > PENDING_TTL_NS]
+        for key in stale:
+            state.pop(key, None)
+        key, entry = change
+        matched = None
+        if key is not None:
+            if entry is None:
+                matched = state.pop(key, None) if consume else state.get(key)
+            else:
+                state[key] = entry
+        evicted = 0
+        while len(state) > MAX_PENDING_EVENTS:
+            oldest = min(state, key=lambda item: state[item].get("started_ns", 0))
+            state.pop(oldest, None)
+            evicted += 1
+        encoded = json.dumps(state, separators=(",", ":")).encode("utf-8")
+        while len(encoded) > MAX_PENDING_BYTES and state:
+            oldest = min(state, key=lambda item: state[item].get("started_ns", 0))
+            state.pop(oldest, None)
+            evicted += 1
+            encoded = json.dumps(state, separators=(",", ":")).encode("utf-8")
+        fd, temporary = tempfile.mkstemp(prefix="recent-agent-files-pending-", dir=path.parent)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(encoded.decode("utf-8"))
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    return len(stale) + evicted, matched
 
 
-def _cursor_shell_succeeded(value):
-    response = _response_object(value)
-    code = response.get("exitCode") if response else None
-    return type(code) is int and code == 0
-
-
-def _codex_tool_succeeded(value):
-    # A string here is rendered command output, not provider-owned metadata.
-    # In particular, status-looking text or JSON stdout cannot prove success.
-    response = value if isinstance(value, dict) else None
-    if response is None:
+def _record_observed(provider, event, tool, event_key, path, state_dir, timestamp):
+    journal = Path(state_dir) / JOURNAL_NAME
+    state_root = Path(state_dir).resolve(strict=False)
+    try:
+        canonical = Path(path).resolve(strict=False)
+    except OSError:
         return False
-    if response.get("success") is False or str(response.get("status", "")).casefold() in ("failed", "failure", "error"):
+    if canonical == journal.resolve(strict=False) or (
+        canonical.parent == state_root and canonical.name.startswith("recent-agent-files-")
+    ):
+        return True
+    try:
+        _bounded_upsert(journal, {
+            "path": str(canonical),
+            "time_ns": timestamp,
+            "agent": provider,
+            "provenance": f"{provider}.{event}.{tool}"[:120],
+            "event_id": f"{event_key}:{hashlib.sha256(path.encode('utf-8')).hexdigest()[:24]}"[:160],
+        })
+        return True
+    except OSError:
         return False
-    for key in ("exit_code", "exitCode"):
-        code = response.get(key)
-        if type(code) is int:
-            return code == 0
-    return response.get("success") is True or str(response.get("status", "")).casefold() in ("success", "succeeded")
 
 
 def _read_journal(path):
@@ -362,29 +406,67 @@ def _bounded_upsert(journal, record):
 def capture(provider, event, payload, state_dir, *, now_ns=None):
     if provider not in ("codex", "cursor") or not isinstance(payload, dict):
         return 0
-    paths, tool = _event_paths(provider, event, payload)
-    if not paths:
-        if tool.startswith("gap:"):
-            _mark_gap(provider, event, tool[4:], state_dir, now_ns)
-        return 0
-    journal = Path(state_dir) / JOURNAL_NAME
-    captured = 0
+    paths, tool, candidate = _candidate_paths(provider, event, payload)
     timestamp = int(now_ns if now_ns is not None else time.time_ns())
-    event_id = payload.get("tool_use_id") or payload.get("generation_id") or uuid.uuid4().hex
-    for index, path in enumerate(paths):
-        if os.path.abspath(path) == os.path.abspath(journal):
+    if len(paths) > MAX_CANDIDATE_PATHS:
+        if candidate:
+            _mark_gap(provider, event, "too-many-explicit-paths", state_dir, timestamp)
+        return 0
+    if provider == "cursor" and event in ("afterFileEdit", "afterTabFileEdit"):
+        key = hashlib.sha256((provider + "\0" + str(payload.get("generation_id", ""))).encode()).hexdigest()
+        return sum(_record_observed(provider, event, tool, key, path, state_dir, timestamp + index)
+                   for index, path in enumerate(paths) if _fingerprint(path) is not None)
+
+    pre_event = event == "PreToolUse" if provider == "codex" else event == "preToolUse"
+    post_event = event == "PostToolUse" if provider == "codex" else event in ("postToolUse", "postToolUseFailure")
+    if not (pre_event or post_event):
+        return 0
+    event_key = _event_key(provider, payload)
+    pending = Path(state_dir) / PENDING_NAME
+    if pre_event:
+        if not candidate:
+            return 0
+        fingerprints = [{"path": path, "before": _fingerprint(path)} for path in paths]
+        if event_key is None or not fingerprints:
+            _mark_gap(provider, event, tool, state_dir, timestamp)
+            return 0
+        expired, _ = _pending_update(pending, (event_key, {"started_ns": timestamp, "files": fingerprints}))
+        if expired:
+            _mark_gap(provider, event, "stale-or-evicted-pending", state_dir, timestamp)
+        return 0
+
+    if event_key is None:
+        if candidate:
+            _mark_gap(provider, event, tool, state_dir, timestamp)
+        return 0
+    expired, entry = _pending_update(pending, (event_key, None), consume=False)
+    if expired:
+        _mark_gap(provider, event, "stale-or-evicted-pending", state_dir, timestamp)
+    if not isinstance(entry, dict) or not isinstance(entry.get("files"), list):
+        if candidate:
+            _mark_gap(provider, event, "unmatched:" + tool, state_dir, timestamp)
+        return 0
+    captured = 0
+    failed_record = False
+    ambiguous = False
+    for index, item in enumerate(entry["files"]):
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            failed_record = True
             continue
-        try:
-            _bounded_upsert(journal, {
-                "path": path,
-                "time_ns": timestamp + index,
-                "agent": provider,
-                "provenance": f"{provider}.{event}.{tool}"[:120],
-                "event_id": f"{event_id}:{hashlib.sha256(path.encode('utf-8')).hexdigest()[:24]}"[:160],
-            })
-        except OSError:
+        after = _fingerprint(item["path"])
+        if after is None and item.get("before") is not None:
+            ambiguous = True
             continue
-        captured += 1
+        if after is None or after == item.get("before"):
+            continue
+        if not _record_observed(provider, event, tool, event_key, item["path"], state_dir, timestamp + index):
+            failed_record = True
+        else:
+            captured += 1
+    if not failed_record:
+        _pending_update(pending, (event_key, None))
+    if ambiguous:
+        _mark_gap(provider, event, "candidate-disappeared-during-tool", state_dir, timestamp)
     return captured
 
 

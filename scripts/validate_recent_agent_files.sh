@@ -27,6 +27,7 @@ run_checks() {
     unset HERDR_RECENT_AGENT_FILES_RENDER
     run_filter opener
     run_filter native_turn_cursor_hooks_preserve_user_hooks
+    run_filter install_codex_is_idempotent_for_hook_entries_and_feature_flag
 }
 
 if run_checks >"$log_path" 2>&1; then

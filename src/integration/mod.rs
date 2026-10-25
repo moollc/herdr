@@ -1291,6 +1291,13 @@ fn install_codex_at(dir: &Path) -> io::Result<CodexInstallPaths> {
     )?;
     ensure_command_hook(
         hooks,
+        "PreToolUse",
+        format!("bash {quoted_hook_path} recent-files PreToolUse"),
+        10,
+        Some(".*"),
+    )?;
+    ensure_command_hook(
+        hooks,
         "PostToolUse",
         format!("bash {quoted_hook_path} recent-files PostToolUse"),
         10,
@@ -1734,6 +1741,11 @@ fn uninstall_codex_at(codex_dir: &Path) -> io::Result<CodexUninstallResult> {
                 hooks,
                 "PostToolUse",
                 &format!("bash {quoted_hook_path} recent-files PostToolUse"),
+            )?;
+            updated_hooks |= remove_command_hook(
+                hooks,
+                "PreToolUse",
+                &format!("bash {quoted_hook_path} recent-files PreToolUse"),
             )?;
             updated_hooks |= remove_command_hook(
                 hooks,
@@ -3820,7 +3832,11 @@ mod tests {
             .unwrap()
             .contains("recent-files PostToolUse"));
         assert!(codex_dir.join(RECENT_AGENT_FILES_HOOK_NAME).is_file());
-        assert!(hooks["hooks"].get("PreToolUse").is_none());
+        assert_eq!(hooks["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert!(hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("recent-files PreToolUse"));
         assert!(hooks["hooks"].get("PermissionRequest").is_none());
         assert!(hooks["hooks"].get("Stop").is_none());
         assert!(config.contains("model = \"gpt-5.4\""));
@@ -3863,6 +3879,11 @@ mod tests {
             "[features]\ncodex_hooks = false\nother = true\n",
         )
         .unwrap();
+        fs::write(
+            codex_dir.join("hooks.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Read","hooks":[{"type":"command","command":"echo keep"}]}]}}"#,
+        )
+        .unwrap();
         std::env::set_var("HOME", &home);
 
         install_codex().unwrap();
@@ -3877,7 +3898,25 @@ mod tests {
         assert!(hooks["hooks"]["UserPromptSubmit"]
             .as_array()
             .is_some_and(|v| v.len() == 1));
-        assert!(hooks["hooks"].get("PreToolUse").is_none());
+        assert_eq!(hooks["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+        assert!(hooks["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["matcher"] == "Read" && entry["hooks"][0]["command"] == "echo keep"
+            }));
+        assert!(hooks["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["matcher"] == ".*"
+                    && entry["hooks"][0]["command"]
+                        .as_str()
+                        .unwrap()
+                        .contains("recent-files PreToolUse")
+            }));
         assert!(hooks["hooks"].get("PermissionRequest").is_none());
         assert!(hooks["hooks"].get("Stop").is_none());
         assert_eq!(config.matches("hooks = true").count(), 1);

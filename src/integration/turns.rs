@@ -74,6 +74,23 @@ pub(super) fn cursor_registered(script: &Path) -> bool {
         && settings
             .as_ref()
             .and_then(|s| s.get("hooks"))
+            .and_then(|h| h.get("preToolUse"))
+            .and_then(Value::as_array)
+            .is_some_and(|entries| {
+                let command = format!(
+                    "python3 {} cursor preToolUse",
+                    shell_single_quote(
+                        &dir.join(RECENT_AGENT_FILES_HOOK_NAME).display().to_string()
+                    )
+                );
+                entries.iter().any(|entry| {
+                    entry.get("command").and_then(Value::as_str) == Some(command.as_str())
+                        && entry.get("matcher").and_then(Value::as_str) == Some(".*")
+                })
+            })
+        && settings
+            .as_ref()
+            .and_then(|s| s.get("hooks"))
             .and_then(|h| h.get("postToolUse"))
             .and_then(Value::as_array)
             .is_some_and(|entries| {
@@ -85,7 +102,24 @@ pub(super) fn cursor_registered(script: &Path) -> bool {
                 );
                 entries.iter().any(|entry| {
                     entry.get("command").and_then(Value::as_str) == Some(command.as_str())
-                        && entry.get("matcher").and_then(Value::as_str) == Some("Shell")
+                        && entry.get("matcher").and_then(Value::as_str) == Some(".*")
+                })
+            })
+        && settings
+            .as_ref()
+            .and_then(|s| s.get("hooks"))
+            .and_then(|h| h.get("postToolUseFailure"))
+            .and_then(Value::as_array)
+            .is_some_and(|entries| {
+                let command = format!(
+                    "python3 {} cursor postToolUseFailure",
+                    shell_single_quote(
+                        &dir.join(RECENT_AGENT_FILES_HOOK_NAME).display().to_string()
+                    )
+                );
+                entries.iter().any(|entry| {
+                    entry.get("command").and_then(Value::as_str) == Some(command.as_str())
+                        && entry.get("matcher").and_then(Value::as_str) == Some(".*")
                 })
             })
 }
@@ -152,6 +186,22 @@ fn cursor_hooks(dir: &Path, remove: bool) -> io::Result<()> {
     }
     if entries.is_empty() {
         hooks.remove(event);
+    }
+    for event in ["preToolUse", "postToolUse", "postToolUseFailure"] {
+        let command = format!("python3 {recent_script} cursor {event}");
+        let entries = hooks
+            .entry(event.to_string())
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or_else(|| io::Error::other("cursor tool hooks must be an array"))?;
+        entries
+            .retain(|entry| entry.get("command").and_then(Value::as_str) != Some(command.as_str()));
+        if !remove {
+            entries.push(json!({"command": command, "matcher": ".*"}));
+        }
+        if entries.is_empty() {
+            hooks.remove(event);
+        }
     }
     fs::write(path, serde_json::to_string_pretty(&settings)?)
 }
@@ -287,13 +337,14 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("hooks.json"),
-            r#"{"version":1,"hooks":{"stop":[{"command":"echo keep","loop_limit":3}],"postToolUse":[{"command":"echo audit","matcher":"Shell"}]}}"#,
+            r#"{"version":1,"hooks":{"stop":[{"command":"echo keep","loop_limit":3}],"preToolUse":[{"command":"echo pre audit","matcher":"Read"}],"postToolUse":[{"command":"echo audit","matcher":"Shell"}],"postToolUseFailure":[{"command":"echo failure audit","matcher":"Write"}]}}"#,
         )
         .unwrap();
         cursor_hooks(&dir, false).unwrap();
         cursor_hooks(&dir, false).unwrap();
         let parsed: Value =
             serde_json::from_str(&fs::read_to_string(dir.join("hooks.json")).unwrap()).unwrap();
+        assert!(cursor_registered(&dir.join("herdr-agent-state.sh")));
         assert_eq!(parsed["hooks"]["stop"].as_array().unwrap().len(), 2);
         assert_eq!(
             parsed["hooks"]["afterFileEdit"].as_array().unwrap().len(),
@@ -303,6 +354,22 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("cursor afterFileEdit"));
+        assert_eq!(parsed["hooks"]["preToolUse"].as_array().unwrap().len(), 2);
+        assert!(parsed["hooks"]["preToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains("cursor preToolUse"))
+                    && entry["matcher"] == ".*"
+            }));
+        assert!(parsed["hooks"]["preToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| { entry["command"] == "echo pre audit" && entry["matcher"] == "Read" }));
         assert!(parsed["hooks"]["postToolUse"]
             .as_array()
             .unwrap()
@@ -312,13 +379,25 @@ mod tests {
                     .as_str()
                     .unwrap()
                     .contains("cursor postToolUse")
-                    && entry["matcher"] == "Shell"
+                    && entry["matcher"] == ".*"
             }));
         assert!(parsed["hooks"]["postToolUse"]
             .as_array()
             .unwrap()
             .iter()
             .any(|entry| { entry["command"] == "echo audit" && entry["matcher"] == "Shell" }));
+        assert_eq!(
+            parsed["hooks"]["postToolUseFailure"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(parsed["hooks"]["postToolUseFailure"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["command"] == "echo failure audit" && entry["matcher"] == "Write"));
         cursor_hooks(&dir, true).unwrap();
         let restored: Value =
             serde_json::from_str(&fs::read_to_string(dir.join("hooks.json")).unwrap()).unwrap();
@@ -331,6 +410,14 @@ mod tests {
         assert_eq!(
             restored["hooks"]["postToolUse"],
             json!([{"command":"echo audit","matcher":"Shell"}])
+        );
+        assert_eq!(
+            restored["hooks"]["preToolUse"],
+            json!([{"command":"echo pre audit","matcher":"Read"}])
+        );
+        assert_eq!(
+            restored["hooks"]["postToolUseFailure"],
+            json!([{"command":"echo failure audit","matcher":"Write"}])
         );
     }
 }
