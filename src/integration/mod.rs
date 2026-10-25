@@ -3703,6 +3703,7 @@ mod tests {
 
     #[test]
     fn codex_v2_integration_status_is_outdated() {
+        assert_eq!(CODEX_INTEGRATION_VERSION, 8);
         let _lock = integration_env_lock();
         let base = unique_base();
         let home = base.join("home");
@@ -3726,6 +3727,12 @@ mod tests {
         assert_eq!(codex.installed_version, Some(2));
         assert_eq!(codex.expected_version, CODEX_INTEGRATION_VERSION);
         assert_eq!(codex.state, IntegrationStatusKind::Outdated);
+
+        let cursor = integration_specs()
+            .into_iter()
+            .find(|(target, _, _)| *target == crate::api::schema::IntegrationTarget::Cursor)
+            .expect("Cursor integration spec");
+        assert_eq!(cursor.2, 2);
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);

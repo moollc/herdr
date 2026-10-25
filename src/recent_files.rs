@@ -93,10 +93,15 @@ impl RecentFilesWatcher {
                 return *snapshot != previous_snapshot;
             }
             snapshot.root = root.clone();
+            snapshot.files.clear();
+            snapshot.selected = None;
+            snapshot.scroll_offset = 0;
+            snapshot.truncated = false;
+            snapshot.error = None;
             snapshot.loading = true;
             changed = true;
         }
-        if root.is_none() || now < self.next_poll {
+        if root.is_none() || (now < self.next_poll && !changed) {
             return changed;
         }
         self.next_poll = now + Duration::from_secs(1);
@@ -397,6 +402,78 @@ mod tests {
             "provenance": format!("{agent}.PostToolUse.fixture"),
             "event_id": format!("fixture-{time_ns}"),
         })
+    }
+
+    #[test]
+    fn watcher_reads_unchanged_journal_on_root_switch_before_poll_deadline() {
+        let base = fixture_dir("watcher-root-switch-journal");
+        let first_root = base.join("first");
+        let second_root = base.join("second");
+        fs::create_dir_all(&first_root).expect("first root");
+        fs::create_dir_all(&second_root).expect("second root");
+        let journal = base.join("state").join(JOURNAL_NAME);
+        fs::create_dir_all(journal.parent().expect("state parent")).expect("state");
+        fs::write(&journal, "").expect("empty journal");
+
+        let mut watcher = RecentFilesWatcher::with_journal_path(journal);
+        let mut snapshot = RecentFilesSnapshot::default();
+        let monotonic_start = Instant::now();
+        let wall_start = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert!(watcher.poll_at(monotonic_start, wall_start, Some(first_root), &mut snapshot));
+        assert!(!snapshot.loading);
+
+        assert!(watcher.poll_at(
+            monotonic_start + Duration::from_millis(100),
+            wall_start + Duration::from_millis(100),
+            Some(second_root.clone()),
+            &mut snapshot
+        ));
+        assert_eq!(snapshot.root, Some(second_root.clone()));
+        assert!(!snapshot.loading);
+
+        assert!(!watcher.poll_at(
+            monotonic_start + Duration::from_secs(1),
+            wall_start + Duration::from_secs(1),
+            Some(second_root),
+            &mut snapshot
+        ));
+        assert!(!snapshot.loading);
+    }
+
+    #[test]
+    fn watcher_clears_stale_files_when_root_switches_without_a_journal() {
+        let base = fixture_dir("watcher-root-switch-no-journal");
+        let first_root = base.join("first");
+        let second_root = base.join("second");
+        fs::create_dir_all(&first_root).expect("first root");
+        fs::create_dir_all(&second_root).expect("second root");
+        let journal = base.join("missing-state").join(JOURNAL_NAME);
+        let mut watcher = RecentFilesWatcher::with_journal_path(journal);
+        let mut snapshot = RecentFilesSnapshot::default();
+        let monotonic_start = Instant::now();
+        let wall_start = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert!(watcher.poll_at(monotonic_start, wall_start, Some(first_root), &mut snapshot));
+        assert!(!snapshot.loading);
+
+        snapshot.files.push(RecentFile {
+            path: base.join("stale-from-previous-root.txt"),
+            modified: wall_start,
+            agent: "codex".into(),
+        });
+        snapshot.selected = Some(0);
+        snapshot.scroll_offset = 1;
+        assert!(watcher.poll_at(
+            monotonic_start + Duration::from_millis(100),
+            wall_start + Duration::from_millis(100),
+            Some(second_root.clone()),
+            &mut snapshot
+        ));
+
+        assert_eq!(snapshot.root, Some(second_root));
+        assert!(snapshot.files.is_empty());
+        assert_eq!(snapshot.selected, None);
+        assert_eq!(snapshot.scroll_offset, 0);
+        assert!(!snapshot.loading);
     }
 
     #[test]
