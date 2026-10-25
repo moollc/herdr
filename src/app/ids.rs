@@ -223,4 +223,96 @@ mod tests {
             Some(pane_id)
         );
     }
+    #[test]
+    #[cfg(unix)]
+    fn repeated_handoff_aliases_follow_terminals_including_detached_agents() {
+        use crate::layout::PaneId;
+        use crate::terminal::{TerminalId, TerminalRuntimeRegistry};
+        let mut app = test_app();
+        let original = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal = app.state.workspaces[0]
+            .terminal_id(original)
+            .unwrap()
+            .clone();
+        let detached_raw = PaneId::alloc();
+        let detached_terminal = TerminalId::alloc();
+        app.state
+            .detached_agents
+            .push(crate::app::state::DetachedAgent {
+                pane_id: detached_raw,
+                pane: crate::pane::PaneState::new(detached_terminal.clone()),
+            });
+        app.state.ensure_test_terminals();
+        let original_report = format!("p_{}", original.raw());
+        let detached_report = format!("p_{}", detached_raw.raw());
+        // The first live generation already had an alias collision. The live
+        // process's original id must retain its original terminal binding.
+        let mut visible = crate::workspace::Workspace::test_new("generation");
+        let actual = visible.tabs[0].root_pane;
+        visible.tabs[0]
+            .panes
+            .get_mut(&actual)
+            .unwrap()
+            .attached_terminal_id = terminal.clone();
+        app.state.pane_id_aliases.insert(original.raw(), actual);
+        app.state.workspaces = vec![visible];
+        for _ in 0..3 {
+            let snapshot = crate::persist::capture(&app.state, &TerminalRuntimeRegistry::new());
+            let json = serde_json::to_string(&snapshot).unwrap();
+            let mut snapshot: crate::persist::SessionSnapshot =
+                serde_json::from_str(&json).unwrap();
+            assert_eq!(snapshot.handoff_pane_terminals[&original.raw()], terminal);
+            // Reproduce an older server's collision: a current layout id
+            // points elsewhere, but an inherited alias already owns that id.
+            let mut unrelated = serde_json::to_value(
+                snapshot.workspaces[0].tabs[0]
+                    .panes
+                    .values()
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+            unrelated["terminal_id"] = serde_json::to_value(&detached_terminal).unwrap();
+            snapshot.workspaces[0].tabs[0]
+                .panes
+                .insert(original.raw(), serde_json::from_value(unrelated).unwrap());
+            let mut next = crate::workspace::Workspace::test_new("next generation");
+            let next_pane = next.tabs[0].root_pane;
+            next.tabs[0]
+                .panes
+                .get_mut(&next_pane)
+                .unwrap()
+                .attached_terminal_id = terminal.clone();
+            let next_detached = PaneId::alloc();
+            app.state.workspaces = vec![next];
+            app.state.detached_agents[0].pane_id = next_detached;
+            app.state.pane_id_aliases = crate::persist::handoff_pane_aliases(
+                &snapshot,
+                &app.state.workspaces,
+                &app.state.detached_agents,
+            );
+            assert_eq!(
+                app.parse_reporting_pane_id(&original_report),
+                Some(next_pane)
+            );
+            assert_eq!(
+                app.parse_reporting_pane_id(&detached_report),
+                Some(next_detached)
+            );
+            assert_eq!(
+                app.state.terminal_id_for_any_pane(next_detached),
+                Some(detached_terminal.clone())
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handoff_reserves_alias_namespace_before_new_pane_allocations() {
+        use crate::layout::PaneId;
+        let held = PaneId::alloc().raw() + 32;
+        PaneId::reserve_through(held).unwrap();
+        assert!(PaneId::alloc().raw() > held);
+        assert!(PaneId::reserve_through(u32::MAX).is_err());
+    }
 }

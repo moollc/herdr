@@ -17,6 +17,10 @@ pub struct SessionSnapshot {
     /// Format version — used to detect incompatible changes.
     #[serde(default)]
     pub version: u32,
+    /// Raw ids retained by surviving processes across live handoffs, bound to
+    /// stable terminal identity rather than the current layout or pane number.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub handoff_pane_terminals: HashMap<u32, crate::terminal::TerminalId>,
     pub workspaces: Vec<WorkspaceSnapshot>,
     pub active: Option<usize>,
     pub selected: usize,
@@ -67,6 +71,7 @@ impl Default for SessionSnapshot {
     fn default() -> Self {
         Self {
             version: SNAPSHOT_VERSION,
+            handoff_pane_terminals: HashMap::new(),
             workspaces: Vec::new(),
             active: None,
             selected: 0,
@@ -352,6 +357,8 @@ struct RawSessionSnapshot {
     #[serde(default)]
     workspaces: Vec<serde_json::Value>,
     #[serde(default)]
+    handoff_pane_terminals: HashMap<u32, crate::terminal::TerminalId>,
+    #[serde(default)]
     active: Option<usize>,
     #[serde(default)]
     selected: usize,
@@ -388,6 +395,7 @@ struct RawSessionSnapshot {
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
     Ok(SessionSnapshot {
         version: raw.version,
+        handoff_pane_terminals: raw.handoff_pane_terminals,
         workspaces: raw
             .workspaces
             .into_iter()
@@ -463,8 +471,32 @@ pub fn capture(
     state: &crate::app::state::AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
 ) -> SessionSnapshot {
+    let mut handoff_pane_terminals: HashMap<_, _> = state
+        .pane_id_aliases
+        .iter()
+        .filter_map(|(raw, pane)| state.terminal_id_for_any_pane(*pane).map(|id| (*raw, id)))
+        .collect();
+    // Inherited aliases win when an older server already reused a raw id.
+    // New handoff restores reserve the entire old namespace before allocating.
+    for workspace in &state.workspaces {
+        for tab in &workspace.tabs {
+            for pane in tab.layout.pane_ids() {
+                if let Some(id) = tab.terminal_id(pane) {
+                    handoff_pane_terminals
+                        .entry(pane.raw())
+                        .or_insert_with(|| id.clone());
+                }
+            }
+        }
+    }
+    for detached in &state.detached_agents {
+        handoff_pane_terminals
+            .entry(detached.pane_id.raw())
+            .or_insert_with(|| detached.pane.attached_terminal_id.clone());
+    }
     SessionSnapshot {
         version: SNAPSHOT_VERSION,
+        handoff_pane_terminals,
         workspaces: state
             .workspaces
             .iter()

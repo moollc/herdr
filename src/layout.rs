@@ -14,6 +14,16 @@ impl PaneId {
         Self(NEXT_PANE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// Keep newly allocated ids clear of ids inherited by live processes.
+    #[cfg(unix)]
+    pub(crate) fn reserve_through(raw: u32) -> std::io::Result<()> {
+        let next = raw
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("handoff pane id namespace exhausted"))?;
+        NEXT_PANE_ID.fetch_max(next, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     pub fn raw(self) -> u32 {
         self.0
     }

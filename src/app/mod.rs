@@ -784,7 +784,8 @@ impl App {
             app.render_notify.clone(),
             app.render_dirty.clone(),
         )?;
-        let pane_id_aliases = crate::persist::handoff_pane_aliases(snapshot, &workspaces);
+        let pane_id_aliases =
+            crate::persist::handoff_pane_aliases(snapshot, &workspaces, &detached_agents);
 
         app.no_session = false;
         app.state.detach_exits = false;

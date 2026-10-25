@@ -691,8 +691,16 @@ mod tests {
             context.contains(&format!("terminal={}", quoted(&first_terminal.to_string()))),
             "{context}"
         );
+        // Assigned fixture names may legitimately be William or Eleanor.
+        // Check the actual terminal's name instead of excluding real names.
+        let expected_name = crate::pane_names::assigned_names(&app.state.terminals)
+            .remove(&first_terminal)
+            .unwrap();
         assert!(
-            !context.contains("William") && !context.contains("Eleanor"),
+            context.contains(&format!(
+                "live space overseer: name={}",
+                quoted(&expected_name)
+            )),
             "{context}"
         );
         // A second live space overseer makes the state ambiguous for every reader.

@@ -909,80 +909,249 @@ fn live_handoff_accepts_old_pane_id_from_child_env() {
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("herdr.sock");
-    let pane_id_marker = base.join("old-pane-id");
-
-    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    let spawned = spawn_server_with_env(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &[("HERDR_SESSION", "handoff-reporting")],
+    );
     wait_for_socket(&api_socket, Duration::from_secs(10));
     register_runtime_dir(&runtime_dir);
 
-    let created = request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:workspace:create",
-            "method": "workspace.create",
-            "params": {"cwd": "/tmp", "focus": true}
-        }),
-    );
-    let pane_id = created["result"]["root_pane"]["pane_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:pane:print-id",
-            "method": "pane.send_input",
-            "params": {"pane_id": pane_id, "text": format!("printf '%s' \"$HERDR_PANE_ID\" > {}", pane_id_marker.display()), "keys": ["Enter"]}
-        }),
-    ));
-    let old_pane_id = wait_for_file_contains(&pane_id_marker, "p_", Duration::from_secs(5));
-    assert!(
-        old_pane_id.starts_with("p_"),
-        "unexpected pane id from env: {old_pane_id:?}"
-    );
+    // Use the actual bundled native hooks, real PTYs and serialized handoffs.
+    // No provider, model, or agent process is launched by this regression.
+    let mut recipients = Vec::new();
+    for (index, kind) in ["cursor", "codex", "claude", "shell"].iter().enumerate() {
+        let created = request(
+            &api_socket,
+            serde_json::json!({
+                "id": "create", "method": "workspace.create",
+                "params": {"cwd": "/tmp", "focus": true}
+            }),
+        );
+        let pane = created["result"]["root_pane"]["pane_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let terminal = created["result"]["root_pane"]["terminal_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let workspace = created["result"]["workspace"]["workspace_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let marker = base.join(format!("inherited-{index}"));
+        // A small foreground input sink stands in for the native UI. Hooks
+        // can trigger startup orientation; it must be consumed as agent input,
+        // rather than executed as commands by the fixture's ordinary shell.
+        let input_sink = if *kind == "shell" {
+            ""
+        } else {
+            "; stty -echo; cat >/dev/null"
+        };
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({
+                "id": "inherited", "method": "pane.send_input",
+                "params": {"pane_id": pane, "text": format!("printf '%s' \"$HERDR_PANE_ID\" > {}{input_sink}", marker.display()), "keys": ["Enter"]}
+            }),
+        ));
+        let inherited = wait_for_file_contains(&marker, "p_", Duration::from_secs(5));
+        recipients.push((kind.to_string(), terminal, workspace, inherited));
+    }
 
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
-    ));
-    drop(spawned);
-    wait_for_api(&api_socket, Duration::from_secs(10));
-
-    assert_ok(request(
-        &api_socket,
-        serde_json::json!({
-            "id": "test:old-pane-report",
-            "method": "pane.report_agent",
-            "params": {
-                "pane_id": old_pane_id,
-                "source": "handoff-test",
-                "agent": "pi",
-                "state": "working"
+    for generation in 0..=3 {
+        for (kind, _, _, inherited) in &recipients {
+            if kind == "shell" {
+                continue;
             }
+            let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/integration/assets");
+            let mut command = if kind == "cursor" {
+                let mut cmd = std::process::Command::new("python3");
+                cmd.arg(source.join("turn-report.py"))
+                    .args(["cursor", "session"]);
+                cmd
+            } else {
+                let mut cmd = std::process::Command::new("sh");
+                cmd.arg(source.join(kind).join("herdr-agent-state.sh"))
+                    .arg("session");
+                cmd
+            };
+            let mut child = command
+                .env("HERDR_ENV", "1")
+                .env("HERDR_SOCKET_PATH", &api_socket)
+                .env("HERDR_PANE_ID", inherited)
+                .env("TMPDIR", &base)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let payload = serde_json::json!({"session_id": format!("{kind}-generation-{generation}"),
+                "source": "resume", "hook_event_name": "sessionStart"});
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.to_string().as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "native {kind} hook failed: {:?}",
+                output
+            );
+        }
+        let agents = request(
+            &api_socket,
+            serde_json::json!({
+                "id": "agents", "method": "agent.list", "params": {}
+            }),
+        );
+        let rows = agents["result"]["agents"].as_array().unwrap();
+        for (kind, terminal, _, _) in &recipients {
+            if kind == "shell" {
+                assert!(
+                    !rows.iter().any(|row| row["terminal_id"] == *terminal
+                        && row.get("agent_session").is_some_and(|v| !v.is_null())),
+                    "native identity leaked onto untouched shell: {agents}"
+                );
+                continue;
+            }
+            let session = format!("{kind}-generation-{generation}");
+            if kind == "claude" && generation > 0 {
+                // agent.list intentionally describes layout panes. Check the
+                // actual persisted detached terminal after the native callback.
+                let snapshot = config_home
+                    .join(app_dir_name())
+                    .join("sessions/handoff-reporting/session.json");
+                let text = wait_for_file_contains(&snapshot, &session, Duration::from_secs(10));
+                let saved: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let matches: Vec<_> = saved["detached_agents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|agent| agent["pane"]["agent_session"]["value"] == session)
+                    .collect();
+                assert_eq!(
+                    matches.len(),
+                    1,
+                    "detached native session lost or duplicated: {saved}"
+                );
+                assert_eq!(matches[0]["pane"]["terminal_id"], *terminal);
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|row| row["agent_session"]["value"] == session),
+                    "detached report leaked into a layout pane: {agents}"
+                );
+                continue;
+            }
+            let matches: Vec<_> = rows
+                .iter()
+                .filter(|row| row["agent_session"]["value"] == session)
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "native session duplicated or lost: {agents}"
+            );
+            assert_eq!(
+                matches[0]["terminal_id"], *terminal,
+                "native hook updated wrong terminal: {agents}"
+            );
+        }
+        if generation == 3 {
+            break;
+        }
+        if generation == 0 {
+            // The Claude terminal continues reporting after its layout is closed.
+            assert_ok(request(
+                &api_socket,
+                serde_json::json!({
+                    "id": "detach", "method": "workspace.close",
+                    "params": {"workspace_id": recipients[2].2}
+                }),
+            ));
+        }
+        assert_ok(request(
+            &api_socket,
+            serde_json::json!({
+                "id": "handoff", "method": "server.live_handoff", "params": {}
+            }),
+        ));
+        wait_for_api(&api_socket, Duration::from_secs(10));
+    }
+    // Reserved native sources deliberately ignore generic release requests.
+    // Preserve that guard while checking an ordinary reported identity can
+    // still be released through its inherited id without touching neighbours.
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "native-release", "method": "pane.release_agent",
+            "params": {"pane_id": recipients[0].3, "source": "herdr:cursor", "agent": "cursor"}
         }),
     ));
-    let agents = request(
+    assert_ok(request(
         &api_socket,
-        serde_json::json!({"id":"test:agent-list","method":"agent.list","params":{}}),
+        serde_json::json!({
+            "id": "generic-report", "method": "pane.report_agent",
+            "params": {"pane_id": recipients[3].3, "source": "handoff-test", "agent": "pi", "state": "working", "seq": 1}
+        }),
+    ));
+    let reported = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "reported", "method": "agent.list", "params": {}
+        }),
     );
-    let found = agents["result"]["agents"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|agent| {
-            agent["agent"].as_str() == Some("pi")
-                && agent["agent_status"].as_str() == Some("working")
-        });
     assert!(
-        found,
-        "old pane id report did not update restored pane: {agents}"
+        reported["result"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["terminal_id"] == recipients[3].1 && row["agent"] == "pi"),
+        "generic report missed its terminal: {reported}"
     );
-
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "generic-release", "method": "pane.release_agent",
+            "params": {"pane_id": recipients[3].3, "source": "handoff-test", "agent": "pi", "seq": 2}
+        }),
+    ));
+    let released = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "after-release", "method": "agent.list", "params": {}
+        }),
+    );
+    let rows = released["result"]["agents"].as_array().unwrap();
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row["terminal_id"] == recipients[3].1 && row["agent"] == "pi"),
+        "generic release retained the wrong identity: {released}"
+    );
+    for (index, kind) in ["cursor", "codex"].iter().enumerate() {
+        assert!(
+            rows.iter()
+                .any(|row| row["terminal_id"] == recipients[index].1
+                    && row["agent_session"]["value"] == format!("{kind}-generation-3")),
+            "release touched a native binding: {released}"
+        );
+    }
+    drop(spawned);
     let _ = request(
         &api_socket,
-        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+        serde_json::json!({
+            "id": "stop", "method": "server.stop", "params": {}
+        }),
     );
-    cleanup_test_base(&base);
+    // Retain the PTY and native-hook evidence for diagnosis; no test files
+    // need to be removed for this regression.
+    support::unregister_runtime_dir(&runtime_dir);
 }
 
 #[test]

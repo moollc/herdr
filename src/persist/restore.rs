@@ -115,6 +115,24 @@ pub fn restore_handoff(
     render_notify: Arc<Notify>,
     render_dirty: Arc<AtomicBool>,
 ) -> std::io::Result<RestoredSession> {
+    // Processes retain HERDR_PANE_ID across every handoff. Never let a new
+    // pane allocation shadow any of those ids, including set-down agents.
+    let max_raw = snapshot
+        .handoff_pane_terminals
+        .keys()
+        .copied()
+        .chain(
+            snapshot
+                .workspaces
+                .iter()
+                .flat_map(|ws| &ws.tabs)
+                .flat_map(|tab| tab.panes.keys().copied()),
+        )
+        .chain(snapshot.detached_agents.iter().map(|agent| agent.pane_id))
+        .max();
+    if let Some(raw) = max_raw {
+        PaneId::reserve_through(raw)?;
+    }
     restore_with_imports_strict(
         snapshot,
         None,
@@ -134,38 +152,44 @@ pub fn restore_handoff(
 pub fn handoff_pane_aliases(
     snapshot: &SessionSnapshot,
     workspaces: &[Workspace],
+    detached_agents: &[crate::app::state::DetachedAgent],
 ) -> HashMap<u32, PaneId> {
-    let mut aliases = HashMap::new();
-    for (ws_snap, workspace) in snapshot.workspaces.iter().zip(workspaces) {
-        for (tab_snap, tab) in ws_snap.tabs.iter().zip(&workspace.tabs) {
-            let old_ids = collect_snapshot_pane_ids(&tab_snap.layout);
-            let new_ids = tab.layout.pane_ids();
-            for (old_id, new_id) in old_ids.into_iter().zip(new_ids) {
-                if old_id != new_id.raw() {
-                    aliases.insert(old_id, new_id);
+    let mut by_terminal = HashMap::new();
+    for workspace in workspaces {
+        for tab in &workspace.tabs {
+            for pane in tab.layout.pane_ids() {
+                if let Some(terminal) = tab.terminal_id(pane) {
+                    by_terminal.insert(terminal.clone(), pane);
                 }
             }
         }
     }
-    aliases
-}
-
-#[cfg(unix)]
-fn collect_snapshot_pane_ids(node: &LayoutSnapshot) -> Vec<u32> {
-    let mut ids = Vec::new();
-    collect_snapshot_ids_inner(node, &mut ids);
-    ids
-}
-
-#[cfg(unix)]
-fn collect_snapshot_ids_inner(node: &LayoutSnapshot, ids: &mut Vec<u32>) {
-    match node {
-        LayoutSnapshot::Pane(id) => ids.push(*id),
-        LayoutSnapshot::Split { first, second, .. } => {
-            collect_snapshot_ids_inner(first, ids);
-            collect_snapshot_ids_inner(second, ids);
+    for detached in detached_agents {
+        by_terminal.insert(detached.pane.attached_terminal_id.clone(), detached.pane_id);
+    }
+    let mut bindings = snapshot.handoff_pane_terminals.clone();
+    // Backward compatibility for the first handoff from an older binary.
+    // Match terminals, never zip layout positions (which can change on restore).
+    for ws in &snapshot.workspaces {
+        for tab in &ws.tabs {
+            for (raw, pane) in &tab.panes {
+                if let Some(terminal) = &pane.terminal_id {
+                    bindings.entry(*raw).or_insert_with(|| terminal.clone());
+                }
+            }
         }
     }
+    for detached in &snapshot.detached_agents {
+        if let Some(terminal) = &detached.pane.terminal_id {
+            bindings
+                .entry(detached.pane_id)
+                .or_insert_with(|| terminal.clone());
+        }
+    }
+    bindings
+        .into_iter()
+        .filter_map(|(raw, terminal)| by_terminal.get(&terminal).copied().map(|pane| (raw, pane)))
+        .collect()
 }
 
 #[cfg(unix)]
