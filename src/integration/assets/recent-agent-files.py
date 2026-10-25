@@ -366,10 +366,12 @@ def _bounded_upsert(journal, record):
         fcntl.flock(lock, fcntl.LOCK_EX)
         old_records = _read_journal(journal)
         history_truncated = any(item.get("truncated") is True for item in old_records)
+        record_path = record.get("path")
         records = [
             {key: value for key, value in item.items() if key != "truncated"}
             for item in old_records
-            if item.get("path") != record.get("path") and item["event_id"] != record["event_id"]
+            if item["event_id"] != record["event_id"]
+            and (not record_path or item.get("path") != record_path)
         ]
         records.append(record)
         records.sort(key=lambda item: (item["time_ns"], item.get("path", "")), reverse=True)
@@ -403,8 +405,18 @@ def _bounded_upsert(journal, record):
             os.fsync(dir_fd)
         finally:
             os.close(dir_fd)
+def _is_tool_event(provider, event):
+    return (provider == "codex" and event in ("PreToolUse", "PostToolUse")) or (
+        provider == "cursor" and event in ("preToolUse", "postToolUse", "postToolUseFailure")
+    )
+
+
 def capture(provider, event, payload, state_dir, *, now_ns=None):
-    if provider not in ("codex", "cursor") or not isinstance(payload, dict):
+    if provider not in ("codex", "cursor"):
+        return 0
+    if not isinstance(payload, dict):
+        if _is_tool_event(provider, event):
+            _mark_gap(provider, event, "unparseable-or-non-object-input", state_dir, now_ns)
         return 0
     paths, tool, candidate = _candidate_paths(provider, event, payload)
     timestamp = int(now_ns if now_ns is not None else time.time_ns())
@@ -494,10 +506,14 @@ def main():
     event = sys.argv[2] if len(sys.argv) > 2 else ""
     raw = sys.stdin.buffer.read(MAX_INPUT + 1)
     if len(raw) > MAX_INPUT:
+        if _is_tool_event(provider, event):
+            _mark_gap(provider, event, "oversize-input", os.environ["HERDR_STATE_DIR"])
         return
     try:
         payload = json.loads(raw) if raw.strip() else {}
     except (ValueError, TypeError):
+        if _is_tool_event(provider, event):
+            _mark_gap(provider, event, "malformed-input", os.environ["HERDR_STATE_DIR"])
         return
     capture(provider, event, payload, os.environ["HERDR_STATE_DIR"])
 

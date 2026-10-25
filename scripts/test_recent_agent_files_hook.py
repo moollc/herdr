@@ -210,6 +210,50 @@ class RecentAgentFilesHookTests(unittest.TestCase):
         self.run_hook("cursor", "afterFileEdit", {"file_path": str(journal), "generation_id": "self"})
         self.assertEqual(len(self.records()), hook.MAX_RECORDS)
 
+    def test_oversize_pre_and_post_payloads_each_record_a_pathless_gap(self):
+        for provider, events in (("codex", ("PreToolUse", "PostToolUse")),
+                                 ("cursor", ("preToolUse", "postToolUse"))):
+            for event in events:
+                with self.subTest(provider=provider, event=event):
+                    result = subprocess.run(
+                        [sys.executable, str(ASSET), provider, event],
+                        input="{" + " " * hook.MAX_INPUT + "}", text=True, capture_output=True,
+                        env=dict(os.environ, HERDR_ENV="1", HERDR_PANE_ID="fixture-pane",
+                                 HERDR_STATE_DIR=str(self.state)), check=True,
+                    )
+                    self.assertEqual(result.returncode, 0)
+        rows = self.records()
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row.get("gap") and "path" not in row for row in rows))
+        self.assertEqual(len({row["event_id"] for row in rows}), 4)
+
+    def test_malformed_pre_and_post_payloads_each_record_a_pathless_gap(self):
+        for provider, events in (("codex", ("PreToolUse", "PostToolUse")),
+                                 ("cursor", ("preToolUse", "postToolUse"))):
+            for event in events:
+                with self.subTest(provider=provider, event=event):
+                    result = subprocess.run(
+                        [sys.executable, str(ASSET), provider, event], input="{broken", text=True,
+                        capture_output=True,
+                        env=dict(os.environ, HERDR_ENV="1", HERDR_PANE_ID="fixture-pane",
+                                 HERDR_STATE_DIR=str(self.state)), check=True,
+                    )
+                    self.assertEqual(result.returncode, 0)
+        rows = self.records()
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row.get("gap") and "path" not in row for row in rows))
+        self.assertEqual(len({row["event_id"] for row in rows}), 4)
+
+    def test_distinct_unmatched_events_keep_distinct_gap_records(self):
+        for tool_id in ("unmatched-one", "unmatched-two"):
+            payload = {"tool_name": "apply_patch", "tool_use_id": tool_id,
+                       "cwd": str(self.cwd), "tool_input": {"command": "*** Begin Patch\n*** End Patch"}}
+            self.run_hook("codex", "PostToolUse", payload)
+        rows = self.records()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row.get("gap") and "path" not in row for row in rows))
+        self.assertEqual(len({row["event_id"] for row in rows}), 2)
+
     def test_pending_events_are_bounded_and_eviction_is_reported_as_gap(self):
         for index in range(hook.MAX_PENDING_EVENTS + 5):
             path = self.cwd / f"pending-{index}.txt"
