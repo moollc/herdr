@@ -58,7 +58,6 @@ pub(crate) enum SettingsAction {
     SaveAllowance(
         crate::usage::Provider,
         crate::allowance_guard::ProviderLimits,
-        Vec<(String, bool)>,
     ),
     SaveTheme(String),
     SaveSound(bool),
@@ -154,9 +153,7 @@ impl App {
         let previous_section = self.state.settings.section;
         if let Some(action) = update_settings_state(&mut self.state, key) {
             match action {
-                SettingsAction::SaveAllowance(p, policy, benches) => {
-                    self.save_allowance(p, policy, benches)
-                }
+                SettingsAction::SaveAllowance(p, policy) => self.save_allowance(p, policy),
                 SettingsAction::SaveTheme(name) => self.save_theme(&name),
                 SettingsAction::SaveSound(enabled) => self.save_sound(enabled),
                 SettingsAction::SaveDoneSound(choice) => self.save_done_sound(&choice),

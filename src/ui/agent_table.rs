@@ -2373,6 +2373,7 @@ mod tests {
             reset: false,
         };
         let usage = |provider, windows| ProviderUsage {
+            extra_spend: None,
             provider,
             windows,
             seen_at: Some(USAGE_NOW),
@@ -2561,6 +2562,7 @@ mod tests {
             for usage in &mut snapshot.providers {
                 if usage.provider == Provider::Cursor {
                     *usage = ProviderUsage {
+                        extra_spend: None,
                         problem: Some(UsageProblem::LoginExpired),
                         ..usage.clone()
                     };

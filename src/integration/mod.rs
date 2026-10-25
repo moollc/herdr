@@ -3724,7 +3724,7 @@ mod tests {
 
         assert_eq!(codex.path, hook_path);
         assert_eq!(codex.installed_version, Some(2));
-        assert_eq!(codex.expected_version, 7);
+        assert_eq!(codex.expected_version, CODEX_INTEGRATION_VERSION);
         assert_eq!(codex.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");

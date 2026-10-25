@@ -110,16 +110,56 @@ pub struct WindowLimits {
     pub overseer_pct: u8,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpendLimits {
+    pub enabled: bool,
+    #[serde(flatten)]
+    pub limits: WindowLimits,
+}
+impl Default for SpendLimits {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            limits: WindowLimits {
+                wind_down_pct: 15,
+                overseer_pct: 8,
+                stop_pct: 3,
+            },
+        }
+    }
+}
+impl SpendLimits {
+    fn window(&self, usage: &ProviderUsage) -> Option<crate::usage::UsageWindow> {
+        if !self.enabled {
+            return None;
+        }
+        let current = usage.extra_spend.as_ref()?;
+        Some(crate::usage::UsageWindow {
+            kind: WindowKind::ExtraSpend,
+            left_pct: current.left_pct(),
+            resets_at: Some(current.cycle_end),
+            note: Some("bonus + on-demand, percent left of reported total".into()),
+            reset: false,
+        })
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderLimits {
     pub enabled: bool,
     pub short: WindowLimits,
     pub long: WindowLimits,
     pub fast_drop_points: u8,
     pub fast_window_minutes: u64,
+    #[serde(default)]
+    pub extra_spend: SpendLimits,
 }
 impl ProviderLimits {
     pub fn validate(&self) -> Result<(), &'static str> {
-        for w in [&self.short, &self.long] {
+        let mut windows = vec![&self.short, &self.long];
+        if self.extra_spend.enabled {
+            windows.push(&self.extra_spend.limits);
+        }
+        for w in windows {
             if w.wind_down_pct > 100 || w.stop_pct >= w.wind_down_pct {
                 return Err("Stop at must be below Wind-down at (0–100).");
             }
@@ -140,6 +180,7 @@ impl ProviderLimits {
     }
     pub fn window(&self, kind: WindowKind) -> &WindowLimits {
         match kind {
+            WindowKind::ExtraSpend => &self.extra_spend.limits,
             WindowKind::Weekly | WindowKind::Monthly | WindowKind::Named => &self.long,
             _ => &self.short,
         }
@@ -176,6 +217,7 @@ impl GuardConfig {
             long,
             fast_drop_points: self.fast_drop_points,
             fast_window_minutes: self.fast_window_minutes,
+            extra_spend: SpendLimits::default(),
         };
         self.providers
             .get(&provider)
@@ -292,8 +334,13 @@ impl Guard {
             self.window_history.retain(|(p, _), _| *p != provider);
             return Vec::new();
         }
+        let spend_window = policy.extra_spend.window(usage).filter(|_| {
+            usage
+                .seen_at
+                .is_some_and(|seen| seen <= now && now - seen <= MAX_READING_AGE_SECS)
+        });
         let mut readings = Vec::new();
-        for w in &usage.windows {
+        for w in usage.windows.iter().chain(spend_window.iter()) {
             let Some(pct) = window_reading(usage, w, now, working) else {
                 continue;
             };
@@ -312,13 +359,13 @@ impl Guard {
             {
                 h.pop_front();
             }
-            let fast = h
-                .iter()
-                .map(|(_, p)| *p)
-                .max()
-                .unwrap_or(pct)
-                .saturating_sub(pct)
-                >= policy.fast_drop_points;
+            let fast = w.kind != WindowKind::ExtraSpend
+                && h.iter()
+                    .map(|(_, p)| *p)
+                    .max()
+                    .unwrap_or(pct)
+                    .saturating_sub(pct)
+                    >= policy.fast_drop_points;
             readings.push((w, pct, fast));
         }
         let mut events = Vec::new();
@@ -353,12 +400,15 @@ impl Guard {
                     } || (!overseer && *fast)
                 })
                 .min_by_key(|(w, pct, _)| {
-                    i16::from(*pct)
-                        - i16::from(if overseer {
-                            policy.window(w.kind).overseer_pct
-                        } else {
-                            policy.window(w.kind).wind_down_pct
-                        })
+                    (
+                        *pct > policy.window(w.kind).stop_pct,
+                        i16::from(*pct)
+                            - i16::from(if overseer {
+                                policy.window(w.kind).overseer_pct
+                            } else {
+                                policy.window(w.kind).wind_down_pct
+                            }),
+                    )
                 });
             if let Some((w, pct, fast)) = trigger {
                 let fresh = !phases.contains_key(&provider);
@@ -387,6 +437,11 @@ impl Guard {
         }
         events
     }
+    pub fn reset_provider(&mut self, provider: Provider) {
+        self.phases.remove(&provider);
+        self.reserves.remove(&provider);
+        self.window_history.retain(|(p, _), _| *p != provider);
+    }
     pub fn policy_kind(&self, provider: Provider) -> WindowKind {
         self.phases
             .get(&provider)
@@ -410,8 +465,18 @@ impl Guard {
             self.phases.get(&provider)
         }?;
         let kind = phase.kind?;
-        let window = usage.windows.iter().find(|w| w.kind == kind)?;
+        let policy = self.config.effective(provider);
         let (now, working) = context;
+        let spend_window = policy.extra_spend.window(usage).filter(|_| {
+            usage
+                .seen_at
+                .is_some_and(|seen| seen <= now && now - seen <= MAX_READING_AGE_SECS)
+        });
+        let window = usage
+            .windows
+            .iter()
+            .chain(spend_window.iter())
+            .find(|w| w.kind == kind)?;
         let pct = window_reading(usage, window, now, working)?;
         if window.resets_at.is_some_and(|at| at <= now) {
             return None;
@@ -596,13 +661,6 @@ pub fn reading(usage: &ProviderUsage, now: u64, provider_working: bool) -> Optio
         .min()
 }
 
-/// The bench file lives beside the dispatcher's single queue file.
-pub fn benched_path() -> std::path::PathBuf {
-    std::env::var_os("TEAM_BENCHED")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| crate::overseer::team_queue_path().with_file_name("BENCHED"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,6 +677,7 @@ mod tests {
         windows: &[(WindowKind, Option<u8>, Option<u64>)],
     ) -> ProviderUsage {
         ProviderUsage {
+            extra_spend: None,
             provider,
             windows: windows
                 .iter()
@@ -915,6 +974,7 @@ mod policy_tests {
     use crate::usage::UsageWindow;
     fn usage(short: u8, long: u8, now: u64) -> ProviderUsage {
         ProviderUsage {
+            extra_spend: None,
             provider: Provider::Codex,
             seen_at: Some(now),
             source: "fixture".into(),
@@ -1025,5 +1085,115 @@ mod policy_tests {
         u.seen_at = Some(301);
         g.observe_usage(&u, 301, true);
         assert!(g.active(Provider::Codex));
+    }
+}
+
+#[cfg(test)]
+mod extra_spend_tests {
+    use super::*;
+    use crate::usage::CursorSpend;
+    fn sample(bonus: u64, demand: u64, at: u64) -> ProviderUsage {
+        ProviderUsage {
+            provider: Provider::Cursor,
+            windows: vec![],
+            seen_at: Some(at),
+            source: "fixture".into(),
+            problem: None,
+            extra_spend: Some(CursorSpend {
+                bonus_units: bonus,
+                on_demand_units: demand,
+                total_units: 10000,
+                cycle_end: 10000,
+            }),
+        }
+    }
+    #[test]
+    fn allowance_extra_spend_exact_thresholds_roles_reset_and_stale() {
+        let mut g = Guard::default();
+        g.config.cursor = true;
+        let mut policy = g.config.effective(Provider::Cursor);
+        policy.extra_spend.enabled = true;
+        assert!(policy.validate().is_ok());
+        g.config.providers.insert(Provider::Cursor, policy.clone());
+        let pane = TerminalId::alloc();
+        assert!(g.observe_usage(&sample(8400, 0, 101), 101, true).is_empty());
+        let wind = sample(8500, 0, 102);
+        assert!(matches!(
+            g.observe_usage(&wind, 102, true).first(),
+            Some(Event::WindDown { .. })
+        ));
+        assert!(
+            g.pane_action(Provider::Cursor, false, &pane, &wind, (102, true))
+                .unwrap()
+                .3
+        );
+        assert!(g
+            .pane_action(Provider::Cursor, true, &pane, &wind, (102, true))
+            .is_none());
+        let reserve = sample(8500, 700, 103);
+        g.observe_usage(&reserve, 103, true);
+        assert!(
+            g.pane_action(Provider::Cursor, true, &pane, &reserve, (103, true))
+                .unwrap()
+                .3
+        );
+        let stop = sample(8500, 1200, 104);
+        assert!(matches!(
+            g.observe_usage(&stop, 104, true).last(),
+            Some(Event::Stop { .. })
+        ));
+        for role in [false, true] {
+            assert!(
+                g.pane_action(Provider::Cursor, role, &pane, &stop, (104, true))
+                    .unwrap()
+                    .4
+            );
+            g.mark_policy_action(Provider::Cursor, role, &pane, true);
+            assert!(
+                !g.pane_action(Provider::Cursor, role, &pane, &stop, (104, true))
+                    .unwrap()
+                    .4
+            );
+        }
+        assert!(g
+            .pane_action(Provider::Cursor, false, &pane, &stop, (1005, true))
+            .is_none());
+        g.reset_provider(Provider::Cursor);
+        let mut rollover = sample(0, 0, 105);
+        rollover.extra_spend.as_mut().unwrap().cycle_end += 10000;
+        assert!(g.observe_usage(&rollover, 105, true).is_empty());
+        assert!(!g.active(Provider::Cursor));
+        let encoded = toml::to_string(&policy).unwrap();
+        assert_eq!(toml::from_str::<ProviderLimits>(&encoded).unwrap(), policy);
+        let mut missing = stop.clone();
+        missing.extra_spend = None;
+        assert!(policy.extra_spend.window(&missing).is_none());
+        let mut invalid = policy.clone();
+        invalid.extra_spend.limits.stop_pct = 16;
+        assert!(invalid.validate().is_err());
+        assert_eq!(
+            policy.extra_spend.window(&rollover).unwrap().left_pct,
+            Some(100)
+        );
+    }
+    #[test]
+    fn allowance_extra_spend_never_masks_a_pool_stop() {
+        let mut g = Guard::default();
+        g.config.cursor = true;
+        let mut p = g.config.effective(Provider::Cursor);
+        p.extra_spend.enabled = true;
+        g.config.providers.insert(Provider::Cursor, p);
+        let mut u = sample(500, 0, 101);
+        u.windows.push(crate::usage::UsageWindow {
+            kind: WindowKind::Named,
+            left_pct: Some(0),
+            resets_at: Some(10000),
+            note: None,
+            reset: false,
+        });
+        assert!(g
+            .observe_usage(&u, 101, true)
+            .iter()
+            .any(|e| matches!(e, Event::Stop { .. })));
     }
 }

@@ -2247,6 +2247,7 @@ mod tests {
             version: 1,
             taken_at: 1_000_000,
             providers: vec![ProviderUsage {
+                extra_spend: None,
                 provider: Provider::Claude,
                 windows: vec![
                     UsageWindow {

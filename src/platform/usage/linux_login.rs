@@ -299,7 +299,19 @@ mod tests {
         assert!(file_read(&root3).is_err());
         assert!(file_store(&root3, "token=wrong").is_err());
         drop(locked);
-        file_clear(&root3).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        loop {
+            match file_clear(&root3) {
+                Ok(()) => break,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("clearing released credential lock: {error}"),
+            }
+        }
         assert!(file_read(&root3).is_err());
         let root4 = base.join("public");
         std::fs::create_dir(&root4).unwrap();

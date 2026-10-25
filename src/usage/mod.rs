@@ -56,6 +56,8 @@ pub enum WindowKind {
     Auto,
     /// Cursor's named-model pool (Grok, Claude, GPT and others picked by name).
     Named,
+    /// Guard-only dollar budget, never a provider percentage pool.
+    ExtraSpend,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,9 +79,30 @@ pub struct UsageWindow {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reset: bool,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorSpend {
+    pub bonus_units: u64,
+    pub on_demand_units: u64,
+    pub total_units: u64,
+    pub cycle_end: u64,
+}
+impl CursorSpend {
+    pub fn left_pct(&self) -> Option<u8> {
+        if self.total_units == 0 {
+            return None;
+        }
+        let extra = self.bonus_units.saturating_add(self.on_demand_units);
+        Some(
+            (u128::from(self.total_units.saturating_sub(extra)) * 100
+                / u128::from(self.total_units)) as u8,
+        )
+    }
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderUsage {
     pub provider: Provider,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_spend: Option<CursorSpend>,
     pub windows: Vec<UsageWindow>,
     pub seen_at: Option<u64>,
     pub source: String,
@@ -682,6 +705,7 @@ pub(super) fn unknown(provider: Provider, problem: UsageProblem) -> ProviderUsag
         &[WindowKind::FiveHour, WindowKind::Weekly]
     };
     ProviderUsage {
+        extra_spend: None,
         provider,
         windows: kinds
             .iter()

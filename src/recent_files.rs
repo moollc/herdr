@@ -147,10 +147,12 @@ impl RecentFilesWatcher {
     }
 }
 
+#[cfg(test)]
 fn read_journal(journal: &Path) -> Result<(Vec<RecentFile>, bool, Option<String>), String> {
     read_journal_at(journal, SystemTime::now())
 }
 
+#[cfg(test)]
 fn read_journal_at(
     journal: &Path,
     wall_now: SystemTime,
@@ -159,10 +161,12 @@ fn read_journal_at(
     Ok((files, truncated, error))
 }
 
+type JournalReadDetails = (Vec<RecentFile>, bool, Option<String>, Option<SystemTime>);
+
 fn read_journal_details(
     journal: &Path,
     wall_now: SystemTime,
-) -> Result<(Vec<RecentFile>, bool, Option<String>, Option<SystemTime>), String> {
+) -> Result<JournalReadDetails, String> {
     let bytes = match fs::read(journal) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

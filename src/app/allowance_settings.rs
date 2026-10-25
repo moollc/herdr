@@ -10,12 +10,12 @@ pub(crate) struct AllowanceSettings {
     pub draft: ProviderLimits,
     pub selected: usize,
     pub digits: String,
-    pub benches: Vec<(String, bool)>,
+    pub spend_reading: Option<crate::usage::CursorSpend>,
     pub error: String,
 }
 impl AllowanceSettings {
-    fn values(&self) -> [u64; 8] {
-        [
+    fn values(&self) -> Vec<u64> {
+        let mut values = vec![
             self.draft.short.wind_down_pct.into(),
             self.draft.short.stop_pct.into(),
             self.draft.short.overseer_pct.into(),
@@ -24,7 +24,16 @@ impl AllowanceSettings {
             self.draft.long.overseer_pct.into(),
             self.draft.fast_drop_points.into(),
             self.draft.fast_window_minutes,
-        ]
+        ];
+        if self.provider == Provider::Cursor {
+            values.extend([
+                0,
+                self.draft.extra_spend.limits.wind_down_pct.into(),
+                self.draft.extra_spend.limits.overseer_pct.into(),
+                self.draft.extra_spend.limits.stop_pct.into(),
+            ]);
+        }
+        values
     }
     fn set(&mut self, value: u64) {
         let pct = value.min(100) as u8;
@@ -37,8 +46,15 @@ impl AllowanceSettings {
             6 => self.draft.long.overseer_pct = pct,
             7 => self.draft.fast_drop_points = pct,
             8 => self.draft.fast_window_minutes = value.min(1440),
+            10 => self.draft.extra_spend.limits.wind_down_pct = pct,
+            11 => self.draft.extra_spend.limits.overseer_pct = pct,
+            12 => self.draft.extra_spend.limits.stop_pct = pct,
             _ => {}
         }
+    }
+    fn numeric(&self) -> bool {
+        (1..=8).contains(&self.selected)
+            || (self.provider == Provider::Cursor && (10..=12).contains(&self.selected))
     }
     fn rows(&self) -> Vec<String> {
         let short = if self.provider == Provider::Cursor {
@@ -74,23 +90,30 @@ impl AllowanceSettings {
                 self.draft.fast_window_minutes
             ),
         ];
-        rows.extend(
-            self.benches
-                .iter()
-                .map(|(n, b)| format!("[{}] {n} may work", if *b { " " } else { "x" })),
-        );
+        if self.provider == Provider::Cursor {
+            let cap = &self.draft.extra_spend;
+            rows.extend([
+                format!(
+                    "Extra spend cap: {}",
+                    if cap.enabled { "on" } else { "off" }
+                ),
+                format!("Extra spend · Wind-down at: {}%", cap.limits.wind_down_pct),
+                format!("Extra spend · Overseer until: {}%", cap.limits.overseer_pct),
+                format!("Extra spend · Stop at: {}%", cap.limits.stop_pct),
+                match self.spend_reading.as_ref().and_then(|r| r.left_pct()) {
+                    Some(left) => format!("Extra spend: {left}% left of total (bonus + on-demand)"),
+                    None => "Extra spend: unknown; refresh usage".into(),
+                },
+            ]);
+        }
         rows
     }
     fn toggle(&mut self) {
         if self.selected == 0 {
             self.draft.enabled = !self.draft.enabled;
         }
-        if let Some((_, b)) = self
-            .selected
-            .checked_sub(9)
-            .and_then(|i| self.benches.get_mut(i))
-        {
-            *b = !*b;
+        if self.provider == Provider::Cursor && self.selected == 9 {
+            self.draft.extra_spend.enabled = !self.draft.extra_spend.enabled;
         }
     }
 }
@@ -99,35 +122,26 @@ fn popup(area: Rect) -> Option<Rect> {
 }
 impl AppState {
     pub(crate) fn open_allowance_settings(&mut self, provider: Provider) {
-        #[cfg(not(test))]
-        let benched =
-            std::fs::read_to_string(crate::allowance_guard::benched_path()).unwrap_or_default();
-        #[cfg(test)]
-        let benched = String::new();
-        let mut names: Vec<_> = self
-            .terminals
-            .iter()
-            .filter(|(_, t)| {
-                t.effective_known_agent()
-                    .and_then(crate::ui::usage_bar::provider_for_agent)
-                    == Some(provider)
-            })
-            .filter_map(|(id, _)| crate::pane_names::effective_name(&self.terminals, id))
-            .collect();
-        names.sort();
-        names.dedup();
+        let spend_reading = self.usage_snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .providers
+                .iter()
+                .find(|u| u.provider == provider)
+                .filter(|u| {
+                    u.problem.is_none()
+                        && u.seen_at.is_some_and(|at| {
+                            let now = crate::usage::now();
+                            at <= now && now - at <= crate::allowance_guard::MAX_READING_AGE_SECS
+                        })
+                })
+                .and_then(|u| u.extra_spend.clone())
+        });
         self.allowance_settings = Some(AllowanceSettings {
             provider,
             draft: self.allowance_guard.config.effective(provider),
             selected: 0,
             digits: String::new(),
-            benches: names
-                .into_iter()
-                .map(|n| {
-                    let b = benched.lines().any(|l| l.trim() == n);
-                    (n, b)
-                })
-                .collect(),
+            spend_reading,
             error: String::new(),
         });
         self.mode = Mode::Settings;
@@ -138,11 +152,7 @@ impl AppState {
             panel.error = error.into();
             return None;
         }
-        let action = SettingsAction::SaveAllowance(
-            panel.provider,
-            panel.draft.clone(),
-            panel.benches.clone(),
-        );
+        let action = SettingsAction::SaveAllowance(panel.provider, panel.draft.clone());
         self.allowance_settings = None;
         self.mode = Mode::Terminal;
         Some(action)
@@ -163,8 +173,8 @@ impl AppState {
                 panel.selected = (panel.selected + 1).min(panel.rows().len() - 1);
                 panel.digits.clear();
             }
-            KeyCode::Char(c) if c.is_ascii_digit() && (1..=8).contains(&panel.selected) => {
-                if panel.digits.len() < 4 {
+            KeyCode::Char(c) if c.is_ascii_digit() && panel.numeric() => {
+                if panel.digits.len() < 9 {
                     panel.digits.push(c);
                     if let Ok(v) = panel.digits.parse() {
                         panel.set(v);
@@ -175,11 +185,11 @@ impl AppState {
                 panel.digits.pop();
                 panel.set(panel.digits.parse().unwrap_or(0));
             }
-            KeyCode::Right | KeyCode::Char('+') if (1..=8).contains(&panel.selected) => {
+            KeyCode::Right | KeyCode::Char('+') if panel.numeric() => {
                 panel.set(panel.values()[panel.selected - 1] + 1);
                 panel.digits.clear();
             }
-            KeyCode::Left | KeyCode::Char('-') if (1..=8).contains(&panel.selected) => {
+            KeyCode::Left | KeyCode::Char('-') if panel.numeric() => {
                 panel.set(panel.values()[panel.selected - 1].saturating_sub(1));
                 panel.digits.clear();
             }
@@ -243,7 +253,7 @@ pub(crate) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
     frame.render_widget(
-        Paragraph::new(" Select a number, type or use ←/→. Click switches.")
+        Paragraph::new(" Type percentages left, or use ←/→. Click switches.")
             .style(Style::default().fg(p.overlay0)),
         Rect::new(inner.x, inner.y + 1, inner.width, 1),
     );
@@ -275,12 +285,7 @@ pub(crate) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
     );
 }
 impl App {
-    pub(crate) fn save_allowance(
-        &mut self,
-        provider: Provider,
-        policy: ProviderLimits,
-        benches: Vec<(String, bool)>,
-    ) {
+    pub(crate) fn save_allowance(&mut self, provider: Provider, policy: ProviderLimits) {
         if let Err(error) = policy.validate() {
             self.state.config_diagnostic = Some(error.into());
             return;
@@ -297,38 +302,6 @@ impl App {
             Provider::Codex => "codex",
             Provider::Cursor => "cursor",
         };
-        // Read the current BENCHED file at save time, preserving panes outside this panel.
-        let path = crate::allowance_guard::benched_path();
-        let original = match std::fs::read_to_string(&path) {
-            Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => {
-                self.state.config_diagnostic = Some(format!("Could not read pane switches: {e}"));
-                return;
-            }
-        };
-        let mut lines: Vec<String> = original.lines().map(str::to_owned).collect();
-        for (name, benched) in benches {
-            lines.retain(|l| l.trim() != name);
-            if benched {
-                lines.push(name);
-            }
-        }
-        let updated = if lines.is_empty() {
-            String::new()
-        } else {
-            lines.join("\n") + "\n"
-        };
-        if updated != original {
-            let tmp = path.with_extension("allowance-settings.tmp");
-            if let Err(error) =
-                std::fs::write(&tmp, &updated).and_then(|()| std::fs::rename(&tmp, &path))
-            {
-                self.state.config_diagnostic =
-                    Some(format!("Could not save pane switches: {error}"));
-                return;
-            }
-        }
         if self.update_config_file("allowance settings", |content| {
             let mut out = crate::config::upsert_section_bool(
                 content,
@@ -354,11 +327,20 @@ impl App {
                     );
                 }
             }
+            if provider == Provider::Cursor {
+                out = crate::config::upsert_section_value(
+                    &out,
+                    &format!("allowance_guard.providers.{name}"),
+                    "extra_spend",
+                    &toml::Value::try_from(&policy.extra_spend)
+                        .map(|v| v.to_string())
+                        .unwrap_or_default(),
+                );
+            }
             out
         }) {
+            self.state.allowance_guard.reset_provider(provider);
             self.apply_config_from_disk(false);
-        } else if updated != original {
-            let _ = std::fs::write(&path, original);
         }
     }
 }
@@ -412,7 +394,7 @@ mod tests {
                 .short
                 .stop_pct = 3;
             assert!(
-                matches!(app.allowance_key(KeyEvent::from(KeyCode::Char('s'))),Some(SettingsAction::SaveAllowance(p,_,_)) if p==provider)
+                matches!(app.allowance_key(KeyEvent::from(KeyCode::Char('s'))),Some(SettingsAction::SaveAllowance(p,_)) if p==provider)
             );
             assert_eq!(app.mode, Mode::Terminal);
         }
@@ -421,7 +403,6 @@ mod tests {
     fn panel_mouse_toggle_save_cancel_and_visible_values() {
         let mut app = AppState::test_new();
         app.open_allowance_settings(Provider::Codex);
-        app.allowance_settings.as_mut().unwrap().benches = vec![("birch".into(), false)];
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
         terminal.draw(|f| render(&app, f, f.area())).unwrap();
@@ -435,10 +416,8 @@ mod tests {
         assert!(text.contains("GPT allowance settings"));
         assert!(text.contains("Overseer keeps going until"));
         assert!(text.contains("Wind-down at: 5%"));
-        assert!(text.contains("birch may work"));
-        app.allowance_settings.as_mut().unwrap().selected = 9;
-        app.allowance_key(KeyEvent::from(KeyCode::Enter));
-        assert!(app.allowance_settings.as_ref().unwrap().benches[0].1);
+        assert!(!text.contains("may work"));
+        assert_eq!(app.allowance_settings.as_ref().unwrap().rows().len(), 9);
         app.allowance_key(KeyEvent::from(KeyCode::Esc));
         assert!(app.allowance_settings.is_none());
     }
@@ -447,9 +426,8 @@ mod tests {
         let mut app = AppState::test_new();
         app.view.terminal_area = Rect::new(0, 0, 120, 40);
         app.open_allowance_settings(Provider::Codex);
-        app.allowance_settings.as_mut().unwrap().benches = vec![("birch".into(), false)];
         let rect = popup(app.screen_rect()).unwrap();
-        for idx in 0..10 {
+        for idx in 0..9 {
             let event = MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: rect.x + 2,
@@ -472,17 +450,13 @@ mod tests {
             }
         }
         assert!(!app.allowance_settings.as_ref().unwrap().draft.enabled);
-        assert!(app.allowance_settings.as_ref().unwrap().benches[0].1);
         let action = app.allowance_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: rect.x + 2,
             row: rect.bottom() - 3,
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
-        assert!(matches!(
-            action,
-            Some(SettingsAction::SaveAllowance(_, _, _))
-        ));
+        assert!(matches!(action, Some(SettingsAction::SaveAllowance(_, _))));
         app.open_allowance_settings(Provider::Codex);
         app.allowance_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -490,6 +464,86 @@ mod tests {
             row: rect.bottom() - 3,
             modifiers: crossterm::event::KeyModifiers::NONE,
         });
+        assert!(app.allowance_settings.is_none());
+    }
+}
+
+#[cfg(test)]
+mod spend_panel_tests {
+    use super::*;
+    #[test]
+    fn allowance_settings_cursor_controls_reset_edit_validate_save_and_cancel() {
+        let mut app = AppState::test_new();
+        app.view.terminal_area = Rect::new(0, 0, 120, 40);
+        app.open_allowance_settings(Provider::Cursor);
+        let rect = popup(app.screen_rect()).unwrap();
+        let panel = app.allowance_settings.as_mut().unwrap();
+        panel.spend_reading = Some(crate::usage::CursorSpend {
+            bonus_units: 43354,
+            on_demand_units: 0,
+            total_units: 49500,
+            cycle_end: 10000,
+        });
+        app.allowance_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 2,
+            row: rect.y + 12,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        assert!(
+            app.allowance_settings
+                .as_ref()
+                .unwrap()
+                .draft
+                .extra_spend
+                .enabled
+        );
+        for (idx, digits, expected) in [(10, "20", 20), (11, "10", 10), (12, "5", 5)] {
+            app.allowance_settings.as_mut().unwrap().selected = idx;
+            app.allowance_settings.as_mut().unwrap().digits.clear();
+            for c in digits.chars() {
+                app.allowance_key(KeyEvent::from(KeyCode::Char(c)));
+            }
+            assert_eq!(
+                app.allowance_settings.as_ref().unwrap().values()[idx - 1],
+                expected
+            );
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| render(&app, f, f.area())).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Extra spend · Stop at: 5%"));
+        assert!(!text.contains("may work"));
+        assert!(matches!(
+            app.allowance_key(KeyEvent::from(KeyCode::Char('s'))),
+            Some(SettingsAction::SaveAllowance(Provider::Cursor, _))
+        ));
+        app.open_allowance_settings(Provider::Cursor);
+        app.allowance_settings
+            .as_mut()
+            .unwrap()
+            .draft
+            .extra_spend
+            .enabled = true;
+        app.allowance_settings.as_mut().unwrap().selected = 10;
+        app.allowance_key(KeyEvent::from(KeyCode::Char('2')));
+        assert!(app
+            .allowance_key(KeyEvent::from(KeyCode::Char('s')))
+            .is_none());
+        assert!(app
+            .allowance_settings
+            .as_ref()
+            .unwrap()
+            .error
+            .contains("Stop"));
+        app.allowance_key(KeyEvent::from(KeyCode::Esc));
         assert!(app.allowance_settings.is_none());
     }
 }

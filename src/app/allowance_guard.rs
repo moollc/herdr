@@ -249,6 +249,20 @@ impl App {
                     provider_name(provider),
                 ),
             };
+            let line = if self.state.allowance_guard.policy_kind(provider)
+                == crate::usage::WindowKind::ExtraSpend
+            {
+                format!(
+                    "Herdr allowance guard: extra spend percentage threshold reached; {}: {who}.",
+                    if matches!(event, Event::Stop { .. }) {
+                        "interrupting"
+                    } else {
+                        "wind down"
+                    }
+                )
+            } else {
+                line
+            };
             tracing::info!(%line, "allowance guard");
             self.guard_run.lines.push_back(line);
         }
@@ -333,8 +347,12 @@ impl App {
                     &runtime.recent_ansi(80),
                 );
             if quiet {
-                let text = wind_down_note(provider, pct, fast)
-                    .replace("five hour", crate::ui::usage_bar::window_phrase(kind));
+                let text = if kind == crate::usage::WindowKind::ExtraSpend {
+                    format!("Herdr allowance guard: extra spend has {pct}% left of the reported total (bonus + on-demand). Finish this step, save your work, write a hand-off, then stop. Start nothing new until the allowance recovers.")
+                } else {
+                    wind_down_note(provider, pct, fast)
+                        .replace("five hour", crate::ui::usage_bar::window_phrase(kind))
+                };
                 if super::api_helpers::send_prompt(runtime, &text).is_ok() {
                     self.state
                         .allowance_guard
@@ -458,6 +476,7 @@ mod tests {
             version: 1,
             taken_at: at,
             providers: vec![ProviderUsage {
+                extra_spend: None,
                 provider,
                 windows: vec![UsageWindow {
                     kind: if provider == Provider::Cursor {
@@ -586,6 +605,43 @@ mod tests {
         feed(&mut app, Provider::Cursor, 2, NOW);
         ticks(&mut app, 4);
         assert!(typed(&mut cursor).await.contains('\u{3}'));
+    }
+
+    #[tokio::test]
+    async fn allowance_extra_spend_sends_dollar_note_then_cursor_interrupt_once() {
+        let mut app = new_app();
+        app.state.allowance_guard.config.cursor = true;
+        let mut policy = app.state.allowance_guard.config.effective(Provider::Cursor);
+        policy.extra_spend.enabled = true;
+        app.state
+            .allowance_guard
+            .config
+            .providers
+            .insert(Provider::Cursor, policy);
+        let mut cursor = add(&mut app, "A", "Cu", Agent::Cursor, AgentState::Working);
+        let mut snap = reading(Provider::Cursor, 90, NOW);
+        snap.providers[0].extra_spend = Some(crate::usage::CursorSpend {
+            bonus_units: 8500,
+            on_demand_units: 0,
+            total_units: 10000,
+            cycle_end: NOW + 10000,
+        });
+        app.allowance_guard_readings(&snap, NOW);
+        ticks(&mut app, 4);
+        let note = typed(&mut cursor).await;
+        assert!(note.contains("15% left"), "{note:?}");
+        assert!(!note.contains('\u{3}'));
+        snap.providers[0]
+            .extra_spend
+            .as_mut()
+            .unwrap()
+            .on_demand_units = 1200;
+        app.allowance_guard_readings(&snap, NOW);
+        ticks(&mut app, 4);
+        assert_eq!(typed(&mut cursor).await.matches('\u{3}').count(), 1);
+        app.allowance_guard_readings(&snap, NOW);
+        ticks(&mut app, 4);
+        assert_eq!(typed(&mut cursor).await, "");
     }
 
     #[tokio::test]

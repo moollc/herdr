@@ -1293,6 +1293,7 @@ mod usage_refresh_tests {
             reset: false,
         };
         let usage = |provider, windows, problem| ProviderUsage {
+            extra_spend: None,
             provider,
             windows,
             seen_at: Some(1_000),

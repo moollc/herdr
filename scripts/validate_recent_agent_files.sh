@@ -44,7 +44,7 @@ if [[ "${SPEAK:-1}" != "0" && "$(uname -s)" == "Darwin" ]]; then
     message="Recent agent files validation finished, $result"
     task_home="$HOME"
     if [[ -x "$task_home/.local/bin/announce" ]]; then
-        "$task_home/.local/bin/announce" Sophie "$message" >/dev/null 2>&1 &
+        "$task_home/.local/bin/announce" "${ANNOUNCE_NAME:-builder}" "$message" >/dev/null 2>&1 &
     elif command -v say >/dev/null 2>&1; then
         say "$message" >/dev/null 2>&1 &
     fi

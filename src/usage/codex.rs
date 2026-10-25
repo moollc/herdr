@@ -7,9 +7,10 @@ use std::{
     fs,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    time::SystemTime,
 };
 
-fn files(folder: &Path) -> Vec<PathBuf> {
+fn file_entries(folder: &Path) -> Vec<(SystemTime, PathBuf)> {
     let mut paths: Vec<_> = fs::read_dir(folder)
         .into_iter()
         .flatten()
@@ -27,7 +28,14 @@ fn files(folder: &Path) -> Vec<PathBuf> {
         })
         .collect();
     paths.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    paths.into_iter().take(5).map(|(_, p)| p).collect()
+    paths
+}
+fn files(folder: &Path) -> Vec<PathBuf> {
+    file_entries(folder)
+        .into_iter()
+        .take(5)
+        .map(|(_, path)| path)
+        .collect()
 }
 fn newest_folder(root: &Path, exclude: &Path) -> Option<PathBuf> {
     // Walk calendar directory names only; never scan session file contents here.
@@ -60,6 +68,44 @@ fn newest_folder(root: &Path, exclude: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+fn older_folders(root: &Path, before: &Path) -> Vec<PathBuf> {
+    let Ok(years) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut folders = Vec::new();
+    for year in years.flatten().filter(|e| {
+        e.file_name().to_string_lossy().len() == 4 && e.file_type().is_ok_and(|t| t.is_dir())
+    }) {
+        let Ok(months) = fs::read_dir(year.path()) else {
+            continue;
+        };
+        for month in months
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        {
+            let Ok(days) = fs::read_dir(month.path()) else {
+                continue;
+            };
+            folders.extend(days.flatten().filter_map(|day| {
+                let path = day.path();
+                (path < before && day.file_type().is_ok_and(|t| t.is_dir())).then_some(path)
+            }));
+        }
+    }
+    folders.sort_by_key(|path| std::cmp::Reverse(path.clone()));
+    folders
+}
+fn active_files(root: &Path, today: &Path) -> Vec<PathBuf> {
+    // Active rollouts can keep appending to a file under the day they started.
+    // Inspect metadata across dated folders, then read tails from at most five files.
+    let mut entries = file_entries(today);
+    for folder in older_folders(root, today) {
+        // A file outside a folder's newest five cannot make the global newest five.
+        entries.extend(file_entries(&folder).into_iter().take(5));
+    }
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    entries.into_iter().take(5).map(|(_, path)| path).collect()
 }
 fn tail(path: &Path, size: u64) -> std::io::Result<Vec<u8>> {
     let mut f = fs::File::open(path)?;
@@ -122,6 +168,12 @@ fn candidate(data: &[u8]) -> Option<Reading> {
             {
                 return None;
             }
+            if event.payload.rate_limits.plan_type.as_deref() == Some("openrouter")
+                && event.payload.rate_limits.primary.is_null()
+                && event.payload.rate_limits.secondary.is_null()
+            {
+                return None;
+            }
             let text = event.timestamp.as_str().unwrap_or("");
             let seen = timestamp(text);
             let fraction = text
@@ -165,11 +217,15 @@ fn latest(paths: &[PathBuf]) -> Option<Reading> {
         })
         .max_by_key(|reading| reading.key)
 }
-/// The newest qualifying reading under one Codex home: five newest files of
-/// today, then of the most recent earlier day, tails only.
-fn reading_in(home: &Path, now: u64) -> Option<Reading> {
+/// Read at most five file tails per home. Inactive homes keep the inexpensive
+/// today/previous-day lookup; active homes also consider older rollout folders
+/// because a live conversation can keep appending to its start-day file.
+fn reading_in(home: &Path, now: u64, active: bool) -> Option<Reading> {
     let root = home.join("sessions");
     let today = root.join(local_time(now, c"%Y/%m/%d"));
+    if active {
+        return latest(&active_files(&root, &today));
+    }
     let paths = files(&today);
     // Reserve one of the five file reads for the previous day if today has no
     // qualifying events. When today has data, its fifth newest file participates.
@@ -211,7 +267,7 @@ pub fn read_homes(homes: &[Home], now: u64) -> ProviderUsage {
             continue;
         }
         seen_paths.push(&home.path);
-        if let Some(reading) = reading_in(&home.path, now) {
+        if let Some(reading) = reading_in(&home.path, now, home.active) {
             // The first candidate is the configured home and keeps its say.
             if index == 0 {
                 configured_plan = reading.limits.plan_type.clone();
@@ -246,13 +302,19 @@ pub fn read_homes(homes: &[Home], now: u64) -> ProviderUsage {
 }
 
 pub fn read(home: &Path, now: u64) -> ProviderUsage {
-    build(reading_in(home, now), now)
+    build(reading_in(home, now, false), now)
 }
 
 fn build(best: Option<Reading>, now: u64) -> ProviderUsage {
     let Some(reading) = best else {
         return unknown(Provider::Codex, UsageProblem::NoData);
     };
+    if reading.limits.plan_type.as_deref() == Some("openrouter")
+        && reading.limits.primary.is_null()
+        && reading.limits.secondary.is_null()
+    {
+        return unknown(Provider::Codex, UsageProblem::NoData);
+    }
     let mut result = unknown(Provider::Codex, UsageProblem::FormatChanged);
     let Some(seen) = reading.seen else {
         return result;
@@ -276,25 +338,51 @@ fn build(best: Option<Reading>, now: u64) -> ProviderUsage {
 mod home_tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const NOW: u64 = 1_792_000_000;
 
-    fn write_home(dir: &Path, stamp: &str, plan: Option<&str>, used: u32) {
-        let day = dir.join("sessions").join(local_time(NOW, c"%Y/%m/%d"));
+    fn write_reading(
+        dir: &Path,
+        folder_time: u64,
+        stamp: &str,
+        plan: Option<&str>,
+        primary: serde_json::Value,
+        secondary: serde_json::Value,
+    ) {
+        let day = dir
+            .join("sessions")
+            .join(local_time(folder_time, c"%Y/%m/%d"));
         fs::create_dir_all(&day).unwrap();
-        let plan = plan.map_or(String::new(), |p| format!(r#""plan_type":"{p}","#));
-        let line = format!(
-            r#"{{"timestamp":"{stamp}","type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"limit_id":"codex",{plan}"primary":{{"used_percent":{used}.0,"window_minutes":300,"resets_at":{r}}},"secondary":{{"used_percent":1.0,"window_minutes":10080,"resets_at":{r2}}}}}}}}}"#,
-            r = NOW + 3600,
-            r2 = NOW + 86_400
+        let line = serde_json::json!({
+            "timestamp": stamp,
+            "type": "event_msg",
+            "payload": {"type": "token_count", "rate_limits": {
+                "limit_id": "codex", "plan_type": plan,
+                "primary": primary, "secondary": secondary
+            }}
+        });
+        fs::write(day.join("rollout-a.jsonl"), format!("{line}\n")).unwrap();
+    }
+
+    fn write_home(dir: &Path, stamp: &str, plan: Option<&str>, used: u32) {
+        write_reading(
+            dir,
+            NOW,
+            stamp,
+            plan,
+            serde_json::json!({"used_percent": used, "resets_at": NOW + 3600}),
+            serde_json::json!({"used_percent": 1, "resets_at": NOW + 86_400}),
         );
-        fs::write(day.join("rollout-a.jsonl"), line + "\n").unwrap();
     }
 
     fn temp(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("herdr-codex-homes-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-codex-homes-{name}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -348,5 +436,49 @@ mod home_tests {
         // The home of a running Codex process decides when there is one.
         let got = read_homes(&[home(&cfg, false), home(&other, true)], NOW);
         assert_eq!(used(&got), 30.0);
+    }
+
+    #[test]
+    fn active_older_dated_rollout_beats_stale_today_reading_with_five_file_cap() {
+        let path = temp("active-older-day");
+        write_home(&path, "2026-10-14T16:00:00Z", Some("plus"), 81);
+        let today = path.join("sessions").join(local_time(NOW, c"%Y/%m/%d"));
+        for n in 0..5 {
+            fs::write(today.join(format!("other-{n}.jsonl")), "no token data\n").unwrap();
+        }
+        write_reading(
+            &path,
+            NOW - 86_400,
+            "2026-10-14T17:46:00Z",
+            Some("plus"),
+            serde_json::json!({"used_percent": 39, "resets_at": NOW + 3600}),
+            serde_json::json!({"used_percent": 36, "resets_at": NOW + 86_400}),
+        );
+
+        let got = read_homes(&[home(&path, true)], NOW);
+        assert_eq!(got.windows[0].left_pct, Some(61));
+        assert_eq!(got.windows[1].left_pct, Some(64));
+        assert_eq!(got.seen_at, timestamp("2026-10-14T17:46:00Z"));
+        assert_eq!(active_files(&path.join("sessions"), &today).len(), 5);
+    }
+
+    #[test]
+    fn null_openrouter_limits_do_not_override_a_real_home_reading() {
+        let configured = temp("configured-plus");
+        let openrouter = temp("openrouter-null");
+        write_home(&configured, "2026-10-14T16:00:00Z", Some("plus"), 20);
+        write_reading(
+            &openrouter,
+            NOW,
+            "2026-10-14T17:46:00Z",
+            Some("openrouter"),
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        );
+
+        let got = read_homes(&[home(&configured, false), home(&openrouter, true)], NOW);
+        assert_eq!(got.windows[0].left_pct, Some(80));
+        assert_eq!(got.windows[1].left_pct, Some(99));
+        assert_eq!(got.seen_at, timestamp("2026-10-14T16:00:00Z"));
     }
 }

@@ -464,9 +464,7 @@ impl App {
         if !handled_pane_double_click {
             if let Some(action) = self.state.handle_mouse(&mut self.terminal_runtimes, mouse) {
                 match action {
-                    SettingsAction::SaveAllowance(p, policy, benches) => {
-                        self.save_allowance(p, policy, benches)
-                    }
+                    SettingsAction::SaveAllowance(p, policy) => self.save_allowance(p, policy),
                     SettingsAction::SaveTheme(name) => self.save_theme(&name),
                     SettingsAction::SaveSound(enabled) => self.save_sound(enabled),
                     SettingsAction::SaveDoneSound(choice) => self.save_done_sound(&choice),

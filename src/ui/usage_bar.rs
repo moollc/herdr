@@ -89,6 +89,7 @@ pub(crate) fn window_label(kind: WindowKind) -> &'static str {
         WindowKind::Monthly => "mo",
         WindowKind::Auto => "cm",
         WindowKind::Named => "om",
+        WindowKind::ExtraSpend => "$",
     }
 }
 
@@ -99,6 +100,7 @@ pub(crate) fn window_phrase(kind: WindowKind) -> &'static str {
         WindowKind::Monthly => "monthly",
         WindowKind::Auto => "models",
         WindowKind::Named => "other models",
+        WindowKind::ExtraSpend => "extra spend",
     }
 }
 
@@ -734,6 +736,7 @@ mod tests {
 
     fn usage(provider: Provider, windows: Vec<UsageWindow>) -> ProviderUsage {
         ProviderUsage {
+            extra_spend: None,
             provider,
             windows,
             seen_at: Some(NOW),
@@ -1182,6 +1185,7 @@ mod tests {
         let later = NOW + STALE_AFTER_SECS - 2;
         let snap = UsageSnapshot {
             providers: vec![ProviderUsage {
+                extra_spend: None,
                 windows: vec![],
                 ..usage(Provider::Claude, vec![])
             }],

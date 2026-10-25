@@ -726,8 +726,19 @@ stop_pct = 3
 overseer_pct = 8
 ```
 
-Pane switches use the dispatcher's existing `BENCHED` file beside `TEAM_QUEUE`;
-`TEAM_BENCHED` can specify a different path. They do not create another bench list.
+The allowance panel shows provider limits only. The overseer still manages the
+existing `BENCHED` file beside `TEAM_QUEUE`; `TEAM_BENCHED` can specify a different
+path. Saving allowance limits never reads or writes that file.
+
+Cursor also has an optional **Extra spend cap**, off by default. It counts bonus
+plus on-demand usage as a percentage of the reported total pool. The pool is
+`breakdown.total / (totalPercentUsed / 100)`, calculated before rounding.
+Its limits are percentages left, like the other limits: 15% wind-down, 8% overseer
+reserve and 3% stop by default. The cap follows the main Guard switch and uses the
+same pane note and interrupt controls. No saved start or dollar entry is needed.
+A new billing cycle uses its newly reported total. Missing, zero-denominator or
+stale readings remain unknown. Readings update on Cursor's existing polling
+interval, so this is a local guard based on reported usage.
 `herdr usage --json` includes the effective `allowance_policy` for scheduling tools.
 After an observed reset deadline passes, the plain usage command labels the full
 allowance as “estimated after reset” until a real observation replaces it.

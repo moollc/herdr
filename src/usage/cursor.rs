@@ -50,6 +50,25 @@ pub(super) fn parse(value: &Value, now: u64) -> ProviderUsage {
         on_demand.map_or(String::new(), |v| format!(", on_demand={v}"))
     );
     let passed = reset <= now && !unlimited;
+    // Derive the reported total before rounding the percentage for display.
+    // All counters use the same source units; missing counters remain unknown.
+    result.extra_spend = (|| {
+        let used = plan.get("totalPercentUsed")?.as_f64()?;
+        let total = plan.get("breakdown")?.get("total")?.as_u64()?;
+        if !used.is_finite() || used <= 0.0 {
+            return None;
+        }
+        let pool = (total as f64 * 100.0 / used).round();
+        if !pool.is_finite() || pool < 1.0 || pool >= u64::MAX as f64 {
+            return None;
+        }
+        Some(super::CursorSpend {
+            bonus_units: plan.get("breakdown")?.get("bonus")?.as_u64()?,
+            on_demand_units: value.pointer("/individualUsage/onDemand/used")?.as_u64()?,
+            total_units: pool as u64,
+            cycle_end: reset,
+        })
+    })();
     result.seen_at = Some(now);
     result.windows = vec![
         super::UsageWindow {
@@ -126,5 +145,30 @@ pub(super) fn http_result(status: u16, location: &str, body: &str, now: u64) -> 
     match serde_json::from_str(body) {
         Ok(value) => parse(&value, now),
         Err(_) => unknown(Provider::Cursor, UsageProblem::FormatChanged),
+    }
+}
+
+#[cfg(test)]
+mod spend_tests {
+    use super::*;
+    #[test]
+    fn cursor_extra_spend_matches_live_source_and_missing_is_unknown() {
+        let mut v = serde_json::json!({"billingCycleEnd":"2026-11-08T05:21:26Z", "individualUsage":{
+            "plan":{"autoPercentUsed":99.93777777777778,"apiPercentUsed":8.488888888888889,
+                "totalPercentUsed":91.6242,"limit":2000,"breakdown":{"included":2000,"bonus":43354,"total":45354}},
+            "onDemand":{"enabled":false,"used":0,"limit":null,"remaining":null}}});
+        let u = parse(&v, 100);
+        let spend = u.extra_spend.unwrap();
+        assert_eq!(spend.bonus_units, 43354);
+        assert_eq!(spend.total_units, 49500);
+        assert_eq!(spend.left_pct(), Some(12));
+        assert_eq!(spend.on_demand_units, 0);
+        v["individualUsage"]["onDemand"]["used"] = serde_json::json!(125);
+        assert_eq!(parse(&v, 101).extra_spend.unwrap().on_demand_units, 125);
+        v["individualUsage"]["plan"]["totalPercentUsed"] = serde_json::json!(0);
+        assert!(parse(&v, 102).extra_spend.is_none());
+        v["individualUsage"]["plan"]["totalPercentUsed"] = serde_json::json!(91.6242);
+        v["individualUsage"]["plan"]["breakdown"]["bonus"] = Value::Null;
+        assert!(parse(&v, 102).extra_spend.is_none());
     }
 }
