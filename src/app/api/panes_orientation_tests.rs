@@ -51,6 +51,63 @@ async fn submitted_bytes(rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>) -> 
 }
 
 #[tokio::test]
+async fn ordinary_api_submission_closes_only_a_pending_notification_origin() {
+    let (mut app, pane) = app_with_two_panes();
+    let terminal_id = app.state.terminal_id_for_any_pane(pane).unwrap();
+    app.state
+        .terminals
+        .get_mut(&terminal_id)
+        .unwrap()
+        .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("api-session").unwrap(),
+        });
+    let mut notification = app
+        .message_origin_for_api(pane, Some("notification"), Some("api-notice"), None)
+        .unwrap()
+        .unwrap();
+    notification.active = true;
+    app.store_message_origin(pane, Some(notification));
+    let (runtime, mut rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+    app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+    let response = app.handle_pane_send_input(
+        "ordinary".into(),
+        PaneSendInputParams {
+            pane_id: app.public_pane_id(0, pane).unwrap(),
+            text: "follow up".into(),
+            keys: vec!["Enter".into()],
+            origin: None,
+            correlation_id: None,
+            task_id: None,
+        },
+    );
+    assert!(response.contains("result"), "{response}");
+    assert_eq!(submitted_bytes(&mut rx).await, b"follow up\r");
+    assert!(app.state.terminals[&terminal_id].message_origin.is_none());
+
+    let response = app.handle_pane_send_input(
+        "checked-task".into(),
+        PaneSendInputParams {
+            pane_id: app.public_pane_id(0, pane).unwrap(),
+            text: "checked task".into(),
+            keys: vec!["Enter".into()],
+            origin: Some("task".into()),
+            correlation_id: Some("api-task-correlation".into()),
+            task_id: Some("api-task-9".into()),
+        },
+    );
+    assert!(response.contains("result"), "{response}");
+    assert_eq!(submitted_bytes(&mut rx).await, b"checked task\r");
+    let origin = app.state.terminals[&terminal_id]
+        .message_origin
+        .as_ref()
+        .unwrap();
+    assert_eq!(origin.correlation_id, "api-task-correlation");
+    assert_eq!(origin.task_id.as_deref(), Some("api-task-9"));
+}
+
+#[tokio::test]
 #[ignore = "requires a separately provisioned compatible Codex client; set HERDR_TEST_CODEX and run explicitly"]
 async fn external_codex_deepseek_model_request_receives_orientation_before_task() {
     use std::io::{BufRead, BufReader, Write};

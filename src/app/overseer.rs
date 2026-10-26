@@ -306,6 +306,29 @@ impl App {
         })
     }
 
+    pub(super) fn clear_pending_notification_origin(&mut self, pane: PaneId) {
+        let Some(terminal_id) = self.state.terminal_id_for_any_pane(pane) else {
+            return;
+        };
+        let clear = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .is_some_and(|terminal| {
+                terminal
+                    .message_origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.kind == MessageOriginKind::Notification)
+            });
+        if clear {
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.message_origin = None;
+            }
+            self.state.mark_session_dirty();
+            self.schedule_session_save();
+        }
+    }
+
     pub(super) fn send_overseer(&mut self, id: &TerminalId, text: &str) -> bool {
         let sent = self
             .terminal_runtimes
@@ -355,6 +378,12 @@ impl App {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            submitted_while_working: self.state.terminals[&terminal_id].state
+                == AgentState::Working,
+            submitted_turn_ends: self.state.terminals[&terminal_id]
+                .turn_reporting
+                .as_ref()
+                .map_or(0, |report| report.ends),
             active: false,
         }))
     }
@@ -372,7 +401,7 @@ impl App {
             .terminals
             .get(&terminal_id)
             .and_then(|terminal| terminal.message_origin.as_ref())
-            .is_none_or(|origin| !origin.active)
+            .is_none_or(|origin| origin.kind == MessageOriginKind::Notification)
         {
             if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
                 terminal.message_origin = None;
@@ -404,6 +433,11 @@ impl App {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
+                submitted_while_working: terminal.state == AgentState::Working,
+                submitted_turn_ends: terminal
+                    .turn_reporting
+                    .as_ref()
+                    .map_or(0, |report| report.ends),
                 active: false,
             });
             self.state.mark_session_dirty();
@@ -570,13 +604,51 @@ impl App {
                     .get(id)
                     .is_some_and(|(state, _)| *state == AgentState::Working);
                 let was_observed = self.overseer_service.previous.contains_key(id);
+                let hook_ended_after_submission = terminal
+                    .turn_reporting
+                    .as_ref()
+                    .is_some_and(|report| report.ends != origin.submitted_turn_ends);
+                // If no start was observed, an idle notification is either an
+                // acknowledgement completed between ticks or a runtime that
+                // has not exposed a provable start boundary. Fail open here so
+                // it cannot claim the next unrelated completion.
+                if origin.kind == MessageOriginKind::Notification
+                    && !origin.active
+                    && !origin.submitted_while_working
+                    && terminal.state != AgentState::Working
+                {
+                    return Some((id.clone(), None));
+                }
+                // Native hook counters survive a complete start/end between
+                // collector passes, so retire an unobserved notification at
+                // its accepted lifecycle boundary too.
+                if origin.kind == MessageOriginKind::Notification
+                    && !origin.active
+                    && hook_ended_after_submission
+                {
+                    return Some((id.clone(), None));
+                }
+                // If a sampled notification turn ended and the hook already
+                // started another turn before this pass, detach the old origin
+                // before the new turn can be mistaken for its acknowledgement.
+                if origin.kind == MessageOriginKind::Notification
+                    && origin.active
+                    && hook_ended_after_submission
+                    && terminal.state == AgentState::Working
+                {
+                    return Some((id.clone(), None));
+                }
                 // A cold restore can resume an agent after its prior turn
                 // finished while Herdr was down. Do not carry that completed
                 // turn's active correlation into the next request.
                 if origin.active && !was_observed && terminal.state != AgentState::Working {
                     return Some((id.clone(), None));
                 }
-                if terminal.state == AgentState::Working && !was_working && !origin.active {
+                if terminal.state == AgentState::Working
+                    && !was_working
+                    && !origin.active
+                    && !origin.submitted_while_working
+                {
                     let mut active = origin.clone();
                     active.active = true;
                     return Some((id.clone(), Some(active)));
@@ -1241,6 +1313,248 @@ mod tests {
         app.overseer_service.situation_path = folder.join("situation.md");
         app.overseer_service.queue_path = folder.join("queue.tsv");
         (app, pane, id, rx)
+    }
+
+    fn collector_worker(app: &mut App, chief_pane: PaneId, now: Instant) -> (PaneId, TerminalId) {
+        app.state.toggle_oversee(chief_pane);
+        let worker_ws = crate::workspace::Workspace::test_new("Worker space");
+        let worker_pane = worker_ws.tabs[0].root_pane;
+        let worker_id = worker_ws.terminal_id(worker_pane).unwrap().clone();
+        let mut worker = TerminalState::new(worker_id.clone(), std::env::temp_dir());
+        worker.detected_agent = Some(Agent::Codex);
+        worker.agent_name = Some("worker".into());
+        worker.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("worker-session").unwrap(),
+        });
+        let (runtime, _rx) = TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(worker_id.clone(), runtime);
+        app.state.terminals.insert(worker_id.clone(), worker);
+        app.state.workspaces.push(worker_ws);
+        app.collect_overseer_events(now);
+        (worker_pane, worker_id)
+    }
+
+    fn api_origin(
+        app: &App,
+        pane: PaneId,
+        origin: &str,
+        correlation: &str,
+        task_id: Option<&str>,
+    ) -> MessageOrigin {
+        app.message_origin_for_api(pane, Some(origin), Some(correlation), task_id)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn collected_text(app: &App, chief: &TerminalId, key: &str) -> Option<String> {
+        app.overseer_service
+            .holders
+            .get(chief)
+            .and_then(|holder| holder.events.get(key))
+            .map(|event| event.text.clone())
+    }
+
+    #[tokio::test]
+    async fn collector_clears_missed_notification_before_same_session_followup() {
+        let (mut app, chief_pane, chief_id, _rx) = setup();
+        let now = Instant::now();
+        let (worker_pane, worker_id) = collector_worker(&mut app, chief_pane, now);
+        let origin = api_origin(&app, worker_pane, "notification", "notice-missed", None);
+        app.store_message_origin(worker_pane, Some(origin));
+
+        // The whole notification reply occurs between collector passes.
+        let worker = app.state.terminals.get_mut(&worker_id).unwrap();
+        worker.state = AgentState::Working;
+        worker.state = AgentState::Idle;
+        app.collect_overseer_events(now + Duration::from_secs(1));
+        assert!(app.state.terminals[&worker_id].message_origin.is_none());
+        assert!(collected_text(&app, &chief_id, &worker_id.to_string()).is_none());
+
+        // A later ordinary completion in the same native session is reported once.
+        app.state.terminals.get_mut(&worker_id).unwrap().state = AgentState::Working;
+        app.collect_overseer_events(now + Duration::from_secs(2));
+        app.state.terminals.get_mut(&worker_id).unwrap().state = AgentState::Idle;
+        app.collect_overseer_events(now + Duration::from_secs(3));
+        let text = collected_text(&app, &chief_id, &worker_id.to_string()).unwrap();
+        assert!(text.ends_with("done"), "{text}");
+        app.collect_overseer_events(now + Duration::from_secs(4));
+        assert_eq!(
+            collected_text(&app, &chief_id, &worker_id.to_string()),
+            Some(text)
+        );
+    }
+
+    #[tokio::test]
+    async fn collector_does_not_consume_turn_already_working_at_notification_send() {
+        let (mut app, chief_pane, chief_id, _rx) = setup();
+        let now = Instant::now();
+        let (worker_pane, worker_id) = collector_worker(&mut app, chief_pane, now);
+        app.state.terminals.get_mut(&worker_id).unwrap().state = AgentState::Working;
+        app.collect_overseer_events(now + Duration::from_secs(1));
+        let origin = api_origin(&app, worker_pane, "notification", "notice-raced", None);
+        assert!(origin.submitted_while_working);
+        app.store_message_origin(worker_pane, Some(origin));
+        app.collect_overseer_events(now + Duration::from_secs(2));
+        app.state.terminals.get_mut(&worker_id).unwrap().state = AgentState::Idle;
+        app.collect_overseer_events(now + Duration::from_secs(3));
+        let text = collected_text(&app, &chief_id, &worker_id.to_string()).unwrap();
+        assert!(text.ends_with("done"), "{text}");
+        assert!(app.state.terminals[&worker_id].message_origin.is_none());
+    }
+
+    #[tokio::test]
+    async fn collector_uses_native_end_counter_for_unobserved_notification_ack() {
+        use crate::turn_reporting::TurnEvent;
+        let (mut app, chief_pane, _chief_id, _rx) = setup();
+        let now = Instant::now();
+        let (worker_pane, worker_id) = collector_worker(&mut app, chief_pane, now);
+        app.state.terminals.get_mut(&worker_id).unwrap().state = AgentState::Working;
+        app.collect_overseer_events(now + Duration::from_secs(1));
+        let origin = api_origin(&app, worker_pane, "notification", "notice-native", None);
+        assert!(origin.submitted_while_working);
+        app.store_message_origin(worker_pane, Some(origin));
+        let worker = app.state.terminals.get_mut(&worker_id).unwrap();
+        worker.report_turn(Agent::Codex, TurnEvent::Ended, 1, Some("ack".into()));
+        app.collect_overseer_events(now + Duration::from_secs(2));
+        assert!(app.state.terminals[&worker_id].message_origin.is_none());
+    }
+
+    #[tokio::test]
+    async fn collector_detaches_sampled_native_ack_before_a_followup_turn() {
+        use crate::turn_reporting::TurnEvent;
+        let (mut app, chief_pane, _chief_id, _rx) = setup();
+        let now = Instant::now();
+        let (worker_pane, worker_id) = collector_worker(&mut app, chief_pane, now);
+        let origin = api_origin(
+            &app,
+            worker_pane,
+            "notification",
+            "notice-native-sampled",
+            None,
+        );
+        app.store_message_origin(worker_pane, Some(origin));
+        let worker = app.state.terminals.get_mut(&worker_id).unwrap();
+        worker.report_turn(Agent::Codex, TurnEvent::Started, 1, Some("ack".into()));
+        app.collect_overseer_events(now + Duration::from_secs(1));
+        assert!(app.state.terminals[&worker_id]
+            .message_origin
+            .as_ref()
+            .is_some_and(|origin| origin.active));
+
+        let worker = app.state.terminals.get_mut(&worker_id).unwrap();
+        worker.report_turn(Agent::Codex, TurnEvent::Ended, 2, Some("ack".into()));
+        worker.report_turn(
+            Agent::Codex,
+            TurnEvent::Started,
+            3,
+            Some("follow-up".into()),
+        );
+        app.collect_overseer_events(now + Duration::from_secs(2));
+        assert!(app.state.terminals[&worker_id].message_origin.is_none());
+    }
+
+    #[tokio::test]
+    async fn collector_suppresses_sampled_notice_then_keeps_checked_task_and_failures() {
+        let (mut app, chief_pane, chief_id, _rx) = setup();
+        let now = Instant::now();
+        let (worker_pane, worker_id) = collector_worker(&mut app, chief_pane, now);
+        let origin = api_origin(&app, worker_pane, "notification", "notice-sampled", None);
+        app.store_message_origin(worker_pane, Some(origin));
+        app.state.terminals.get_mut(&worker_id).unwrap().state = AgentState::Working;
+        app.collect_overseer_events(now + Duration::from_secs(1));
+        assert!(app.state.terminals[&worker_id]
+            .message_origin
+            .as_ref()
+            .is_some_and(|origin| origin.active));
+        app.state.terminals.get_mut(&worker_id).unwrap().state = AgentState::Idle;
+        app.collect_overseer_events(now + Duration::from_secs(2));
+        assert!(collected_text(&app, &chief_id, &worker_id.to_string()).is_none());
+        assert!(app.state.terminals[&worker_id].message_origin.is_none());
+
+        let task = api_origin(
+            &app,
+            worker_pane,
+            "task",
+            "task-correlation",
+            Some("task-7"),
+        );
+        app.store_message_origin(worker_pane, Some(task));
+        app.state.terminals.get_mut(&worker_id).unwrap().state = AgentState::Working;
+        app.collect_overseer_events(now + Duration::from_secs(3));
+        app.state.terminals.get_mut(&worker_id).unwrap().state = AgentState::Idle;
+        app.collect_overseer_events(now + Duration::from_secs(4));
+        let text = collected_text(&app, &chief_id, &worker_id.to_string()).unwrap();
+        assert!(text.contains("task_id=task-7"), "{text}");
+        assert!(text.contains("correlation=task-correlation"), "{text}");
+        assert!(app.state.terminals[&worker_id].message_origin.is_none());
+
+        let failure = api_origin(&app, worker_pane, "notification", "notice-error", None);
+        app.store_message_origin(worker_pane, Some(failure));
+        app.state.terminals.get_mut(&worker_id).unwrap().state = AgentState::Working;
+        app.collect_overseer_events(now + Duration::from_secs(5));
+        app.state
+            .terminals
+            .get_mut(&worker_id)
+            .unwrap()
+            .blocked_reason = Some("approval");
+        app.state.terminals.get_mut(&worker_id).unwrap().state = AgentState::Blocked;
+        app.collect_overseer_events(now + Duration::from_secs(6));
+        assert!(collected_text(&app, &chief_id, &worker_id.to_string())
+            .unwrap()
+            .ends_with("blocked: approval"));
+
+        app.state.terminals.get_mut(&worker_id).unwrap().state = AgentState::Working;
+        app.state
+            .terminals
+            .get_mut(&worker_id)
+            .unwrap()
+            .blocked_reason = None;
+        let error_origin = api_origin(&app, worker_pane, "notification", "notice-idle-error", None);
+        app.store_message_origin(worker_pane, Some(error_origin));
+        app.collect_overseer_events(now + Duration::from_secs(7));
+        app.terminal_runtimes
+            .get(&worker_id)
+            .unwrap()
+            .test_process_pty_bytes(b"\x1b[2J\x1b[Herror: tool failed\r\n\xe2\x9d\xaf ");
+        assert!(app
+            .terminal_runtimes
+            .get(&worker_id)
+            .unwrap()
+            .detection_text()
+            .contains("error: tool failed"));
+        app.state.terminals.get_mut(&worker_id).unwrap().state = AgentState::Idle;
+        app.collect_overseer_events(now + Duration::from_secs(8));
+        let error_text = collected_text(&app, &chief_id, &worker_id.to_string()).unwrap();
+        assert!(error_text.ends_with("idle with an error"), "{error_text}");
+    }
+
+    #[tokio::test]
+    async fn actual_headless_keyboard_enter_clears_only_pending_notification_origin() {
+        let (mut app, pane, id, _rx) = setup();
+        let terminal = app.state.terminals.get_mut(&id).unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("keyboard-session").unwrap(),
+        });
+        let mut notification = api_origin(&app, pane, "notification", "keyboard-notice", None);
+        notification.active = true;
+        app.store_message_origin(pane, Some(notification));
+        app.route_client_input(b"\r".to_vec());
+        assert!(app.state.terminals[&id].message_origin.is_none());
+
+        let task = api_origin(&app, pane, "task", "keyboard-task", Some("task-8"));
+        app.store_message_origin(pane, Some(task));
+        app.clear_pending_notification_origin(pane);
+        assert_eq!(
+            app.state.terminals[&id]
+                .message_origin
+                .as_ref()
+                .map(|origin| origin.task_id.as_deref()),
+            Some(Some("task-8"))
+        );
     }
 
     async fn submitted(rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>) -> String {

@@ -192,12 +192,19 @@ pub struct MessageOrigin {
     pub session: SessionIdentity,
     #[serde(default)]
     pub created_at: u64,
+    /// The recipient was already in a turn when this submission was accepted.
+    /// That turn predates the notification and can never be its acknowledgement.
+    #[serde(default)]
+    pub submitted_while_working: bool,
+    /// Native hook completion counter at the accepted submission boundary.
+    #[serde(default)]
+    pub submitted_turn_ends: u64,
     pub active: bool,
 }
 
 impl MessageOrigin {
     pub fn result_event(&self, terminal_id: &TerminalId, event: &str) -> Option<String> {
-        if event == "done" && self.kind == MessageOriginKind::Notification {
+        if event == "done" && self.kind == MessageOriginKind::Notification && self.active {
             return None;
         }
         if event == "done" && self.kind == MessageOriginKind::Task {
@@ -636,9 +643,9 @@ mod tests {
             task_id: None,
             session: session.clone(),
             created_at: 0,
-            // A fast acknowledgment may finish between collector ticks, before
-            // the pending origin has been promoted to active.
-            active: false,
+            submitted_while_working: false,
+            submitted_turn_ends: 0,
+            active: true,
         };
         let terminal_id = TerminalId::alloc();
         assert_eq!(notification.result_event(&terminal_id, "done"), None);
@@ -656,6 +663,8 @@ mod tests {
             task_id: Some("stage-1".into()),
             session,
             created_at: 0,
+            submitted_while_working: false,
+            submitted_turn_ends: 0,
             active: false,
         };
         let result = task.result_event(&terminal_id, "done").unwrap();
@@ -677,6 +686,8 @@ mod tests {
                 "native-session-2".into(),
             ),
             created_at: 1234,
+            submitted_while_working: false,
+            submitted_turn_ends: 0,
             active: false,
         };
         let saved = serde_json::to_string(&origin).unwrap();
