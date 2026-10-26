@@ -23,6 +23,7 @@ MAX_PENDING_EVENTS = 64
 MAX_PENDING_BYTES = 512 * 1024
 MAX_CANDIDATE_PATHS = 64
 PENDING_TTL_NS = 120 * 1_000_000_000
+MAX_CONTEXT_RESPONSE_BYTES = 16 * 1024
 
 
 def _shell_destinations(command):
@@ -167,11 +168,11 @@ def _patch_paths(value):
 
 
 def _direct_paths(tool_name, tool_input):
-    if not isinstance(tool_input, dict):
-        return []
-    name = str(tool_name or "").casefold()
+    name = _base_tool_name(tool_name)
     if name in ("apply_patch", "applypatch"):
         return _patch_paths(tool_input)
+    if not isinstance(tool_input, dict):
+        return []
     if not any(word in name for word in ("write", "edit", "patch", "create", "replace")):
         return []
     paths = []
@@ -180,6 +181,10 @@ def _direct_paths(tool_name, tool_input):
         if isinstance(value, str):
             paths.append(value)
     return paths
+
+
+def _base_tool_name(tool_name):
+    return str(tool_name or "").casefold().rsplit(".", 1)[-1]
 
 
 def _normalize_path(raw_path, cwd):
@@ -204,7 +209,7 @@ def _candidate_paths(provider, event, payload):
     cwd = payload.get("cwd")
     paths = []
     tool_name = str(payload.get("tool_name") or event or "unknown")
-    normalized_name = tool_name.casefold()
+    normalized_name = _base_tool_name(tool_name)
     tool_input = payload.get("tool_input")
     if provider == "cursor" and event in ("afterFileEdit", "afterTabFileEdit"):
         paths.append(payload.get("file_path"))
@@ -427,25 +432,38 @@ def _resolve_state_dir():
     }
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            deadline = time.monotonic() + 0.3
             client.settimeout(0.3)
             client.connect(socket_path)
             client.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
             chunks = []
+            response_size = 0
             while True:
-                chunk = client.recv(65536)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                client.settimeout(remaining)
+                chunk = client.recv(min(4096, MAX_CONTEXT_RESPONSE_BYTES + 1 - response_size))
                 if not chunk:
                     break
                 chunks.append(chunk)
+                response_size += len(chunk)
+                if response_size > MAX_CONTEXT_RESPONSE_BYTES:
+                    return None
                 if b"\n" in chunk:
                     break
-        response = json.loads(b"".join(chunks).split(b"\n", 1)[0])
-        result = response.get("result", {})
+        response_line, separator, _ = b"".join(chunks).partition(b"\n")
+        if not separator:
+            return None
+        response = json.loads(response_line)
+        if not isinstance(response, dict) or "error" in response:
+            return None
+        result = response.get("result")
+        if not isinstance(result, dict):
+            return None
         state_dir = result.get("state_dir")
-        session_name = result.get("session_name", "default")
         if not isinstance(state_dir, str) or not os.path.isabs(state_dir):
             return None
-        if session_name != "default":
-            state_dir = str(Path(state_dir) / "sessions" / session_name)
         return state_dir
     except (OSError, ValueError, TypeError):
         return None

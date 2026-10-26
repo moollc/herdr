@@ -836,6 +836,15 @@ mod tests {
         .unwrap();
         assert_eq!(context["result"]["type"], "pane_context");
         assert_eq!(context["result"]["terminal_id"], terminal);
+        assert_eq!(
+            context["result"]["state_dir"],
+            crate::config::state_dir().display().to_string()
+        );
+        assert_eq!(
+            context["result"]["session_name"],
+            crate::session::active_name()
+                .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string())
+        );
         let snapshot =
             crate::persist::capture(&app.state, &crate::terminal::TerminalRuntimeRegistry::new());
         assert_eq!(

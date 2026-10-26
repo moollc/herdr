@@ -113,11 +113,7 @@ impl App {
             id,
             ResponseResult::PaneContext {
                 terminal_id: terminal_id.to_string(),
-                state_dir: crate::session::active_name()
-                    .map(|name| crate::config::state_dir().join("sessions").join(name))
-                    .unwrap_or_else(crate::config::state_dir)
-                    .display()
-                    .to_string(),
+                state_dir: crate::config::state_dir().display().to_string(),
                 session_name: crate::session::active_name()
                     .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string()),
             },

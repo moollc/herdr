@@ -72,6 +72,30 @@ class RecentAgentFilesHookTests(unittest.TestCase):
         self.run_hook("codex", "PostToolUse", {**pre, "tool_response": "unstructured result"})
         self.assertEqual([row["path"] for row in self.records() if row.get("path")], [str(path.resolve())])
 
+    def test_native_freeform_apply_patch_string_and_prefixed_name_pair_pre_post(self):
+        expected = []
+        for tool_name, tool_id in (("apply_patch", "native-patch"), ("tools.apply_patch", "nested-patch")):
+            path = self.cwd / f"{tool_id}.txt"
+            patch = f"*** Begin Patch\n*** Add File: {path.name}\n+fixture\n*** End Patch"
+            pre = {"tool_name": tool_name, "tool_use_id": tool_id, "cwd": str(self.cwd), "tool_input": patch}
+            self.run_hook("codex", "PreToolUse", pre)
+            path.write_text("fixture")
+            self.run_hook("codex", "PostToolUse", {**pre, "tool_response": "unstructured result"})
+            expected.append(str(path.resolve()))
+        self.assertCountEqual(
+            [row["path"] for row in self.records() if row.get("path")], expected
+        )
+
+    def test_nested_exec_command_prefix_keeps_shell_write_capture(self):
+        path = self.cwd / "nested-shell.txt"
+        command = "printf fixture > '" + str(path) + "'"
+        pre = {"tool_name": "tools.exec_command", "tool_use_id": "nested-exec", "cwd": str(self.cwd),
+               "tool_input": {"command": command}}
+        self.run_hook("codex", "PreToolUse", pre)
+        path.write_text("fixture")
+        self.run_hook("codex", "PostToolUse", {**pre, "tool_response": "done"})
+        self.assertEqual([row["path"] for row in self.records() if row.get("path")], [str(path.resolve())])
+
     def test_failed_codex_tool_that_changed_file_is_recorded_from_observed_change(self):
         path = self.cwd / "partial.txt"
         command = "echo partial > '" + str(path) + "'"
@@ -192,8 +216,22 @@ class RecentAgentFilesHookTests(unittest.TestCase):
         self.assertNotIn("must not be journaled", journal)
         self.assertNotIn("native Pi fixture", journal)
 
-    def test_missing_state_dir_is_resolved_from_the_live_socket_context(self):
+    def test_pi_error_without_observed_change_does_not_create_a_file_row(self):
+        path = self.cwd / "pi-no-change.txt"
+        path.write_text("unchanged")
+        before = {"tool_name": "write", "tool_call_id": "pi-error-no-change", "cwd": str(self.cwd),
+                  "tool_input": {"path": str(path), "content": "not written"}}
+        self.run_hook("pi", "PreToolUse", before)
+        self.run_hook("pi", "PostToolUse", {**before, "tool_error": True})
+        self.assertEqual(self.records(), [])
+        pending = self.state / hook.PENDING_NAME
+        self.assertEqual(json.loads(pending.read_text()), {})
+
+    def test_socket_context_state_root_is_used_verbatim_for_named_and_default_sessions(self):
         class FakeSocket:
+            def __init__(self, session_name):
+                self.session_name = session_name
+
             def __enter__(self):
                 return self
 
@@ -210,13 +248,49 @@ class RecentAgentFilesHookTests(unittest.TestCase):
                 pass
 
             def recv(self, _size):
-                return b'{"id":"recent-agent-files-context","result":{"state_dir":"/tmp/herdr-state","session_name":"pilot"}}\n'
+                response = {"id": "recent-agent-files-context", "result": {
+                    "state_dir": "/tmp/herdr-state", "session_name": self.session_name}}
+                return (json.dumps(response) + "\n").encode()
+
+        for session_name in ("pilot", "default"):
+            with self.subTest(session_name=session_name), patch.dict(os.environ, {
+                "HERDR_STATE_DIR": "", "HERDR_SOCKET_PATH": "/tmp/active/herdr.sock",
+                "HERDR_PANE_ID": "p_4",
+            }, clear=False), patch.object(hook.socket, "socket", return_value=FakeSocket(session_name)):
+                self.assertEqual(hook._resolve_state_dir(), "/tmp/herdr-state")
+
+    def test_explicit_state_root_avoids_socket_fallback(self):
+        with patch.dict(os.environ, {
+            "HERDR_STATE_DIR": str(self.state), "HERDR_SOCKET_PATH": "/tmp/active/herdr.sock",
+            "HERDR_PANE_ID": "p_4",
+        }, clear=False), patch.object(hook.socket, "socket", side_effect=AssertionError("unexpected socket fallback")):
+            self.assertEqual(hook._resolve_state_dir(), str(self.state))
+
+    def test_socket_context_response_size_is_bounded(self):
+        class OversizedSocket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def settimeout(self, _timeout):
+                pass
+
+            def connect(self, _path):
+                pass
+
+            def sendall(self, _payload):
+                pass
+
+            def recv(self, size):
+                return b"x" * size
 
         with patch.dict(os.environ, {
             "HERDR_STATE_DIR": "", "HERDR_SOCKET_PATH": "/tmp/active/herdr.sock",
             "HERDR_PANE_ID": "p_4",
-        }, clear=False), patch.object(hook.socket, "socket", return_value=FakeSocket()):
-            self.assertEqual(hook._resolve_state_dir(), "/tmp/herdr-state/sessions/pilot")
+        }, clear=False), patch.object(hook.socket, "socket", return_value=OversizedSocket()):
+            self.assertIsNone(hook._resolve_state_dir())
 
     def test_read_only_shell_redirections_and_command_arguments_are_not_candidates(self):
         cases = (("ls -la 2>/dev/null", []), ("ls -la 2>&1 | head", []),
