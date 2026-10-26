@@ -112,6 +112,16 @@ impl App {
         let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
             return;
         };
+        if terminal.pi_resume_orientation_guard.is_some()
+            && terminal
+                .effective_known_agent()
+                .is_some_and(|agent| agent != crate::detect::Agent::Pi)
+        {
+            // A different detected agent is a fresh successor even if it has
+            // no hook/session report to consume the Pi-only resume guard.
+            terminal.pi_resume_orientation_guard = None;
+            terminal.auto_orientation = AutoOrientation::Unarmed;
+        }
         let hook_owned = matches!(
             terminal.orientation,
             OrientationState::Offered | OrientationState::Delivered
@@ -120,8 +130,12 @@ impl App {
             (None, AutoOrientation::Unarmed) => return,
             (None, _) => {
                 // The agent exited. Its successor in this pane is a new
-                // conversation and needs its own orientation.
-                terminal.auto_orientation = AutoOrientation::Unarmed;
+                // conversation and needs its own orientation. Keep a delivered
+                // Pi orientation armed against duplication until session_start
+                // proves this is the same session or identifies a fresh one.
+                if terminal.pi_resume_orientation_guard.is_none() {
+                    terminal.auto_orientation = AutoOrientation::Unarmed;
+                }
                 if terminal.orientation == OrientationState::Delivered {
                     terminal.orientation = OrientationState::Suppressed;
                     terminal.orientation_offer = None;
@@ -568,6 +582,134 @@ mod tests {
             AgentState::Idle,
         );
         assert!(sent(&mut rx).contains(crate::agent_orientation::AUTO_NOTE));
+    }
+
+    #[tokio::test]
+    async fn manual_pi_session_resume_does_not_repeat_orientation_but_new_session_does() {
+        use crate::agent_orientation::AutoOrientation;
+        use crate::agent_resume::AgentSessionRef;
+        use crate::detect::{Agent, AgentState};
+
+        let (mut app, pane, terminal_id, mut rx) = prompt_app(OrientationState::Delivered);
+        let old_ref = AgentSessionRef::path("/tmp/pi/sessions/one.jsonl").unwrap();
+        {
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.auto_orientation = AutoOrientation::Done;
+            terminal.detected_agent = Some(Agent::Pi);
+            let _ = terminal.set_hook_authority_with_session_ref(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Idle,
+                None,
+                None,
+                Some(old_ref.clone()),
+                Some(1),
+            );
+            assert!(terminal
+                .release_agent_with_mutation("herdr:pi", "pi", Some(2))
+                .is_some());
+        }
+        app.maybe_auto_orient(pane);
+        assert_eq!(sent(&mut rx), "", "quit must not discard the resume guard");
+
+        let resumed = app.state.terminals.get_mut(&terminal_id).unwrap();
+        let _ = resumed.set_hook_authority_with_session_ref(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Idle,
+            None,
+            None,
+            Some(old_ref),
+            Some(3),
+        );
+        app.maybe_auto_orient(pane);
+        assert_eq!(
+            sent(&mut rx),
+            "",
+            "same-session /quit then --session must not submit AUTO_NOTE"
+        );
+        assert_eq!(
+            app.state.terminals[&terminal_id].auto_orientation,
+            AutoOrientation::Done
+        );
+
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        assert!(terminal
+            .release_agent_with_mutation("herdr:pi", "pi", Some(4))
+            .is_some());
+        app.maybe_auto_orient(pane);
+        let fresh = app.state.terminals.get_mut(&terminal_id).unwrap();
+        let _ = fresh.set_hook_authority_with_session_ref(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Idle,
+            None,
+            None,
+            Some(AgentSessionRef::path("/tmp/pi/sessions/two.jsonl").unwrap()),
+            Some(5),
+        );
+        app.maybe_auto_orient(pane);
+        assert!(
+            sent(&mut rx).contains(crate::agent_orientation::AUTO_NOTE),
+            "a distinct new Pi session still gets onboarding"
+        );
+    }
+
+    #[tokio::test]
+    async fn detected_hook_free_successor_after_pi_release_is_oriented_once() {
+        use crate::agent_orientation::{AutoOrientation, OrientationState};
+        use crate::agent_resume::AgentSessionRef;
+        use crate::detect::{Agent, AgentState};
+
+        let (mut app, pane, terminal_id, mut rx) = prompt_app(OrientationState::Delivered);
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.auto_orientation = AutoOrientation::Done;
+        terminal.detected_agent = Some(Agent::Pi);
+        let _ = terminal.set_hook_authority_with_session_ref(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Idle,
+            None,
+            None,
+            Some(AgentSessionRef::path("/tmp/pi/sessions/one.jsonl").unwrap()),
+            Some(1),
+        );
+        assert!(terminal
+            .release_agent_with_mutation("herdr:pi", "pi", Some(2))
+            .is_some());
+        app.maybe_auto_orient(pane);
+
+        observe(
+            &mut app,
+            pane,
+            &terminal_id,
+            Some(Agent::Codex),
+            AgentState::Working,
+        );
+        assert!(app.state.terminals[&terminal_id]
+            .pi_resume_orientation_guard
+            .is_none());
+        assert_eq!(sent(&mut rx), "", "a working successor is not ready yet");
+        observe(
+            &mut app,
+            pane,
+            &terminal_id,
+            Some(Agent::Codex),
+            AgentState::Idle,
+        );
+        assert!(sent(&mut rx).contains(crate::agent_orientation::AUTO_NOTE));
+        observe(
+            &mut app,
+            pane,
+            &terminal_id,
+            Some(Agent::Codex),
+            AgentState::Idle,
+        );
+        assert_eq!(
+            sent(&mut rx),
+            "",
+            "a detected successor gets one orientation"
+        );
     }
 
     #[tokio::test]
@@ -1161,23 +1303,64 @@ mod tests {
             (OrientationState::Delivered, AutoOrientation::Done),
             (OrientationState::Suppressed, AutoOrientation::Done),
         ] {
-            let note = handoff_idle_note(orientation, auto).await;
+            let note = handoff_idle_note(orientation, auto, None, None).await;
             assert!(
                 !note.contains(crate::agent_orientation::AUTO_NOTE),
                 "{orientation:?} already delivered and was sent again: {note}"
             );
         }
-        let note = handoff_idle_note(OrientationState::Suppressed, AutoOrientation::Unarmed).await;
+        let note = handoff_idle_note(
+            OrientationState::Suppressed,
+            AutoOrientation::Unarmed,
+            None,
+            None,
+        )
+        .await;
         assert!(
             note.contains(crate::agent_orientation::AUTO_NOTE),
             "a terminal that never had the note should still get it, got {note:?}"
         );
     }
 
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn handoff_preserves_pi_resume_guard_and_compares_session_path() {
+        use crate::agent_resume::AgentSessionRef;
+        let guard = AgentSessionRef::path("/tmp/pi/sessions/one.jsonl").unwrap();
+        let same = handoff_idle_note(
+            OrientationState::Suppressed,
+            crate::agent_orientation::AutoOrientation::Done,
+            Some(guard.clone()),
+            Some(guard),
+        )
+        .await;
+        assert!(same.is_empty(), "same Pi path must not duplicate AUTO_NOTE");
+
+        let distinct = handoff_idle_note(
+            OrientationState::Suppressed,
+            crate::agent_orientation::AutoOrientation::Done,
+            Some(AgentSessionRef::path("/tmp/pi/sessions/one.jsonl").unwrap()),
+            Some(AgentSessionRef::path("/tmp/pi/sessions/two.jsonl").unwrap()),
+        )
+        .await;
+        assert!(distinct.contains(crate::agent_orientation::AUTO_NOTE));
+
+        let hook_free = handoff_idle_note(
+            OrientationState::Suppressed,
+            crate::agent_orientation::AutoOrientation::Done,
+            Some(AgentSessionRef::path("/tmp/pi/sessions/one.jsonl").unwrap()),
+            None,
+        )
+        .await;
+        assert!(hook_free.contains(crate::agent_orientation::AUTO_NOTE));
+    }
+
     #[cfg(unix)]
     async fn handoff_idle_note(
         orientation: OrientationState,
         auto: crate::agent_orientation::AutoOrientation,
+        guard: Option<crate::agent_resume::AgentSessionRef>,
+        pi_session_report: Option<crate::agent_resume::AgentSessionRef>,
     ) -> String {
         use crate::detect::{Agent, AgentState};
         use std::collections::HashMap;
@@ -1193,6 +1376,12 @@ mod tests {
             .get_mut(&terminal)
             .unwrap()
             .auto_orientation = auto;
+        original
+            .state
+            .terminals
+            .get_mut(&terminal)
+            .unwrap()
+            .pi_resume_orientation_guard = guard;
         let detached = original.state.detached_agents.remove(0);
         original
             .state
@@ -1246,13 +1435,31 @@ mod tests {
         );
         let pane = restored.state.workspaces[0].focused_pane_id().unwrap();
         restored.unpause_handoff_readers();
-        observe(
-            &mut restored,
-            pane,
-            &terminal,
-            Some(Agent::Codex),
-            AgentState::Idle,
-        );
+        if let Some(session_ref) = pi_session_report {
+            let _ = restored
+                .state
+                .terminals
+                .get_mut(&terminal)
+                .unwrap()
+                .set_hook_authority_with_session_ref(
+                    "herdr:pi".into(),
+                    "pi".into(),
+                    AgentState::Idle,
+                    None,
+                    None,
+                    Some(session_ref),
+                    Some(1),
+                );
+            restored.maybe_auto_orient(pane);
+        } else {
+            observe(
+                &mut restored,
+                pane,
+                &terminal,
+                Some(Agent::Codex),
+                AgentState::Idle,
+            );
+        }
         let mut buf = [0u8; 8192];
         let read = tokio::task::spawn_blocking(move || peer.read(&mut buf).map(|n| (n, buf)))
             .await

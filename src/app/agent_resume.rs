@@ -329,7 +329,7 @@ impl App {
                     "failed to start shell for deferred agent resume"
                 );
                 if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                    terminal.clear_agent_runtime_identity_after_respawn();
+                    terminal.clear_failed_deferred_resume();
                 }
                 return false;
             }
@@ -346,6 +346,9 @@ impl App {
                 "failed to send deferred agent resume command to shell"
             );
             runtime.shutdown();
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.clear_failed_deferred_resume();
+            }
             return false;
         }
 

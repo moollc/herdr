@@ -264,6 +264,10 @@ pub struct PaneSnapshot {
     /// drops it. Snapshots from before the field read as unarmed.
     #[serde(default, skip_serializing_if = "auto_orientation_is_unarmed")]
     pub auto_orientation: crate::agent_orientation::AutoOrientation,
+    /// Pi conversation identity used only to suppress duplicate orientation
+    /// after a manual process exit. It is not a live/restorable agent session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_resume_orientation_guard: Option<crate::agent_resume::AgentSessionRef>,
     #[serde(default)]
     pub overseer: crate::overseer::Role,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -660,6 +664,8 @@ fn capture_pane(
         auto_orientation: terminal
             .map(|terminal| terminal.auto_orientation)
             .unwrap_or_default(),
+        pi_resume_orientation_guard: terminal
+            .and_then(|terminal| terminal.pi_resume_orientation_guard.clone()),
         seen: pane.seen,
         completed: pane.completed,
         agent_timing: terminal.and_then(AgentTimingSnapshot::from_terminal),
@@ -858,7 +864,7 @@ mod tests {
     }
 
     #[test]
-    fn orientation_snapshot_roundtrip_and_legacy_default() {
+    fn pi_resume_guard_snapshot_roundtrip_and_legacy_default() {
         let legacy = serde_json::json!({"cwd":"/tmp"});
         let mut pane: PaneSnapshot = serde_json::from_value(legacy).unwrap();
         assert_eq!(
@@ -866,6 +872,15 @@ mod tests {
             crate::agent_orientation::OrientationState::Suppressed
         );
         assert!(pane.auto_orientation.is_unarmed());
+        assert!(pane.pi_resume_orientation_guard.is_none());
+        pane.pi_resume_orientation_guard =
+            Some(crate::agent_resume::AgentSessionRef::path("/tmp/pi/session.jsonl").unwrap());
+        let restored: PaneSnapshot =
+            serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();
+        assert_eq!(
+            restored.pi_resume_orientation_guard,
+            pane.pi_resume_orientation_guard
+        );
         for state in [
             crate::agent_orientation::OrientationState::Pending,
             crate::agent_orientation::OrientationState::Offered,
@@ -956,6 +971,7 @@ mod tests {
                 message_origin: None,
                 overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
+                pi_resume_orientation_guard: None,
                 seen: true,
                 completed: false,
                 agent_timing: None,
@@ -980,6 +996,7 @@ mod tests {
                 message_origin: None,
                 overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
+                pi_resume_orientation_guard: None,
                 seen: true,
                 completed: false,
                 agent_timing: None,
@@ -1580,6 +1597,7 @@ mod tests {
                 message_origin: None,
                 overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
+                pi_resume_orientation_guard: None,
                 seen: true,
                 completed: false,
                 agent_timing: None,
@@ -1606,6 +1624,7 @@ mod tests {
                 message_origin: None,
                 overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
+                pi_resume_orientation_guard: None,
                 seen: true,
                 completed: false,
                 agent_timing: None,

@@ -27,9 +27,9 @@ impl OrientationState {
     }
 }
 
-/// Hook-free startup orientation for agents Herdr only detects, such as ones
-/// typed into a shell. Each new agent process, including one coming back
-/// after a cold restart, is oriented once when it first goes idle.
+/// Hook-free startup orientation for fresh conversations of agents Herdr only
+/// detects, such as ones typed into a shell. A native session resume continues
+/// an existing conversation and is suppressed at its restore boundary.
 /// The session snapshot carries the value so a live handoff keeps it.
 /// A cold restore drops it (`restored(false)`), because that start is a new process.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

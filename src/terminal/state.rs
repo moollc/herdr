@@ -76,6 +76,9 @@ pub struct TerminalState {
     pub job_marker: Option<PathBuf>,
     pub agent_metadata: HashMap<String, AgentMetadata>,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
+    /// Session identity kept briefly across a Pi process exit so a manual
+    /// `pi --session` resume can retain its already-delivered orientation.
+    pub pi_resume_orientation_guard: Option<crate::agent_resume::AgentSessionRef>,
     pub manual_label: Option<String>,
     /// The model this pane is meant to run; see `agent_model::ModelPin`.
     pub model_pin: Option<crate::agent_model::ModelPin>,
@@ -154,6 +157,7 @@ impl TerminalState {
             job_marker: None,
             agent_metadata: HashMap::new(),
             persisted_agent_session: None,
+            pi_resume_orientation_guard: None,
             manual_label: None,
             model_pin: None,
             pending_restart: None,
@@ -494,6 +498,7 @@ impl TerminalState {
         if self.known_agent_label_conflicts_with_detected_agent(&agent_label) {
             return None;
         }
+        self.update_pi_resume_orientation_guard(&source, &agent_label, session_ref.as_ref());
         // An accepted explicit state report must also update native turn authority.
         // Per-source sequence rejection above still protects against replay.
         if state == AgentState::Idle {
@@ -659,6 +664,7 @@ impl TerminalState {
         if self.known_agent_label_conflicts_with_detected_agent(&agent_label) {
             return None;
         }
+        self.update_pi_resume_orientation_guard(&source, &agent_label, Some(&session_ref));
 
         let previous_session = self.current_session_identity_for_persistence();
         self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
@@ -683,6 +689,25 @@ impl TerminalState {
         };
         crate::detect::parse_agent_label(agent_label)
             .is_some_and(|hook_agent| hook_agent != detected_agent)
+    }
+
+    fn update_pi_resume_orientation_guard(
+        &mut self,
+        source: &str,
+        agent_label: &str,
+        session_ref: Option<&crate::agent_resume::AgentSessionRef>,
+    ) {
+        if source == "herdr:pi" && agent_label == "pi" && session_ref.is_none() {
+            return;
+        }
+        let Some(previous_ref) = self.pi_resume_orientation_guard.take() else {
+            return;
+        };
+        if source == "herdr:pi" && agent_label == "pi" && session_ref == Some(&previous_ref) {
+            self.auto_orientation = crate::agent_orientation::AutoOrientation::Done;
+        } else {
+            self.auto_orientation = crate::agent_orientation::AutoOrientation::Unarmed;
+        }
     }
 
     fn accept_hook_report(&mut self, source: &str, seq: Option<u64>) -> bool {
@@ -799,6 +824,26 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
+        let released_pi_session_ref = (source == "herdr:pi"
+            && agent_label == "pi"
+            && self.auto_orientation == crate::agent_orientation::AutoOrientation::Done)
+            .then(|| {
+                self.hook_authority
+                    .as_ref()
+                    .filter(|authority| {
+                        authority.source == source && authority.agent_label == agent_label
+                    })
+                    .and_then(|authority| authority.session_ref.clone())
+                    .or_else(|| {
+                        self.persisted_agent_session
+                            .as_ref()
+                            .filter(|session| {
+                                session.source == source && session.agent == agent_label
+                            })
+                            .map(|session| session.session_ref.clone())
+                    })
+            })
+            .flatten();
         self.turn_reporting = None;
         self.job_marker = None;
         self.detected_agent = None;
@@ -811,6 +856,7 @@ impl TerminalState {
         self.hook_authority = None;
         self.stale_hook_idle_since = None;
         self.persisted_agent_session = None;
+        self.pi_resume_orientation_guard = released_pi_session_ref;
         if previous_session.is_some() {
             self.orientation = crate::agent_orientation::OrientationState::Suppressed;
             self.orientation_offer = None;
@@ -1058,7 +1104,20 @@ impl TerminalState {
         self.launch_argv = None;
         self.respawn_shell_on_exit = false;
         self.pending_agent_resume_plan = None;
+        self.pi_resume_orientation_guard = None;
+        self.auto_orientation = crate::agent_orientation::AutoOrientation::Unarmed;
         self.clear_agent_name();
+    }
+
+    /// Clear failed deferred-resume runtime state while retaining only the
+    /// separately tracked Pi resume guard, never a live session identity.
+    pub fn clear_failed_deferred_resume(&mut self) {
+        let pi_resume_guard = self.pi_resume_orientation_guard.clone();
+        self.clear_agent_runtime_identity_after_respawn();
+        if let Some(guard) = pi_resume_guard {
+            self.pi_resume_orientation_guard = Some(guard);
+            self.auto_orientation = crate::agent_orientation::AutoOrientation::Done;
+        }
     }
 
     pub fn is_agent_terminal(&self) -> bool {
@@ -1282,6 +1341,39 @@ mod tests {
         terminal.orientation = OrientationState::Pending;
         terminal.clear_agent_runtime_identity_after_respawn();
         assert_eq!(terminal.orientation, OrientationState::Suppressed);
+    }
+
+    #[test]
+    fn pi_resume_guard_identity_reset_and_failed_resume_cleanup_stay_coherent() {
+        use crate::agent_orientation::AutoOrientation;
+        let guard = crate::agent_resume::AgentSessionRef::path("/tmp/pi/session.jsonl").unwrap();
+        let mut terminal = test_terminal();
+        terminal.pi_resume_orientation_guard = Some(guard.clone());
+        terminal.auto_orientation = AutoOrientation::Done;
+        terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: guard.clone(),
+        });
+        terminal.clear_agent_runtime_identity_after_respawn();
+        assert!(terminal.pi_resume_orientation_guard.is_none());
+        assert!(terminal.persisted_agent_session.is_none());
+        assert_eq!(terminal.auto_orientation, AutoOrientation::Unarmed);
+
+        terminal.pi_resume_orientation_guard = Some(guard.clone());
+        terminal.auto_orientation = AutoOrientation::Done;
+        terminal.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: guard.clone(),
+        });
+        terminal.clear_failed_deferred_resume();
+        assert_eq!(terminal.pi_resume_orientation_guard, Some(guard));
+        assert_eq!(terminal.auto_orientation, AutoOrientation::Done);
+        assert!(
+            terminal.persisted_agent_session.is_none(),
+            "failure cleanup must not keep guard identity as a live session"
+        );
     }
 
     #[test]

@@ -699,9 +699,21 @@ fn restore_pane(
         startup.restore_plan.clone()
     };
     if let Some(plan) = pending_native_agent_restore {
+        let is_pi_resume = plan.agent == "pi";
         let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
             .with_pending_agent_resume_plan(plan)
             .with_restore_startup();
+        // A native resume continues an existing conversation; never inject the
+        // hook-free startup orientation as an unsolicited prompt on that path.
+        terminal.auto_orientation = crate::agent_orientation::AutoOrientation::Done;
+        if is_pi_resume {
+            terminal.pi_resume_orientation_guard = saved_agent_session
+                .filter(|session| session.source == "herdr:pi" && session.agent == "pi")
+                .map(|session| crate::agent_resume::AgentSessionRef {
+                    kind: session.kind,
+                    value: session.value.clone(),
+                });
+        }
         if let Some(label) = saved_label {
             terminal.set_manual_label(label);
         }
@@ -826,6 +838,11 @@ fn restore_pane(
                 .map(|pane| pane.auto_orientation)
                 .unwrap_or_default()
                 .restored(was_imported);
+            terminal.pi_resume_orientation_guard =
+                saved_pane.and_then(|pane| pane.pi_resume_orientation_guard.clone());
+            if terminal.pi_resume_orientation_guard.is_some() {
+                terminal.auto_orientation = crate::agent_orientation::AutoOrientation::Done;
+            }
             if restarted_saved_command
                 && saved_pane.is_some_and(|pane| {
                     pane.orientation != crate::agent_orientation::OrientationState::Suppressed
@@ -1387,6 +1404,7 @@ mod tests {
                     message_origin: None,
                     overseer: crate::overseer::Role::default(),
                     auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
+                    pi_resume_orientation_guard: None,
                     seen: true,
                     completed: false,
                     agent_timing: None,
@@ -1459,6 +1477,7 @@ mod tests {
                     message_origin: None,
                     overseer: crate::overseer::Role::default(),
                     auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
+                    pi_resume_orientation_guard: None,
                     seen: true,
                     completed: false,
                     agent_timing: None,
@@ -1547,6 +1566,7 @@ mod tests {
                             message_origin: None,
                             overseer: crate::overseer::Role::default(),
                             auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
+                            pi_resume_orientation_guard: None,
                             seen: true,
                             completed: false,
                             agent_timing: None,
@@ -1623,6 +1643,7 @@ mod tests {
                 message_origin: None,
                 overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
+                pi_resume_orientation_guard: None,
                 seen,
                 completed,
                 agent_timing: None,
@@ -1769,6 +1790,7 @@ mod tests {
                             message_origin: None,
                             overseer: crate::overseer::Role::default(),
                             auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
+                            pi_resume_orientation_guard: None,
                             seen: true,
                             completed: false,
                             agent_timing: None,
@@ -1862,6 +1884,7 @@ mod tests {
                             message_origin: None,
                             overseer: crate::overseer::Role::default(),
                             auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
+                            pi_resume_orientation_guard: None,
                             seen: true,
                             completed: false,
                             agent_timing: None,
@@ -1968,6 +1991,7 @@ mod tests {
                     message_origin: None,
                     overseer: crate::overseer::Role::default(),
                     auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
+                    pi_resume_orientation_guard: None,
                     seen: true,
                     completed: false,
                     agent_timing: None,
@@ -2041,10 +2065,10 @@ mod tests {
                             label: None,
                             agent_name: None,
                             agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
-                                source: "herdr:codex".into(),
-                                agent: "codex".into(),
-                                kind: crate::agent_resume::AgentSessionRefKind::Id,
-                                value: "codex-session".into(),
+                                source: "herdr:pi".into(),
+                                agent: "pi".into(),
+                                kind: crate::agent_resume::AgentSessionRefKind::Path,
+                                value: "/tmp/pi/sessions/restore.jsonl".into(),
                             }),
                             launch_argv: None,
                             orientation: crate::agent_orientation::OrientationState::Pending,
@@ -2054,6 +2078,7 @@ mod tests {
                             message_origin: None,
                             overseer: crate::overseer::Role::default(),
                             auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
+                            pi_resume_orientation_guard: None,
                             seen: true,
                             completed: false,
                             agent_timing: None,
@@ -2099,6 +2124,19 @@ mod tests {
             terminal.orientation,
             crate::agent_orientation::OrientationState::Suppressed
         );
+        assert_eq!(
+            terminal.auto_orientation,
+            crate::agent_orientation::AutoOrientation::Done,
+            "resuming a native session must not inject startup orientation"
+        );
+        assert_eq!(
+            terminal.pi_resume_orientation_guard,
+            Some(
+                crate::agent_resume::AgentSessionRef::path("/tmp/pi/sessions/restore.jsonl")
+                    .unwrap()
+            ),
+            "the saved Pi identity is held only in the resume guard"
+        );
         assert!(
             terminal.pending_agent_resume_plan.is_some(),
             "restored native agent panes should defer resume until client terminal context is known"
@@ -2132,10 +2170,87 @@ mod tests {
             handoff_terminal.pending_agent_resume_plan.is_some(),
             "handoff restore should preserve pending native agent resume intent"
         );
+        assert_eq!(
+            handoff_terminal.pi_resume_orientation_guard, terminal.pi_resume_orientation_guard,
+            "handoff preserves Pi path comparison while resume is pending"
+        );
         assert!(
             handoff_runtimes.is_empty(),
             "handoff restore should not replace pending native agent resume with a shell runtime"
         );
+    }
+
+    #[tokio::test]
+    async fn cold_restore_keeps_pi_guard_separate_and_resolves_same_or_new_path() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let mut snapshot = snapshot_with_pane_terminal_ids(cwd, None, None);
+        let saved_guard =
+            crate::agent_resume::AgentSessionRef::path("/tmp/pi/sessions/original.jsonl").unwrap();
+        let saved_pane = snapshot.workspaces[0].tabs[0].panes.get_mut(&0).unwrap();
+        saved_pane.pi_resume_orientation_guard = Some(saved_guard.clone());
+        saved_pane.auto_orientation = crate::agent_orientation::AutoOrientation::Done;
+        let snapshot = serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+
+        let (events, _event_rx) = mpsc::channel(8);
+        let (_workspaces, mut terminals, mut runtimes, _detached) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            "/bin/sh",
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let terminal = terminals
+            .values_mut()
+            .find(|terminal| terminal.pi_resume_orientation_guard.is_some())
+            .expect("cold restore returns the guarded pane");
+        assert_eq!(
+            terminal.pi_resume_orientation_guard,
+            Some(saved_guard.clone())
+        );
+        assert!(terminal.persisted_agent_session.is_none());
+        assert_eq!(
+            terminal.auto_orientation,
+            crate::agent_orientation::AutoOrientation::Done
+        );
+
+        let _ = terminal.set_hook_authority_with_session_ref(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Idle,
+            None,
+            None,
+            Some(saved_guard),
+            Some(1),
+        );
+        assert_eq!(
+            terminal.auto_orientation,
+            crate::agent_orientation::AutoOrientation::Done,
+            "same path after cold restore keeps orientation suppressed"
+        );
+        assert!(terminal
+            .release_agent_with_mutation("herdr:pi", "pi", Some(2))
+            .is_some());
+        let _ = terminal.set_hook_authority_with_session_ref(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Idle,
+            None,
+            None,
+            Some(crate::agent_resume::AgentSessionRef::path("/tmp/pi/sessions/new.jsonl").unwrap()),
+            Some(3),
+        );
+        assert_eq!(
+            terminal.auto_orientation,
+            crate::agent_orientation::AutoOrientation::Unarmed,
+            "a new path after cold restore retains fresh onboarding"
+        );
+        runtimes.clear();
     }
 
     #[tokio::test]
@@ -2235,6 +2350,7 @@ mod tests {
                 message_origin: None,
                 overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
+                pi_resume_orientation_guard: None,
                 seen: true,
                 completed: false,
                 agent_timing: None,
@@ -2308,6 +2424,7 @@ mod tests {
             message_origin: None,
             overseer: crate::overseer::Role::default(),
             auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
+            pi_resume_orientation_guard: None,
             seen: true,
             completed: false,
             agent_timing: None,
