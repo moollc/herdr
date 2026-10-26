@@ -439,8 +439,14 @@ fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
     }
 
     let pane_id = super::normalize_pane_id(&args[0]);
-    let text = args[1..].join(" ");
-    super::send_ok_request(Method::PaneSendText(PaneSendTextParams { pane_id, text }))
+    let routed = parse_routed_text(&args[1..])?;
+    super::send_ok_request(Method::PaneSendText(PaneSendTextParams {
+        pane_id,
+        text: routed.text,
+        origin: routed.origin,
+        correlation_id: routed.correlation_id,
+        task_id: routed.task_id,
+    }))
 }
 
 fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
@@ -461,12 +467,59 @@ fn pane_run(args: &[String]) -> std::io::Result<i32> {
     }
 
     let pane_id = super::normalize_pane_id(&args[0]);
-    let text = args[1..].join(" ");
+    let routed = parse_routed_text(&args[1..])?;
     super::send_ok_request(Method::PaneSendInput(PaneSendInputParams {
         pane_id,
-        text,
+        text: routed.text,
         keys: vec!["Enter".into()],
+        origin: routed.origin,
+        correlation_id: routed.correlation_id,
+        task_id: routed.task_id,
     }))
+}
+
+struct RoutedText {
+    origin: Option<String>,
+    correlation_id: Option<String>,
+    task_id: Option<String>,
+    text: String,
+}
+
+fn parse_routed_text(args: &[String]) -> std::io::Result<RoutedText> {
+    let mut origin = None;
+    let mut correlation_id = None;
+    let mut task_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        let target = match args[index].as_str() {
+            "--origin" => Some(&mut origin),
+            "--correlation" => Some(&mut correlation_id),
+            "--task" => Some(&mut task_id),
+            "--" => {
+                index += 1;
+                break;
+            }
+            _ => break,
+        };
+        let Some(target) = target else {
+            break;
+        };
+        let Some(value) = args.get(index + 1) else {
+            eprintln!("missing value for {}", args[index]);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "missing routed text option",
+            ));
+        };
+        *target = Some(value.clone());
+        index += 2;
+    }
+    Ok(RoutedText {
+        origin,
+        correlation_id,
+        task_id,
+        text: args[index..].join(" "),
+    })
 }
 
 fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {

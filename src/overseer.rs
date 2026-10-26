@@ -168,6 +168,57 @@ pub const MAIL_LIMIT: usize = 8;
 pub const MAIL_LOG: usize = 10;
 pub const MAIL_CHARS: usize = 240;
 
+pub type SessionIdentity = (
+    String,
+    String,
+    crate::agent_resume::AgentSessionRefKind,
+    String,
+);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageOriginKind {
+    Notification,
+    Task,
+}
+
+/// Correlation attached to one checked message submission. The terminal and
+/// native agent session are bound by Herdr at the point of delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageOrigin {
+    pub kind: MessageOriginKind,
+    pub correlation_id: String,
+    pub task_id: Option<String>,
+    pub session: SessionIdentity,
+    #[serde(default)]
+    pub created_at: u64,
+    pub active: bool,
+}
+
+impl MessageOrigin {
+    pub fn result_event(&self, terminal_id: &TerminalId, event: &str) -> Option<String> {
+        if event == "done" && self.kind == MessageOriginKind::Notification {
+            return None;
+        }
+        if event == "done" && self.kind == MessageOriginKind::Task {
+            let (source, agent, kind, session) = &self.session;
+            return Some(format!(
+                "task result task_id={} correlation={} terminal_id={} agent={} session_source={} session_kind={kind:?} session={session}: done",
+                self.task_id.as_deref().unwrap_or(""),
+                self.correlation_id,
+                terminal_id,
+                agent,
+                source,
+            ));
+        }
+        Some(event.to_string())
+    }
+
+    pub fn stale_pending(&self, now: u64) -> bool {
+        !self.active && now.saturating_sub(self.created_at) > 600
+    }
+}
+
 /// What one overseer has been told and has yet to be sent.
 pub struct Holder {
     pub kind: Kind,
@@ -258,6 +309,7 @@ pub struct Service {
     pub turn_ends: HashMap<TerminalId, u64>,
     pub direct_stops: HashMap<TerminalId, DirectStop>,
     pub profile_probes: HashMap<TerminalId, Vec<String>>,
+    pub message_origin_seq: u64,
 }
 impl Service {
     pub fn new(config: &crate::config::Config) -> Self {
@@ -279,6 +331,7 @@ impl Service {
             turn_ends: HashMap::new(),
             direct_stops: HashMap::new(),
             profile_probes: HashMap::new(),
+            message_origin_seq: 0,
         }
     }
     #[cfg(test)]
@@ -546,8 +599,6 @@ pub fn transition(
 ) -> Option<String> {
     if current == AgentState::Blocked && previous != AgentState::Blocked {
         Some(format!("blocked: {}", reason.unwrap_or("needs attention")))
-    } else if previous == AgentState::Working && current == AgentState::Idle {
-        Some("done".into())
     } else if previous != AgentState::Idle
         && current == AgentState::Idle
         && output
@@ -555,6 +606,8 @@ pub fn transition(
             .any(|line| line.trim_start().to_ascii_lowercase().starts_with("error:"))
     {
         Some("idle with an error".into())
+    } else if previous == AgentState::Working && current == AgentState::Idle {
+        Some("done".into())
     } else {
         None
     }
@@ -569,6 +622,70 @@ pub(crate) fn team_queue_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn notification_ack_is_suppressed_but_correlated_task_and_errors_survive() {
+        let session = (
+            "herdr:codex".to_string(),
+            "codex".to_string(),
+            crate::agent_resume::AgentSessionRefKind::Id,
+            "native-session-1".to_string(),
+        );
+        let notification = MessageOrigin {
+            kind: MessageOriginKind::Notification,
+            correlation_id: "event-1".into(),
+            task_id: None,
+            session: session.clone(),
+            created_at: 0,
+            // A fast acknowledgment may finish between collector ticks, before
+            // the pending origin has been promoted to active.
+            active: false,
+        };
+        let terminal_id = TerminalId::alloc();
+        assert_eq!(notification.result_event(&terminal_id, "done"), None);
+        assert_eq!(
+            notification.result_event(&terminal_id, "blocked: sign in"),
+            Some("blocked: sign in".into())
+        );
+        assert_eq!(
+            notification.result_event(&terminal_id, "idle with an error"),
+            Some("idle with an error".into())
+        );
+        let task = MessageOrigin {
+            kind: MessageOriginKind::Task,
+            correlation_id: "request-1".into(),
+            task_id: Some("stage-1".into()),
+            session,
+            created_at: 0,
+            active: false,
+        };
+        let result = task.result_event(&terminal_id, "done").unwrap();
+        assert!(result.contains("task_id=stage-1"));
+        assert!(result.contains("correlation=request-1"));
+        assert!(result.contains("native-session-1"));
+    }
+
+    #[test]
+    fn message_origin_round_trips_with_its_native_session_binding() {
+        let origin = MessageOrigin {
+            kind: MessageOriginKind::Task,
+            correlation_id: "request-2".into(),
+            task_id: Some("stage-2".into()),
+            session: (
+                "herdr:codex".into(),
+                "codex".into(),
+                crate::agent_resume::AgentSessionRefKind::Id,
+                "native-session-2".into(),
+            ),
+            created_at: 1234,
+            active: false,
+        };
+        let saved = serde_json::to_string(&origin).unwrap();
+        let restored: MessageOrigin = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored, origin);
+        assert!(restored.stale_pending(1835));
+        assert!(!restored.stale_pending(1834));
+    }
+
     #[test]
     fn prompt_and_wrapped_secrets_are_never_reported() {
         let screen = "Finished checks\n────────────────\n❯ password top-secret\nwrapped secret\n────────────────\n";
@@ -603,6 +720,15 @@ mod tests {
         assert_eq!(
             transition(AgentState::Working, AgentState::Idle, None, ""),
             Some("done".into())
+        );
+        assert_eq!(
+            transition(
+                AgentState::Working,
+                AgentState::Idle,
+                None,
+                "error: tool failed"
+            ),
+            Some("idle with an error".into())
         );
         assert_eq!(
             transition(

@@ -1073,7 +1073,13 @@ impl App {
                 };
             }
             Command::Type { to, text } => match pane_id(self, &to) {
-                Some(pane_id) => Method::PaneSendText(PaneSendTextParams { pane_id, text }),
+                Some(pane_id) => Method::PaneSendText(PaneSendTextParams {
+                    pane_id,
+                    text,
+                    origin: None,
+                    correlation_id: None,
+                    task_id: None,
+                }),
                 None => return self.commander_trouble(format!("{} is gone", to.label)),
             },
             Command::Keys { to, keys, .. } => match pane_id(self, &to) {

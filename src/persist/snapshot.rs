@@ -270,6 +270,8 @@ pub struct PaneSnapshot {
     pub job_marker: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_reporting: Option<crate::turn_reporting::Reporting>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_origin: Option<crate::overseer::MessageOrigin>,
     /// Whether the finish had been acknowledged. An agent that finished wears
     /// the done marker until its marker is clicked, and clicking it leaves the
     /// check behind until it is clicked again or another run finishes, so both
@@ -647,6 +649,7 @@ fn capture_pane(
         orientation_offer: terminal.and_then(|terminal| terminal.orientation_offer.clone()),
         job_marker: terminal.and_then(|t| t.job_marker.clone()),
         turn_reporting: terminal.and_then(|t| t.turn_reporting.clone()),
+        message_origin: terminal.and_then(|t| t.message_origin.clone()),
         overseer: {
             let mut role = terminal.map(|t| t.overseer.clone()).unwrap_or_default();
             role.input_pending = terminal_runtimes
@@ -950,6 +953,7 @@ mod tests {
                 orientation_offer: None,
                 job_marker: None,
                 turn_reporting: None,
+                message_origin: None,
                 overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen: true,
@@ -973,6 +977,7 @@ mod tests {
                 orientation_offer: None,
                 job_marker: None,
                 turn_reporting: None,
+                message_origin: None,
                 overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen: true,
@@ -1572,6 +1577,7 @@ mod tests {
                 orientation_offer: None,
                 job_marker: None,
                 turn_reporting: None,
+                message_origin: None,
                 overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen: true,
@@ -1597,6 +1603,7 @@ mod tests {
                 orientation_offer: None,
                 job_marker: None,
                 turn_reporting: None,
+                message_origin: None,
                 overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen: true,

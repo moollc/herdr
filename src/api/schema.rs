@@ -457,6 +457,14 @@ pub struct PaneRenameParams {
 pub struct PaneSendTextParams {
     pub pane_id: String,
     pub text: String,
+    /// Provenance for a checked team send. Missing fields retain ordinary
+    /// interactive input behavior for older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -472,6 +480,12 @@ pub struct PaneSendInputParams {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

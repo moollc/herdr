@@ -673,11 +673,21 @@ impl App {
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let origin = match self.message_origin_for_api(
+            pane_id,
+            params.origin.as_deref(),
+            params.correlation_id.as_deref(),
+            params.task_id.as_deref(),
+        ) {
+            Ok(origin) => origin,
+            Err(message) => return encode_error(id, "invalid_message_origin", message),
+        };
         if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text.clone())) {
             return encode_error(id, "pane_send_failed", err.to_string());
         }
         if !params.text.trim().is_empty() {
             self.suppress_pending_orientation(pane_id);
+            self.store_message_origin(pane_id, origin);
         }
 
         encode_success(id, ResponseResult::Ok {})
@@ -691,9 +701,23 @@ impl App {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let origin = match self.message_origin_for_api(
+            pane_id,
+            params.origin.as_deref(),
+            params.correlation_id.as_deref(),
+            params.task_id.as_deref(),
+        ) {
+            Ok(origin) => origin,
+            Err(message) => return encode_error(id, "invalid_message_origin", message),
+        };
         if params.keys.len() == 1 && params.keys[0].eq_ignore_ascii_case("enter") {
             return match self.send_agent_task(pane_id, &params.text) {
-                Ok(()) => encode_success(id, ResponseResult::Ok {}),
+                Ok(()) => {
+                    if !params.text.trim().is_empty() {
+                        self.store_message_origin(pane_id, origin);
+                    }
+                    encode_success(id, ResponseResult::Ok {})
+                }
                 Err((code, message)) => encode_error(
                     id,
                     if code == "agent_send_failed" {
@@ -749,6 +773,7 @@ impl App {
         }
         if !params.text.trim().is_empty() {
             self.suppress_pending_orientation(pane_id);
+            self.store_message_origin(pane_id, origin);
         }
 
         encode_success(id, ResponseResult::Ok {})

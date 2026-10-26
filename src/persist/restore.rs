@@ -710,6 +710,7 @@ fn restore_pane(
             .unwrap_or_default()
             .restored(was_imported);
         terminal.job_marker = saved_pane.and_then(|p| p.job_marker.clone());
+        terminal.message_origin = saved_pane.and_then(|p| p.message_origin.clone());
         terminal.pending_restart = terminal.overseer.pending_restart();
         terminal.model_pin = saved_model_pin;
         if let Some(agent_name) = saved_agent_name {
@@ -855,6 +856,7 @@ fn restore_pane(
                 .unwrap_or_default()
                 .restored(was_imported);
             terminal.job_marker = saved_pane.and_then(|p| p.job_marker.clone());
+            terminal.message_origin = saved_pane.and_then(|p| p.message_origin.clone());
             terminal.pending_restart = terminal.overseer.pending_restart();
             terminal.model_pin = saved_model_pin;
             if let Some(agent_name) = saved_agent_name {
@@ -1382,6 +1384,7 @@ mod tests {
                     orientation_offer: None,
                     job_marker: None,
                     turn_reporting: None,
+                    message_origin: None,
                     overseer: crate::overseer::Role::default(),
                     auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                     seen: true,
@@ -1453,6 +1456,7 @@ mod tests {
                     orientation_offer: None,
                     job_marker: None,
                     turn_reporting: None,
+                    message_origin: None,
                     overseer: crate::overseer::Role::default(),
                     auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                     seen: true,
@@ -1540,6 +1544,7 @@ mod tests {
                             orientation_offer: None,
                             job_marker: None,
                             turn_reporting: None,
+                            message_origin: None,
                             overseer: crate::overseer::Role::default(),
                             auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                             seen: true,
@@ -1615,6 +1620,7 @@ mod tests {
                 orientation_offer: None,
                 job_marker: None,
                 turn_reporting: None,
+                message_origin: None,
                 overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen,
@@ -1760,6 +1766,7 @@ mod tests {
                             orientation_offer: None,
                             job_marker: None,
                             turn_reporting: None,
+                            message_origin: None,
                             overseer: crate::overseer::Role::default(),
                             auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                             seen: true,
@@ -1852,6 +1859,7 @@ mod tests {
                             orientation_offer: None,
                             job_marker: None,
                             turn_reporting: None,
+                            message_origin: None,
                             overseer: crate::overseer::Role::default(),
                             auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                             seen: true,
@@ -1957,6 +1965,7 @@ mod tests {
                     orientation_offer: None,
                     job_marker: None,
                     turn_reporting: None,
+                    message_origin: None,
                     overseer: crate::overseer::Role::default(),
                     auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                     seen: true,
@@ -2042,6 +2051,7 @@ mod tests {
                             orientation_offer: None,
                             job_marker: None,
                             turn_reporting: None,
+                            message_origin: None,
                             overseer: crate::overseer::Role::default(),
                             auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                             seen: true,
@@ -2222,6 +2232,7 @@ mod tests {
                 orientation_offer: None,
                 job_marker: None,
                 turn_reporting: None,
+                message_origin: None,
                 overseer: crate::overseer::Role::default(),
                 auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
                 seen: true,
@@ -2294,6 +2305,7 @@ mod tests {
             orientation_offer: None,
             job_marker: None,
             turn_reporting: None,
+            message_origin: None,
             overseer: crate::overseer::Role::default(),
             auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
             seen: true,

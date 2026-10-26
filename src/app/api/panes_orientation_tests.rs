@@ -294,6 +294,9 @@ async fn external_codex_deepseek_panel_hook_delivers_generated_identity_before_l
             pane_id: app.public_pane_id(0, pane).unwrap(),
             text: task.into(),
             keys: vec!["Enter".into()],
+            origin: None,
+            correlation_id: None,
+            task_id: None,
         },
     );
     assert!(response.contains("result"));
@@ -502,6 +505,9 @@ async fn orientation_navigation_and_empty_input_preserve_pending_and_raw_batches
                 pane_id: address.clone(),
                 text: "literal task".into(),
                 keys: vec!["Enter".into(), "Down".into()],
+                origin: None,
+                correlation_id: None,
+                task_id: None,
             }
         )
         .contains("result"));
@@ -541,6 +547,9 @@ async fn orientation_navigation_and_empty_input_preserve_pending_and_raw_batches
                 pane_id: address,
                 text: "not admitted".into(),
                 keys: vec!["Enter".into(), "Down".into()],
+                origin: None,
+                correlation_id: None,
+                task_id: None,
             }
         )
         .contains("pane_send_failed"));

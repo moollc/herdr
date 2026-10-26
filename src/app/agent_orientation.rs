@@ -936,6 +936,9 @@ mod tests {
                     pane_id: address,
                     text: "follow up".into(),
                     keys: vec!["Enter".into()],
+                    origin: None,
+                    correlation_id: None,
+                    task_id: None,
                 },
             ),
         });

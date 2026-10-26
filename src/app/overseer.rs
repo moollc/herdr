@@ -2,7 +2,9 @@
 use crate::app::{App, AppState};
 use crate::detect::AgentState;
 use crate::layout::PaneId;
-use crate::overseer::{Holder, Kind, PendingEvent, Scope, MAIL_PREFIX};
+use crate::overseer::{
+    Holder, Kind, MessageOrigin, MessageOriginKind, PendingEvent, Scope, MAIL_PREFIX,
+};
 use crate::terminal::TerminalId;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -304,10 +306,109 @@ impl App {
         })
     }
 
-    pub(super) fn send_overseer(&self, id: &TerminalId, text: &str) -> bool {
-        self.terminal_runtimes
+    pub(super) fn send_overseer(&mut self, id: &TerminalId, text: &str) -> bool {
+        let sent = self
+            .terminal_runtimes
             .get(id)
-            .is_some_and(|rt| super::api_helpers::send_prompt(rt, text).is_ok())
+            .is_some_and(|rt| super::api_helpers::send_prompt(rt, text).is_ok());
+        if sent {
+            self.note_internal_notification(id);
+        }
+        sent
+    }
+
+    pub(super) fn message_origin_for_api(
+        &self,
+        pane: PaneId,
+        origin: Option<&str>,
+        correlation_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> Result<Option<MessageOrigin>, String> {
+        let Some(origin) = origin else {
+            return Ok(None);
+        };
+        let kind = match origin {
+            "notification" => MessageOriginKind::Notification,
+            "task" => MessageOriginKind::Task,
+            _ => return Err("origin must be notification or task".into()),
+        };
+        let correlation_id = correlation_id
+            .filter(|value| !value.trim().is_empty() && value.len() <= 256)
+            .ok_or_else(|| "a bounded correlation_id is required for routed sends".to_string())?;
+        let task_id = task_id.filter(|value| !value.trim().is_empty() && value.len() <= 256);
+        if kind == MessageOriginKind::Task && task_id.is_none() {
+            return Err("task origin requires a bounded task_id".into());
+        }
+        let terminal_id = self
+            .state
+            .terminal_id_for_any_pane(pane)
+            .ok_or_else(|| "routed send target has no native terminal identity".to_string())?;
+        let session = self.state.terminals[&terminal_id]
+            .current_session_identity_for_persistence()
+            .ok_or_else(|| "routed send target has no verified native agent session".to_string())?;
+        Ok(Some(MessageOrigin {
+            kind,
+            correlation_id: correlation_id.to_string(),
+            task_id: task_id.map(str::to_string),
+            session,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            active: false,
+        }))
+    }
+
+    pub(super) fn store_message_origin(&mut self, pane: PaneId, origin: Option<MessageOrigin>) {
+        let Some(terminal_id) = self.state.terminal_id_for_any_pane(pane) else {
+            return;
+        };
+        if let Some(origin) = origin {
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.message_origin = Some(origin);
+            }
+        } else if self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.message_origin.as_ref())
+            .is_none_or(|origin| !origin.active)
+        {
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.message_origin = None;
+            }
+        }
+        self.state.mark_session_dirty();
+        self.schedule_session_save();
+    }
+
+    fn note_internal_notification(&mut self, id: &TerminalId) {
+        let Some(session) = self
+            .state
+            .terminals
+            .get(id)
+            .and_then(|terminal| terminal.current_session_identity_for_persistence())
+        else {
+            return;
+        };
+        let mut service = self.overseer_service.message_origin_seq;
+        service = service.wrapping_add(1);
+        self.overseer_service.message_origin_seq = service;
+        if let Some(terminal) = self.state.terminals.get_mut(id) {
+            terminal.message_origin = Some(MessageOrigin {
+                kind: MessageOriginKind::Notification,
+                correlation_id: format!("native-overseer-{id}-{service}"),
+                task_id: None,
+                session,
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                active: false,
+            });
+            self.state.mark_session_dirty();
+            self.schedule_session_save();
+        }
     }
 
     fn space_label(&self, index: usize) -> String {
@@ -449,6 +550,50 @@ impl App {
         let many_spaces = self.state.workspaces.len() > 1;
         let mut queued: Vec<Queued> = Vec::new();
         let mut ended_assignments = Vec::new();
+        let origin_updates: Vec<_> = self
+            .state
+            .terminals
+            .iter()
+            .filter_map(|(id, terminal)| {
+                let origin = terminal.message_origin.as_ref()?;
+                let session = terminal.current_session_identity_for_persistence();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if Some(origin.session.clone()) != session || origin.stale_pending(now) {
+                    return Some((id.clone(), None));
+                }
+                let was_working = self
+                    .overseer_service
+                    .previous
+                    .get(id)
+                    .is_some_and(|(state, _)| *state == AgentState::Working);
+                let was_observed = self.overseer_service.previous.contains_key(id);
+                // A cold restore can resume an agent after its prior turn
+                // finished while Herdr was down. Do not carry that completed
+                // turn's active correlation into the next request.
+                if origin.active && !was_observed && terminal.state != AgentState::Working {
+                    return Some((id.clone(), None));
+                }
+                if terminal.state == AgentState::Working && !was_working && !origin.active {
+                    let mut active = origin.clone();
+                    active.active = true;
+                    return Some((id.clone(), Some(active)));
+                }
+                None
+            })
+            .collect();
+        if !origin_updates.is_empty() {
+            for (id, origin) in origin_updates {
+                if let Some(terminal) = self.state.terminals.get_mut(&id) {
+                    terminal.message_origin = origin;
+                }
+            }
+            self.state.mark_session_dirty();
+            self.schedule_session_save();
+        }
+        let mut finished_origins = Vec::new();
         for (id, terminal) in &self.state.terminals {
             let current_reason = blocked_reason(terminal);
             let old = self
@@ -526,6 +671,20 @@ impl App {
                     &output,
                 )
             };
+            let current_session = terminal.current_session_identity_for_persistence();
+            let turn_finished = terminal.state == AgentState::Idle && previous != AgentState::Idle;
+            let event = event.and_then(|event| {
+                terminal
+                    .message_origin
+                    .as_ref()
+                    .filter(|origin| Some(origin.session.clone()) == current_session)
+                    .map_or(Some(event.clone()), |origin| {
+                        origin.result_event(id, &event)
+                    })
+            });
+            if turn_finished {
+                finished_origins.push(id.clone());
+            }
             let Some(event) = event else {
                 continue;
             };
@@ -554,6 +713,15 @@ impl App {
                 reason: current_reason,
                 marker: reported_end.and(terminal.job_marker.clone()),
             });
+        }
+        if !finished_origins.is_empty() {
+            for id in finished_origins {
+                if let Some(terminal) = self.state.terminals.get_mut(&id) {
+                    terminal.message_origin = None;
+                }
+            }
+            self.state.mark_session_dirty();
+            self.schedule_session_save();
         }
         // Only a HANDOFF-complete turn consumes a registration. Real stops
         // retain it and use per-registration deduplication; later replies do
