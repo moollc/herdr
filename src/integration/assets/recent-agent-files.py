@@ -167,6 +167,20 @@ def _patch_paths(value):
     return paths
 
 
+NESTED_PATCH_HEADER = re.compile(r"\*\*\* (?:Update File|Add File|Move to): ([^\\\r\n\"'`]+)")
+
+
+def _nested_patch_paths(tool_input):
+    """Patch headers inside a code-mode exec source, e.g. tools.apply_patch("*** Update File: x")."""
+    if isinstance(tool_input, dict):
+        source = tool_input.get("input") or tool_input.get("command") or tool_input.get("cmd")
+    else:
+        source = tool_input
+    if not isinstance(source, str) or "apply_patch" not in source or len(source) > MAX_INPUT:
+        return []
+    return [match.strip() for match in NESTED_PATCH_HEADER.findall(source) if match.strip()]
+
+
 def _direct_paths(tool_name, tool_input):
     name = _base_tool_name(tool_name)
     if name in ("apply_patch", "applypatch"):
@@ -220,6 +234,11 @@ def _candidate_paths(provider, event, payload):
         if normalized_name in ("bash", "exec", "exec_command", "shell"):
             candidate = candidate or _shell_has_candidate_write(command)
             paths.extend(_shell_destinations(command))
+        if normalized_name == "exec":
+            nested = _nested_patch_paths(tool_input)
+            if nested:
+                candidate = True
+                paths.extend(nested)
         paths.extend(_direct_paths(tool_name, tool_input))
         if isinstance(tool_input, dict):
             workdir = tool_input.get("workdir")

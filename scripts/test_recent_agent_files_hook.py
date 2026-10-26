@@ -96,6 +96,24 @@ class RecentAgentFilesHookTests(unittest.TestCase):
         self.run_hook("codex", "PostToolUse", {**pre, "tool_response": "done"})
         self.assertEqual([row["path"] for row in self.records() if row.get("path")], [str(path.resolve())])
 
+    def test_code_mode_exec_nested_apply_patch_header_is_captured_as_candidate(self):
+        path = self.cwd / "code-mode-patch.txt"
+        source = ('tools.apply_patch("*** Begin Patch\\n*** Add File: code-mode-patch.txt\\n'
+                  '+fixture\\n*** End Patch")')
+        pre = {"tool_name": "exec", "tool_use_id": "code-mode-exec", "cwd": str(self.cwd),
+               "tool_input": {"input": source}}
+        self.run_hook("codex", "PreToolUse", pre)
+        path.write_text("fixture")
+        self.run_hook("codex", "PostToolUse", {**pre, "tool_response": "done"})
+        self.assertEqual([row["path"] for row in self.records() if row.get("path")], [str(path.resolve())])
+
+    def test_code_mode_exec_without_patch_or_write_is_not_a_candidate(self):
+        pre = {"tool_name": "exec", "tool_use_id": "code-mode-read", "cwd": str(self.cwd),
+               "tool_input": {"input": 'tools.exec_command({cmd: "cat notes.txt"})'}}
+        self.run_hook("codex", "PreToolUse", pre)
+        self.run_hook("codex", "PostToolUse", {**pre, "tool_response": "done"})
+        self.assertEqual(self.records(), [])
+
     def test_failed_codex_tool_that_changed_file_is_recorded_from_observed_change(self):
         path = self.cwd / "partial.txt"
         command = "echo partial > '" + str(path) + "'"
