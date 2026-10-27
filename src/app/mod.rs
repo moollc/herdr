@@ -610,6 +610,7 @@ impl App {
             state_colors: config.ui.state_colors,
             usage_now: 0,
             usage_openrouter_terminals: Default::default(),
+            usage_openrouter_pi_terminals: Default::default(),
             pane_history_persistence: config.experimental.pane_history,
             refresh_summary_with_grok: config.ui.refresh_summary_with_grok,
             hide_attached_agents: config.ui.hide_attached_agents,
@@ -2017,6 +2018,7 @@ mod tests {
             session_file: "/tmp".into(),
             modified: std::time::SystemTime::now(),
             info: None,
+            provider: None,
             title: Some(title.into()),
             title_scanned_len: 0,
         };
@@ -2053,6 +2055,71 @@ mod tests {
             Some("Improve Agent Summary to be useful"),
             "a later probe must not replace the first fill"
         );
+    }
+
+    #[test]
+    fn pi_provider_refresh_routes_only_current_openrouter_session() {
+        let mut app = test_app();
+        let workspace = Workspace::test_new("pi-provider-refresh");
+        let pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.detected_agent = Some(crate::detect::Agent::Pi);
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::path("/tmp/pi/session.jsonl")
+                .unwrap(),
+        });
+        let result = |session_id: &str, provider: Option<&str>| {
+            crate::agent_model::AgentModelRefreshResult {
+                terminal_id: terminal_id.clone(),
+                entry: crate::agent_model::AgentModelCacheEntry {
+                    session_id: session_id.into(),
+                    session_file: session_id.into(),
+                    modified: std::time::SystemTime::now(),
+                    info: None,
+                    provider: provider.map(str::to_owned),
+                    title: None,
+                    title_scanned_len: 0,
+                },
+            }
+        };
+        app.handle_internal_event(AppEvent::AgentModelRefreshed {
+            results: vec![result("/tmp/pi/session.jsonl", Some("openrouter"))],
+        });
+        assert_eq!(
+            crate::ui::usage_bar::providers_present(&app.state),
+            vec![crate::usage::Provider::OpenRouter]
+        );
+
+        app.handle_internal_event(AppEvent::AgentModelRefreshed {
+            results: vec![result("/tmp/pi/session.jsonl", Some("anthropic"))],
+        });
+        assert!(crate::ui::usage_bar::providers_present(&app.state).is_empty());
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:pi".into(),
+                agent: "pi".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::path(
+                    "/tmp/pi/new-session.jsonl",
+                )
+                .unwrap(),
+            });
+        app.handle_internal_event(AppEvent::AgentModelRefreshed {
+            results: vec![result("/tmp/pi/session.jsonl", Some("openrouter"))],
+        });
+        assert!(crate::ui::usage_bar::providers_present(&app.state).is_empty());
     }
 
     #[test]

@@ -829,7 +829,17 @@ impl App {
 
         let mut jobs = Vec::new();
         let mut cleared = false;
+        let mut provider_mapping_cleared = false;
         for (terminal_id, terminal) in self.state.terminals.iter_mut() {
+            let pi_session = terminal.provider_probe_session_path();
+            if !pi_session.as_ref().is_some_and(|session_id| {
+                self.agent_model_cache
+                    .get(terminal_id)
+                    .is_some_and(|entry| entry.session_id == *session_id)
+            }) {
+                provider_mapping_cleared |=
+                    self.state.usage_openrouter_pi_terminals.remove(terminal_id);
+            }
             match terminal.model_probe_session() {
                 Some((agent, session_id)) => {
                     let cached = self
@@ -845,7 +855,23 @@ impl App {
                     });
                 }
                 None => {
+                    if let Some(session_id) = pi_session {
+                        let cached = self
+                            .agent_model_cache
+                            .get(terminal_id)
+                            .filter(|entry| entry.session_id == session_id)
+                            .cloned();
+                        jobs.push(crate::agent_model::AgentModelRefreshJob {
+                            terminal_id: terminal_id.clone(),
+                            agent: crate::detect::Agent::Pi,
+                            session_id,
+                            cached,
+                        });
+                        continue;
+                    }
                     self.agent_model_cache.remove(terminal_id);
+                    provider_mapping_cleared |=
+                        self.state.usage_openrouter_pi_terminals.remove(terminal_id);
                     if terminal.model_info.take().is_some() {
                         cleared = true;
                     }
@@ -854,6 +880,11 @@ impl App {
                     }
                 }
             }
+        }
+
+        if provider_mapping_cleared {
+            self.mark_usage_refresh_due(now);
+            cleared = true;
         }
 
         if jobs.is_empty() {

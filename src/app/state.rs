@@ -2040,6 +2040,8 @@ pub struct AppState {
     pub usage_now: u64,
     /// Terminals whose Codex runs with the OpenRouter home. Set by the usage worker.
     pub usage_openrouter_terminals: std::collections::HashSet<crate::terminal::TerminalId>,
+    /// Pi terminals whose current session metadata names OpenRouter.
+    pub usage_openrouter_pi_terminals: std::collections::HashSet<crate::terminal::TerminalId>,
     pub pane_history_persistence: bool,
     /// Refresh Summary asks a headless `grok -p` session for a 5–8 word
     /// headline. Off, it reads the latest prompt from the session log.
@@ -2517,6 +2519,7 @@ impl AppState {
             state_colors: true,
             usage_now: 0,
             usage_openrouter_terminals: Default::default(),
+            usage_openrouter_pi_terminals: Default::default(),
             pane_history_persistence: false,
             refresh_summary_with_grok: false,
             hide_attached_agents: false,

@@ -650,6 +650,23 @@ impl TerminalState {
         crate::agent_model::probe_supported(agent).then(|| (agent, session_ref.value.clone()))
     }
 
+    /// Pi reports a session file path, rather than an id. The provider probe
+    /// reads model metadata from that exact path in the background.
+    pub fn provider_probe_session_path(&self) -> Option<String> {
+        let (agent_label, session_ref) = if let Some((authority, session_ref)) = self
+            .hook_authority
+            .as_ref()
+            .and_then(|authority| Some((authority, authority.session_ref.as_ref()?)))
+        {
+            (authority.agent_label.as_str(), session_ref)
+        } else {
+            let session = self.persisted_agent_session.as_ref()?;
+            (session.agent.as_str(), &session.session_ref)
+        };
+        (agent_label == "pi" && session_ref.kind == crate::agent_resume::AgentSessionRefKind::Path)
+            .then(|| session_ref.value.clone())
+    }
+
     pub fn set_agent_session_ref(
         &mut self,
         source: String,

@@ -123,11 +123,37 @@ impl App {
             self.agent_model_refresh_in_flight = false;
             self.last_agent_model_refresh = Instant::now();
             let mut changed = false;
+            let mut provider_changed = false;
             for result in results {
                 if let Some(terminal) = self.state.terminals.get_mut(&result.terminal_id) {
+                    let pi_session_current = terminal
+                        .provider_probe_session_path()
+                        .is_some_and(|session_id| session_id == result.entry.session_id);
                     let still_current = terminal
                         .model_probe_session()
-                        .is_some_and(|(_, session_id)| session_id == result.entry.session_id);
+                        .is_some_and(|(_, session_id)| session_id == result.entry.session_id)
+                        || pi_session_current;
+                    if pi_session_current {
+                        let was_openrouter = self
+                            .state
+                            .usage_openrouter_pi_terminals
+                            .contains(&result.terminal_id);
+                        let is_openrouter =
+                            result.entry.provider.as_deref().is_some_and(|provider| {
+                                provider.eq_ignore_ascii_case("openrouter")
+                            });
+                        if is_openrouter {
+                            self.state
+                                .usage_openrouter_pi_terminals
+                                .insert(result.terminal_id.clone());
+                        } else {
+                            self.state
+                                .usage_openrouter_pi_terminals
+                                .remove(&result.terminal_id);
+                        }
+                        provider_changed |= was_openrouter != is_openrouter;
+                        changed |= was_openrouter != is_openrouter;
+                    }
                     if still_current && terminal.model_info != result.entry.info {
                         terminal.model_info = result.entry.info.clone();
                         changed = true;
@@ -146,6 +172,9 @@ impl App {
             if changed {
                 self.render_dirty.store(true, Ordering::Release);
                 self.render_notify.notify_one();
+            }
+            if provider_changed {
+                self.mark_usage_refresh_due(Instant::now());
             }
             return;
         }

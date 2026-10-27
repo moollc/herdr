@@ -88,6 +88,11 @@ pub(crate) fn provider_for_terminal(
     {
         return Some(Provider::OpenRouter);
     }
+    if agent == crate::detect::Agent::Pi
+        && terminal_id.is_some_and(|id| app.usage_openrouter_pi_terminals.contains(id))
+    {
+        return Some(Provider::OpenRouter);
+    }
     provider_for_agent(agent)
 }
 
@@ -867,6 +872,42 @@ mod tests {
             NOW,
         )
         .remove(0)
+    }
+
+    #[test]
+    fn pi_provider_mapping_includes_openrouter_without_changing_codex_mapping() {
+        let mut app = AppState::test_new();
+        let pi_id = crate::terminal::TerminalId::alloc();
+        let codex_id = crate::terminal::TerminalId::alloc();
+        for (id, agent) in [
+            (pi_id.clone(), crate::detect::Agent::Pi),
+            (codex_id.clone(), crate::detect::Agent::Codex),
+        ] {
+            let mut terminal =
+                crate::terminal::TerminalState::new(id.clone(), std::path::PathBuf::from("/tmp"));
+            terminal.detected_agent = Some(agent);
+            app.terminals.insert(id, terminal);
+        }
+        assert_eq!(
+            provider_for_terminal(&app, Some(&pi_id), crate::detect::Agent::Pi),
+            None
+        );
+        assert_eq!(
+            provider_for_terminal(&app, Some(&codex_id), crate::detect::Agent::Codex),
+            Some(Provider::Codex)
+        );
+
+        app.usage_openrouter_pi_terminals.insert(pi_id.clone());
+        app.usage_openrouter_terminals.insert(codex_id.clone());
+        assert_eq!(
+            provider_for_terminal(&app, Some(&pi_id), crate::detect::Agent::Pi),
+            Some(Provider::OpenRouter)
+        );
+        assert_eq!(
+            provider_for_terminal(&app, Some(&codex_id), crate::detect::Agent::Codex),
+            Some(Provider::OpenRouter)
+        );
+        assert_eq!(providers_present(&app), vec![Provider::OpenRouter]);
     }
 
     #[test]
