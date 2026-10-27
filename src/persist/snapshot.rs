@@ -9,7 +9,7 @@ use crate::terminal::TerminalRuntimeRegistry;
 use crate::workspace::Workspace;
 
 /// Current snapshot format version.
-pub(super) const SNAPSHOT_VERSION: u32 = 3;
+pub(super) const SNAPSHOT_VERSION: u32 = 4;
 
 /// Serializable snapshot of the entire herdr session.
 #[derive(Serialize, Deserialize)]
@@ -200,6 +200,13 @@ pub struct WorkspaceSnapshot {
     /// discarded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_order: Vec<usize>,
+    /// Public pane numbers keyed by stable terminal identity, never raw pane ID
+    /// or layout position. Missing entries are allocated above the saved high-water mark.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub public_pane_numbers: HashMap<String, usize>,
+    /// Monotonic number allocator; prevents reuse of numbers belonging to closed panes.
+    #[serde(default)]
+    pub next_public_pane_number: usize,
 }
 
 #[derive(Deserialize)]
@@ -352,6 +359,8 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
             tabs: vec![tab],
             active_tab: 0,
             agent_order: Vec::new(),
+            public_pane_numbers: HashMap::new(),
+            next_public_pane_number: 1,
         }
     }
 }
@@ -578,6 +587,15 @@ fn capture_workspace(
             .collect(),
         active_tab: ws.active_tab,
         agent_order: capture_agent_order(ws),
+        public_pane_numbers: ws
+            .public_pane_numbers
+            .iter()
+            .filter_map(|(pane_id, number)| {
+                ws.terminal_id(*pane_id)
+                    .map(|terminal_id| (terminal_id.to_string(), *number))
+            })
+            .collect(),
+        next_public_pane_number: ws.next_public_pane_number,
     }
 }
 
@@ -806,6 +824,22 @@ mod tests {
     use ratatui::layout::{Direction, Rect};
 
     use super::*;
+
+    #[test]
+    fn public_pane_numbers_snapshot_by_terminal_identity() {
+        let workspace = Workspace::test_new("stable pane ids");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).unwrap().to_string();
+        let captured = capture_workspace(
+            &workspace,
+            &HashMap::new(),
+            &TerminalRuntimeRegistry::default(),
+        );
+        let value = serde_json::to_value(&captured).unwrap();
+        let restored: WorkspaceSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.public_pane_numbers.get(&terminal_id), Some(&1));
+        assert_eq!(restored.next_public_pane_number, 2);
+    }
     use crate::app::{AppState, Mode};
     use crate::layout::NavDirection;
     use crate::workspace::Workspace;
@@ -1015,6 +1049,8 @@ mod tests {
                 identity_cwd: PathBuf::from("/home/can/Projects/herdr"),
                 worktree_space: None,
                 agent_order: Vec::new(),
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 1,
                 tabs: vec![TabSnapshot {
                     goal: None,
                     layout_preview_hidden: false,
@@ -1644,6 +1680,8 @@ mod tests {
                 identity_cwd: PathBuf::from("/tmp"),
                 worktree_space: None,
                 agent_order: Vec::new(),
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 1,
                 tabs: vec![TabSnapshot {
                     goal: None,
                     layout_preview_hidden: false,

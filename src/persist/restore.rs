@@ -388,7 +388,15 @@ fn restore_workspace(
     let mut terminals = Vec::new();
     let mut terminal_runtimes = HashMap::new();
     let mut public_pane_numbers = HashMap::new();
-    let mut next_public_pane_number = 1;
+    let mut next_public_pane_number = snap.next_public_pane_number.max(1).max(
+        snap.public_pane_numbers
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
+    let mut assigned_public_numbers = HashSet::new();
     let mut failed_imports = 0;
 
     for (idx, tab_snap) in snap.tabs.iter().enumerate() {
@@ -408,8 +416,17 @@ fn restore_workspace(
             continue;
         };
         for pane_id in tab.layout.pane_ids() {
-            public_pane_numbers.insert(pane_id, next_public_pane_number);
-            next_public_pane_number += 1;
+            let stable_id = tab.terminal_id(pane_id).map(ToString::to_string);
+            let saved = stable_id
+                .as_ref()
+                .and_then(|id| snap.public_pane_numbers.get(id))
+                .copied();
+            let number = allocate_public_pane_number(
+                saved,
+                &mut assigned_public_numbers,
+                &mut next_public_pane_number,
+            );
+            public_pane_numbers.insert(pane_id, number);
         }
         terminals.extend(restored_terminals);
         terminal_runtimes.extend(restored_runtimes);
@@ -453,6 +470,23 @@ fn restore_workspace(
         .map(|workspace| (workspace, terminals, terminal_runtimes)),
         failed_imports,
     )
+}
+
+fn allocate_public_pane_number(
+    saved: Option<usize>,
+    assigned: &mut HashSet<usize>,
+    next: &mut usize,
+) -> usize {
+    if let Some(number) = saved.filter(|number| *number > 0 && assigned.insert(*number)) {
+        return number;
+    }
+    while assigned.contains(next) {
+        *next = next.saturating_add(1);
+    }
+    let number = *next;
+    assigned.insert(number);
+    *next = next.saturating_add(1);
+    number
 }
 
 /// Rebuild a space's custom agent order from saved natural-order positions.
@@ -1135,6 +1169,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn duplicate_saved_public_numbers_allocate_unique_fallback() {
+        let mut assigned = HashSet::new();
+        let mut next = 9;
+        assert_eq!(
+            allocate_public_pane_number(Some(7), &mut assigned, &mut next),
+            7
+        );
+        assert_eq!(
+            allocate_public_pane_number(Some(7), &mut assigned, &mut next),
+            9
+        );
+        assert_eq!(
+            allocate_public_pane_number(None, &mut assigned, &mut next),
+            10
+        );
+        assert_eq!(assigned, HashSet::from([7, 9, 10]));
+    }
+
+    #[test]
     fn capture_and_restore_node_round_trip() {
         let node = Node::Split {
             direction: Direction::Horizontal,
@@ -1545,6 +1598,8 @@ mod tests {
                 custom_name: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
+                public_pane_numbers: HashMap::from([(terminal_id.to_string(), 7)]),
+                next_public_pane_number: 11,
                 tabs: vec![TabSnapshot {
                     goal: None,
                     layout_preview_hidden: false,
@@ -1591,7 +1646,7 @@ mod tests {
         };
         let (events, _event_rx) = mpsc::channel(4);
 
-        let (workspaces, terminals, runtimes, detached) = restore(
+        let (mut workspaces, terminals, runtimes, detached) = restore(
             &snapshot,
             None,
             24,
@@ -1606,6 +1661,17 @@ mod tests {
         );
 
         assert_eq!(workspaces.len(), 1);
+        assert_eq!(
+            workspaces[0]
+                .public_pane_numbers
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![7]
+        );
+        assert_eq!(workspaces[0].next_public_pane_number, 11);
+        let added = workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        assert_eq!(workspaces[0].public_pane_numbers[&added], 11);
         assert!(detached.is_empty());
         assert_eq!(
             terminals
@@ -1661,6 +1727,11 @@ mod tests {
                 custom_name: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
+                public_pane_numbers: HashMap::from([
+                    (acknowledged.to_string(), 8),
+                    (finished.to_string(), 3),
+                ]),
+                next_public_pane_number: 10,
                 tabs: vec![TabSnapshot {
                     goal: None,
                     layout_preview_hidden: false,
@@ -1706,6 +1777,17 @@ mod tests {
         );
 
         let panes = &workspaces[0].tabs[0].panes;
+        let number_for = |terminal_id: &TerminalId| {
+            let pane_id = panes
+                .iter()
+                .find(|(_, pane)| pane.attached_terminal_id == *terminal_id)
+                .map(|(pane_id, _)| *pane_id)
+                .expect("restored pane");
+            workspaces[0].public_pane_numbers[&pane_id]
+        };
+        assert_eq!(number_for(&acknowledged), 8);
+        assert_eq!(number_for(&finished), 3);
+        assert_eq!(workspaces[0].next_public_pane_number, 10);
         let marker = |terminal_id: &TerminalId| {
             panes
                 .values()
@@ -1764,6 +1846,8 @@ mod tests {
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
                 agent_order: Vec::new(),
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 1,
                 tabs: vec![TabSnapshot {
                     goal: None,
                     layout_preview_hidden: false,
@@ -1858,6 +1942,8 @@ mod tests {
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
                 agent_order: Vec::new(),
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 1,
                 tabs: vec![TabSnapshot {
                     goal: None,
                     layout_preview_hidden: false,
@@ -2052,6 +2138,8 @@ mod tests {
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
                 agent_order: Vec::new(),
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 1,
                 tabs: vec![TabSnapshot {
                     goal: None,
                     layout_preview_hidden: false,
@@ -2383,6 +2471,8 @@ mod tests {
                 identity_cwd: cwd,
                 worktree_space: None,
                 agent_order: Vec::new(),
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 1,
                 tabs: vec![TabSnapshot {
                     goal: None,
                     layout_preview_hidden: false,
@@ -2442,6 +2532,8 @@ mod tests {
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
                 agent_order: Vec::new(),
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 1,
                 tabs: vec![TabSnapshot {
                     goal: None,
                     layout_preview_hidden: false,

@@ -140,8 +140,8 @@ pub struct Workspace {
     pub(crate) pane_git_statuses: HashMap<PaneId, WorkspaceGitStatusSnapshot>,
     /// Explicit Herdr-managed worktree grouping provenance.
     pub worktree_space: Option<WorktreeSpaceMembership>,
-    /// Stable-ish public pane numbers within this workspace.
-    /// New panes append at the end; closing a pane compacts higher numbers down.
+    /// Stable public pane numbers within this workspace. Numbers are never reused,
+    /// including across persistence restore and native handoff.
     pub public_pane_numbers: HashMap<PaneId, usize>,
     pub(crate) next_public_pane_number: usize,
     /// User-chosen order for this space's agent rows in the sidebar. Display
@@ -948,14 +948,7 @@ impl Workspace {
     fn unregister_pane(&mut self, pane_id: PaneId) {
         self.pane_git_statuses.remove(&pane_id);
         self.agent_order.retain(|id| *id != pane_id);
-        if let Some(removed_number) = self.public_pane_numbers.remove(&pane_id) {
-            for number in self.public_pane_numbers.values_mut() {
-                if *number > removed_number {
-                    *number -= 1;
-                }
-            }
-            self.next_public_pane_number = self.public_pane_numbers.len() + 1;
-        }
+        self.public_pane_numbers.remove(&pane_id);
     }
 
     fn renumber_tabs(&mut self) {
@@ -1067,6 +1060,23 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_pane_numbers_survive_close_without_reuse() {
+        let mut ws = Workspace::test_new("stable numbers");
+        let first = ws.tabs[0].root_pane;
+        let second = ws.test_split(Direction::Horizontal);
+        assert_eq!(ws.public_pane_numbers[&first], 1);
+        assert_eq!(ws.public_pane_numbers[&second], 2);
+
+        assert!(!ws.close_pane(second));
+        assert_eq!(ws.public_pane_numbers[&first], 1);
+        assert_eq!(ws.next_public_pane_number, 3);
+
+        let third = ws.test_split(Direction::Horizontal);
+        assert_eq!(ws.public_pane_numbers[&third], 3);
+        assert_eq!(ws.public_pane_numbers.len(), 2);
+    }
 
     #[test]
     fn workspace_identity_follows_first_tab_root_pane_cwd() {
