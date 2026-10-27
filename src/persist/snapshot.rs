@@ -9,7 +9,7 @@ use crate::terminal::TerminalRuntimeRegistry;
 use crate::workspace::Workspace;
 
 /// Current snapshot format version.
-pub(super) const SNAPSHOT_VERSION: u32 = 4;
+pub(super) const SNAPSHOT_VERSION: u32 = 3;
 
 /// Serializable snapshot of the entire herdr session.
 #[derive(Serialize, Deserialize)]
@@ -824,6 +824,149 @@ mod tests {
     use ratatui::layout::{Direction, Rect};
 
     use super::*;
+
+    // Frozen reader contract from rollback source 487f0fe: version 3 is the
+    // highest on-disk format accepted, workspaces are first read as raw JSON,
+    // and serde ignores fields unknown to that reader. Keep these small types
+    // intentionally limited to the persisted records needed by this test.
+    mod frozen_v3_reader {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        use serde::Deserialize;
+
+        const SNAPSHOT_VERSION: u32 = 3;
+
+        #[derive(Deserialize)]
+        pub struct Session {
+            pub version: u32,
+            pub workspaces: Vec<serde_json::Value>,
+        }
+
+        #[derive(Deserialize)]
+        pub struct Workspace {
+            pub identity_cwd: PathBuf,
+            pub tabs: Vec<Tab>,
+        }
+
+        #[derive(Deserialize)]
+        pub struct Tab {
+            pub layout: super::super::LayoutSnapshot,
+            pub panes: HashMap<u32, Pane>,
+            pub zoomed: bool,
+        }
+
+        #[derive(Deserialize)]
+        pub struct Pane {
+            #[serde(default)]
+            pub terminal_id: Option<String>,
+            pub cwd: PathBuf,
+        }
+
+        #[derive(Deserialize)]
+        pub struct History {
+            pub version: u32,
+            pub workspaces: Vec<HistoryWorkspace>,
+        }
+
+        #[derive(Deserialize)]
+        pub struct HistoryWorkspace {
+            pub tabs: Vec<HistoryTab>,
+        }
+
+        #[derive(Deserialize)]
+        pub struct HistoryTab {
+            pub panes: HashMap<u32, PaneHistory>,
+        }
+
+        #[derive(Deserialize)]
+        pub struct PaneHistory {
+            pub ansi: String,
+            pub lines: usize,
+        }
+
+        pub fn read_session(document: &str) -> Result<Session, String> {
+            let snapshot: Session = serde_json::from_str(document).map_err(|e| e.to_string())?;
+            if snapshot.version > SNAPSHOT_VERSION {
+                return Err(format!(
+                    "snapshot version {} is newer than supported {}",
+                    snapshot.version, SNAPSHOT_VERSION
+                ));
+            }
+            Ok(snapshot)
+        }
+
+        pub fn read_workspace(value: serde_json::Value) -> Result<Workspace, String> {
+            serde_json::from_value(value).map_err(|e| e.to_string())
+        }
+
+        pub fn read_history(document: &str) -> Result<History, String> {
+            let snapshot: History = serde_json::from_str(document).map_err(|e| e.to_string())?;
+            if snapshot.version > SNAPSHOT_VERSION {
+                return Err(format!(
+                    "history snapshot version {} is newer than supported {}",
+                    snapshot.version, SNAPSHOT_VERSION
+                ));
+            }
+            Ok(snapshot)
+        }
+    }
+
+    #[tokio::test]
+    async fn v3_saved_session_and_history_load_in_frozen_rollback_reader() {
+        let state = state_with_workspaces(&["v3-rollback-compat"]);
+        let workspace = &state.workspaces[0];
+        let root = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.tabs[0].panes[&root]
+            .attached_terminal_id
+            .to_string();
+        let expected_cwd = workspace.identity_cwd.clone();
+        let mut runtimes = TerminalRuntimeRegistry::new();
+        runtimes.insert(
+            workspace.tabs[0].panes[&root].attached_terminal_id.clone(),
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                20,
+                3,
+                4096,
+                b"rollback-v3-history-line\r\n",
+            ),
+        );
+
+        let saved_session =
+            serde_json::to_string(&capture_from_state_with_runtimes(&state, &runtimes)).unwrap();
+        assert_eq!(snapshot_file_version(&saved_session), Some(3));
+        let saved_workspace: serde_json::Value = serde_json::from_str(&saved_session).unwrap();
+        let saved_workspace = &saved_workspace["workspaces"][0];
+        assert_eq!(saved_workspace["public_pane_numbers"][&terminal_id], 1);
+        assert_eq!(saved_workspace["next_public_pane_number"], 2);
+
+        let old_reader_session = frozen_v3_reader::read_session(&saved_session).unwrap();
+        assert_eq!(old_reader_session.version, 3);
+        assert_eq!(old_reader_session.workspaces.len(), 1);
+        let old_workspace = frozen_v3_reader::read_workspace(
+            old_reader_session.workspaces.into_iter().next().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(old_workspace.identity_cwd, expected_cwd);
+        assert_eq!(old_workspace.tabs.len(), 1);
+        assert!(!old_workspace.tabs[0].zoomed);
+        assert!(matches!(
+            old_workspace.tabs[0].layout,
+            LayoutSnapshot::Pane(_)
+        ));
+        let old_pane = old_workspace.tabs[0].panes.values().next().unwrap();
+        assert_eq!(old_pane.terminal_id.as_deref(), Some(terminal_id.as_str()));
+        assert_eq!(old_pane.cwd, expected_cwd);
+
+        let saved_history =
+            serde_json::to_string(&capture_history_from_state_with_runtimes(&state, &runtimes))
+                .unwrap();
+        let old_reader_history = frozen_v3_reader::read_history(&saved_history).unwrap();
+        assert_eq!(old_reader_history.version, 3);
+        let old_history = &old_reader_history.workspaces[0].tabs[0].panes[&root.raw()];
+        assert!(old_history.ansi.contains("rollback-v3-history-line"));
+        assert!(old_history.lines >= 1);
+    }
 
     #[test]
     fn public_pane_numbers_snapshot_by_terminal_identity() {
