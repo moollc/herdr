@@ -188,6 +188,9 @@ pub(crate) fn recent_file_viewport(app: &AppState) -> Option<(u16, usize)> {
     if y > area.y + 1 && y < area.bottom() {
         y += 1;
     }
+    if app.recent_files.error.is_some() && y < area.bottom() {
+        y += 1;
+    }
     let first_file_row = y.saturating_add(1);
     (first_file_row < area.bottom())
         .then_some((first_file_row, (area.bottom() - first_file_row) as usize))
@@ -364,79 +367,85 @@ pub(super) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
                         Paragraph::new(" reading agent activity…").style(dim),
                         Rect::new(content.x, y, content.width, 1),
                     );
-                } else if let Some(error) = &app.recent_files.error {
-                    frame.render_widget(
-                        Paragraph::new(fit(error, content.width as usize)).style(dim),
-                        Rect::new(content.x, y, content.width, 1),
-                    );
-                } else if app.recent_files.files.is_empty() {
-                    frame.render_widget(
-                        Paragraph::new(" no captured agent files").style(dim),
-                        Rect::new(content.x, y, content.width, 1),
-                    );
                 } else {
-                    let visible = area.bottom().saturating_sub(y) as usize;
-                    let start = app
-                        .recent_files
-                        .scroll_offset
-                        .min(app.recent_files.files.len().saturating_sub(1));
-                    for (offset, file) in app
-                        .recent_files
-                        .files
-                        .iter()
-                        .skip(start)
-                        .take(visible)
-                        .enumerate()
-                    {
-                        let line_y = y + offset as u16;
-                        let selected = app.recent_files.keyboard_focus
-                            && app.recent_files.selected == Some(start + offset);
-                        let prefix = if selected { "› " } else { "  " };
-                        let now =
-                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(app.usage_now);
-                        let age = crate::recent_files::age(file.modified, now);
-                        let width = content.width as usize;
-                        // Keep the path readable in a narrow sidebar. The
-                        // provider label appears when there is room for it.
-                        let suffix = if width >= 32 {
-                            format!(" {age} {}", file.agent)
-                        } else {
-                            format!(" {age}")
-                        };
-                        let available = width.saturating_sub(prefix.width() + suffix.width());
-                        let filename = crate::recent_files::display_name(&file.path, available);
-                        let root = app
-                            .recent_files
-                            .root
-                            .as_deref()
-                            .unwrap_or(std::path::Path::new(""));
-                        let relative = file.path.strip_prefix(root).unwrap_or(&file.path);
-                        let parent = relative
-                            .parent()
-                            .filter(|path| !path.as_os_str().is_empty())
-                            .map(|path| format!(" {}", path.display()))
-                            .unwrap_or_default();
-                        let parent = fit(&parent, available.saturating_sub(filename.width()));
-                        let name_style = if selected {
-                            Style::default()
-                                .fg(app.palette.accent)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(app.palette.text)
-                        };
-                        let mut spans = vec![
-                            Span::raw(prefix),
-                            Span::styled(filename, name_style),
-                            Span::styled(parent, dim),
-                            Span::styled(suffix, dim),
-                        ];
-                        if app.recent_files.truncated && offset + 1 == visible {
-                            spans.push(Span::styled(" …", dim));
-                        }
+                    if let Some(error) = &app.recent_files.error {
                         frame.render_widget(
-                            Paragraph::new(Line::from(spans)),
-                            Rect::new(content.x, line_y, content.width, 1),
+                            Paragraph::new(fit(error, content.width as usize)).style(dim),
+                            Rect::new(content.x, y, content.width, 1),
                         );
+                        y += 1;
+                    }
+                    if app.recent_files.files.is_empty() {
+                        if app.recent_files.error.is_none() {
+                            frame.render_widget(
+                                Paragraph::new(" no captured agent files").style(dim),
+                                Rect::new(content.x, y, content.width, 1),
+                            );
+                        }
+                    } else if y < area.bottom() {
+                        let visible = area.bottom().saturating_sub(y) as usize;
+                        let start = app
+                            .recent_files
+                            .scroll_offset
+                            .min(app.recent_files.files.len().saturating_sub(1));
+                        for (offset, file) in app
+                            .recent_files
+                            .files
+                            .iter()
+                            .skip(start)
+                            .take(visible)
+                            .enumerate()
+                        {
+                            let line_y = y + offset as u16;
+                            let selected = app.recent_files.keyboard_focus
+                                && app.recent_files.selected == Some(start + offset);
+                            let prefix = if selected { "› " } else { "  " };
+                            let now = std::time::UNIX_EPOCH
+                                + std::time::Duration::from_secs(app.usage_now);
+                            let age = crate::recent_files::age(file.modified, now);
+                            let width = content.width as usize;
+                            // Keep the path readable in a narrow sidebar. The
+                            // provider label appears when there is room for it.
+                            let suffix = if width >= 32 {
+                                format!(" {age} {}", file.agent)
+                            } else {
+                                format!(" {age}")
+                            };
+                            let available = width.saturating_sub(prefix.width() + suffix.width());
+                            let filename = crate::recent_files::display_name(&file.path, available);
+                            let root = app
+                                .recent_files
+                                .root
+                                .as_deref()
+                                .unwrap_or(std::path::Path::new(""));
+                            let relative = file.path.strip_prefix(root).unwrap_or(&file.path);
+                            let parent = relative
+                                .parent()
+                                .filter(|path| !path.as_os_str().is_empty())
+                                .map(|path| format!(" {}", path.display()))
+                                .unwrap_or_default();
+                            let parent = fit(&parent, available.saturating_sub(filename.width()));
+                            let name_style = if selected {
+                                Style::default()
+                                    .fg(app.palette.accent)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(app.palette.text)
+                            };
+                            let mut spans = vec![
+                                Span::raw(prefix),
+                                Span::styled(filename, name_style),
+                                Span::styled(parent, dim),
+                                Span::styled(suffix, dim),
+                            ];
+                            if app.recent_files.truncated && offset + 1 == visible {
+                                spans.push(Span::styled(" …", dim));
+                            }
+                            frame.render_widget(
+                                Paragraph::new(Line::from(spans)),
+                                Rect::new(content.x, line_y, content.width, 1),
+                            );
+                        }
                     }
                 }
             }
@@ -846,5 +855,77 @@ mod tests {
             )
             .expect("write rendered UI capture");
         }
+    }
+
+    #[test]
+    fn partial_recent_files_error_keeps_valid_rows_rendered_and_selectable() {
+        let mut app = state();
+        app.recent_files = crate::recent_files::RecentFilesSnapshot {
+            root: Some("/project".into()),
+            files: ["/project/reports/first.md", "/project/reports/second.html"]
+                .into_iter()
+                .map(|path| crate::recent_files::RecentFile {
+                    path: path.into(),
+                    modified: std::time::SystemTime::now(),
+                    agent: "codex".into(),
+                })
+                .collect(),
+            truncated: true,
+            error: Some("Partial activity: some records could not be read".into()),
+            selected: Some(1),
+            keyboard_focus: true,
+            ..Default::default()
+        };
+
+        let buf = draw(&mut app, 160, 24);
+        let area = app.view.tasks_rect;
+        let rendered = text(&buf);
+        assert!(rendered.contains("agent files · partial"));
+        let rendered_lines = (area.y..area.bottom())
+            .map(|row| {
+                (area.x..area.right())
+                    .map(|x| buf[(x, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(rendered_lines
+            .iter()
+            .any(|line| line.contains("Partial activity")));
+        assert!(rendered.contains("first.md"));
+        assert!(rendered.contains("second.html"));
+        assert_eq!(
+            crate::recent_files::selected_for_open(&app.recent_files),
+            Some(1)
+        );
+
+        let selected_row = (area.y..area.bottom())
+            .find(|row| {
+                (area.x..area.right())
+                    .map(|x| buf[(x, *row)].symbol())
+                    .collect::<String>()
+                    .contains("second.html")
+            })
+            .expect("second captured row should render");
+        assert_eq!(recent_file_at(&app, area.x + 1, selected_row), Some(1));
+        let selected_line = (area.x..area.right())
+            .map(|x| buf[(x, selected_row)].symbol())
+            .collect::<String>();
+        assert!(selected_line.contains("› second.html"), "{selected_line}");
+
+        app.recent_files.files.clear();
+        let error_only = draw(&mut app, 160, 24);
+        let error_lines = (area.y..area.bottom())
+            .map(|row| {
+                (area.x..area.right())
+                    .map(|x| error_only[(x, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(error_lines
+            .iter()
+            .any(|line| line.contains("Partial activity")));
+        let error_only = text(&error_only);
+        assert!(!error_only.contains("no captured agent files"));
+        assert!(!error_only.contains("second.html"));
     }
 }
