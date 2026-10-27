@@ -2019,6 +2019,8 @@ mod tests {
             modified: std::time::SystemTime::now(),
             info: None,
             provider: None,
+            provider_scanned_len: 0,
+            provider_file_identity: None,
             title: Some(title.into()),
             title_scanned_len: 0,
         };
@@ -2086,6 +2088,8 @@ mod tests {
                     modified: std::time::SystemTime::now(),
                     info: None,
                     provider: provider.map(str::to_owned),
+                    provider_scanned_len: 0,
+                    provider_file_identity: None,
                     title: None,
                     title_scanned_len: 0,
                 },

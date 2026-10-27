@@ -77,6 +77,10 @@ pub struct AgentModelCacheEntry {
     pub info: Option<AgentModelInfo>,
     /// Provider from Pi's latest model_change event, when available.
     pub provider: Option<String>,
+    /// Last complete byte of the Pi log scanned for provider metadata.
+    pub provider_scanned_len: u64,
+    /// Detects an atomically replaced Pi session file at the same path.
+    pub provider_file_identity: Option<(u64, u64)>,
     /// A title read out of the session log, for harnesses that never report
     /// one themselves. `None` for a harness whose integration announces its
     /// own title, so a probe can never overwrite what the harness said.
@@ -127,11 +131,17 @@ fn refresh_job(job: AgentModelRefreshJob) -> Option<AgentModelRefreshResult> {
     } else {
         fs::metadata(&session_file).ok()?.modified().ok()?
     };
-    if job
-        .cached
-        .as_ref()
-        .is_some_and(|cached| cached.session_file == session_file && cached.modified == modified)
-    {
+    let metadata = fs::metadata(&session_file).ok()?;
+    let pi_identity = (job.agent == Agent::Pi)
+        .then(|| pi_session_file_identity(&metadata))
+        .flatten();
+    if job.cached.as_ref().is_some_and(|cached| {
+        cached.session_file == session_file
+            && cached.modified == modified
+            && (job.agent != Agent::Pi
+                || (cached.provider_scanned_len == metadata.len()
+                    && cached.provider_file_identity == pi_identity))
+    }) {
         return None;
     }
 
@@ -139,7 +149,11 @@ fn refresh_job(job: AgentModelRefreshJob) -> Option<AgentModelRefreshResult> {
         return refresh_grok_job(job, session_file, modified);
     }
 
-    let tail = read_tail(&session_file, TAIL_READ_BYTES).ok()?;
+    let tail = if job.agent == Agent::Pi {
+        String::new()
+    } else {
+        read_tail(&session_file, TAIL_READ_BYTES).ok()?
+    };
     let info = match job.agent {
         Agent::Claude => parse_claude_transcript_tail(&tail),
         Agent::Codex => parse_codex_rollout_tail(&tail),
@@ -160,7 +174,13 @@ fn refresh_job(job: AgentModelRefreshJob) -> Option<AgentModelRefreshResult> {
         ),
         _ => (None, 0),
     };
-    let title = title.or_else(|| job.cached.and_then(|cached| cached.title));
+    let title = title.or_else(|| job.cached.as_ref().and_then(|cached| cached.title.clone()));
+
+    let (provider, provider_scanned_len, provider_file_identity) = if job.agent == Agent::Pi {
+        scan_pi_provider(&session_file, job.cached.as_ref())?
+    } else {
+        (None, 0, None)
+    };
 
     Some(AgentModelRefreshResult {
         terminal_id: job.terminal_id,
@@ -169,9 +189,9 @@ fn refresh_job(job: AgentModelRefreshJob) -> Option<AgentModelRefreshResult> {
             session_file,
             modified,
             info,
-            provider: (job.agent == Agent::Pi)
-                .then(|| parse_pi_provider_tail(&tail))
-                .flatten(),
+            provider,
+            provider_scanned_len,
+            provider_file_identity,
             title,
             title_scanned_len,
         },
@@ -205,18 +225,58 @@ fn valid_pi_session_path(session_path: &str) -> bool {
         && !session_path.contains('\0')
 }
 
-/// Pi records the active provider in model_change entries. Only that
-/// metadata is read; an unrecognized or missing provider clears routing.
-fn parse_pi_provider_tail(tail: &str) -> Option<String> {
+/// Pi provider metadata is scanned from the beginning on a cold probe, then
+/// only from the last complete line on each append. A truncated or replaced
+/// file restarts at byte zero rather than inheriting stale provider state.
+fn scan_pi_provider(
+    path: &Path,
+    cached: Option<&AgentModelCacheEntry>,
+) -> Option<(Option<String>, u64, Option<(u64, u64)>)> {
+    let metadata = fs::metadata(path).ok()?;
+    let identity = pi_session_file_identity(&metadata);
+    let cached_matches = cached.filter(|entry| {
+        entry.session_file == path
+            && entry.provider_file_identity == identity
+            && entry.provider_scanned_len <= metadata.len()
+    });
+    let start = cached_matches.map_or(0, |entry| entry.provider_scanned_len);
+    let previous = cached_matches.and_then(|entry| entry.provider.clone());
+    if start == metadata.len() {
+        return Some((previous, start, identity));
+    }
+    let chunk = read_from(path, start).ok()?;
+    let complete_len = chunk.rfind('\n').map_or(0, |end| end + 1);
+    let complete = &chunk[..complete_len];
+    let scanned = start + complete_len as u64;
+    let provider = latest_pi_provider_event(complete).unwrap_or(previous);
+    Some((provider, scanned, identity))
+}
+
+#[cfg(unix)]
+fn pi_session_file_identity(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn pi_session_file_identity(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// `Some(None)` means a model_change record exists without a usable provider,
+/// so it clears the previous provider. `None` means no complete record.
+fn latest_pi_provider_event(tail: &str) -> Option<Option<String>> {
     for line in tail.lines().rev() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
         if value.get("type").and_then(serde_json::Value::as_str) == Some("model_change") {
-            return value
-                .get("provider")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned);
+            return Some(
+                value
+                    .get("provider")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            );
         }
     }
     None
@@ -260,6 +320,8 @@ fn refresh_grok_job(
             modified,
             info,
             provider: None,
+            provider_scanned_len: 0,
+            provider_file_identity: None,
             title,
             title_scanned_len,
         },
@@ -1374,7 +1436,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pi_openrouter_provider_refresh_reads_latest_real_shaped_model_change() {
+    fn pi_openrouter_provider_refresh_scans_cold_history_and_incremental_updates() {
         let root = std::env::temp_dir().join(format!(
             "herdr-agent-model-pi-{}-{}",
             std::process::id(),
@@ -1385,14 +1447,18 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("session.jsonl");
-        fs::write(
-            &path,
-            concat!(
-                "{\"type\":\"model_change\",\"provider\":\"openrouter\",\"modelId\":\"nvidia/nemotron-3-ultra-550b-a55b:free\"}\n",
-                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\"}}\n"
-            ),
+        let long_output = format!(
+            "{}\n",
+            r#"{"type":"message","message":{"role":"assistant","content":"large but valid output"}}"#
         )
-        .unwrap();
+        .repeat((TAIL_READ_BYTES as usize / 80) + 100);
+        let openrouter_change =
+            "{\"type\":\"model_change\",\"provider\":\"openrouter\",\"modelId\":\"nvidia/nemotron-3-ultra-550b-a55b:free\"}\n";
+        let anthropic_change =
+            "{\"type\":\"model_change\",\"provider\":\"anthropic\",\"modelId\":\"claude-sonnet\"}\n";
+        let cold_log = format!("{openrouter_change}{long_output}");
+        assert!(cold_log.len() as u64 > TAIL_READ_BYTES);
+        fs::write(&path, &cold_log).unwrap();
         let refresh = |cached| {
             refresh_job(AgentModelRefreshJob {
                 terminal_id: TerminalId::alloc(),
@@ -1403,21 +1469,33 @@ mod tests {
         };
         let first = refresh(None).unwrap();
         assert_eq!(first.entry.provider.as_deref(), Some("openrouter"));
+        assert_eq!(first.entry.provider_scanned_len, cold_log.len() as u64);
+
+        fs::write(&path, format!("{cold_log}{anthropic_change}{long_output}")).unwrap();
+        let second = refresh(Some(first.entry)).unwrap();
+        assert_eq!(second.entry.provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            second.entry.provider_scanned_len,
+            fs::metadata(&path).unwrap().len()
+        );
+
+        let truncated_log =
+            "{\"type\":\"model_change\",\"provider\":\"google\",\"modelId\":\"gemini-pro\"}\n";
+        fs::write(&path, truncated_log).unwrap();
+        let third = refresh(Some(second.entry)).unwrap();
+        assert_eq!(third.entry.provider.as_deref(), Some("google"));
+        assert_eq!(
+            third.entry.provider_scanned_len,
+            fs::metadata(&path).unwrap().len()
+        );
 
         fs::write(
             &path,
-            concat!(
-                "{\"type\":\"model_change\",\"provider\":\"openrouter\",\"modelId\":\"nvidia/nemotron-3-ultra-550b-a55b:free\"}\n",
-                "{\"type\":\"model_change\",\"provider\":\"anthropic\",\"modelId\":\"claude-sonnet\"}\n"
-            ),
+            format!("{truncated_log}{openrouter_change}{long_output}"),
         )
         .unwrap();
-        let second = refresh(Some(first.entry)).unwrap();
-        assert_eq!(second.entry.provider.as_deref(), Some("anthropic"));
-
-        fs::write(&path, "{\"type\":\"message\"}\n").unwrap();
-        let third = refresh(Some(second.entry)).unwrap();
-        assert_eq!(third.entry.provider, None);
+        let fourth = refresh(Some(third.entry)).unwrap();
+        assert_eq!(fourth.entry.provider.as_deref(), Some("openrouter"));
         assert!(!valid_pi_session_path("relative/session.jsonl"));
     }
 
@@ -1700,6 +1778,8 @@ mod tests {
                 modified: modified - std::time::Duration::from_secs(60),
                 info: None,
                 provider: None,
+                provider_scanned_len: 0,
+                provider_file_identity: None,
                 title: None,
                 title_scanned_len: 0,
             }),
@@ -1894,6 +1974,8 @@ mod tests {
                 modified: modified - std::time::Duration::from_secs(60),
                 info: None,
                 provider: None,
+                provider_scanned_len: 0,
+                provider_file_identity: None,
                 title: Some("Update Summary from Subsequent User Prompts".into()),
                 title_scanned_len: 0,
             }),
@@ -1952,6 +2034,8 @@ mod tests {
                 modified: stale,
                 info: None,
                 provider: None,
+                provider_scanned_len: 0,
+                provider_file_identity: None,
                 title: None,
                 title_scanned_len: 0,
             }),
@@ -2091,6 +2175,8 @@ mod tests {
                 modified,
                 info: Some(info.clone()),
                 provider: None,
+                provider_scanned_len: 0,
+                provider_file_identity: None,
                 title: None,
                 title_scanned_len: 0,
             }),
@@ -2107,6 +2193,8 @@ mod tests {
                 modified: modified - std::time::Duration::from_secs(60),
                 info: Some(info.clone()),
                 provider: None,
+                provider_scanned_len: 0,
+                provider_file_identity: None,
                 title: None,
                 title_scanned_len: 0,
             }),
