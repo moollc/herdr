@@ -2230,6 +2230,25 @@ mod tests {
             })
         );
 
+        for (kind, code) in [
+            (crossterm::event::MouseEventKind::ScrollUp, 64),
+            (crossterm::event::MouseEventKind::ScrollDown, 65),
+        ] {
+            assert_eq!(
+                pane.encode_mouse_wheel(kind, 29, 19, crossterm::event::KeyModifiers::empty()),
+                Some(format!("\x1b[<{code};30;20M").into_bytes())
+            );
+        }
+        assert_eq!(
+            pane.encode_mouse_button(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                29,
+                19,
+                crossterm::event::KeyModifiers::empty(),
+            ),
+            Some(b"\x1b[<0;30;20M".to_vec())
+        );
+
         let encoded = pane.encode_terminal_key(
             crate::input::TerminalKey::new(
                 crossterm::event::KeyCode::Up,

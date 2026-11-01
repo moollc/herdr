@@ -2150,6 +2150,16 @@ impl MouseEncoder {
         }
     }
 
+    pub fn set_tracking_mode(&mut self, mode: ffi::GhosttyMouseTrackingMode) {
+        unsafe {
+            ffi::ghostty_mouse_encoder_setopt(
+                self.raw,
+                ffi::GhosttyMouseEncoderOption_GHOSTTY_MOUSE_ENCODER_OPT_EVENT,
+                (&mode as *const ffi::GhosttyMouseTrackingMode).cast(),
+            )
+        }
+    }
+
     pub fn set_format(&mut self, format: ffi::GhosttyMouseFormat) {
         unsafe {
             ffi::ghostty_mouse_encoder_setopt(

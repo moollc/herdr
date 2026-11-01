@@ -58,13 +58,31 @@ pub(super) fn ghostty_mouse_encoder_for_terminal(
 ) -> Option<crate::ghostty::MouseEncoder> {
     let mut encoder = crate::ghostty::MouseEncoder::new().ok()?;
     encoder.set_from_terminal(terminal);
+    // Ghostty's mode_set restores the DEC mode bits without updating the
+    // encoder's cached mouse flags. Use the same mode bits as pane routing so
+    // a restored pane cannot route a wheel event to a disabled encoder.
+    use crate::ghostty::ffi;
+    let tracking = if terminal.mode_get(1003).ok()? {
+        ffi::GhosttyMouseTrackingMode_GHOSTTY_MOUSE_TRACKING_ANY
+    } else if terminal.mode_get(1002).ok()? {
+        ffi::GhosttyMouseTrackingMode_GHOSTTY_MOUSE_TRACKING_BUTTON
+    } else if terminal.mode_get(1000).ok()? {
+        ffi::GhosttyMouseTrackingMode_GHOSTTY_MOUSE_TRACKING_NORMAL
+    } else if terminal.mode_get(9).ok()? {
+        ffi::GhosttyMouseTrackingMode_GHOSTTY_MOUSE_TRACKING_X10
+    } else {
+        ffi::GhosttyMouseTrackingMode_GHOSTTY_MOUSE_TRACKING_NONE
+    };
+    encoder.set_tracking_mode(tracking);
     if terminal
         .mode_get(crate::ghostty::MODE_MOUSE_SGR_PIXELS)
         .ok()?
+        || terminal.mode_get(crate::ghostty::MODE_MOUSE_SGR).ok()?
     {
-        // Herdr receives host mouse positions in terminal cells. Downgrade
-        // SGR-pixels to normal SGR so forwarded coordinates stay cell-local.
+        // Herdr receives cell coordinates, including for SGR-pixel mode.
         encoder.set_format(crate::ghostty::MOUSE_FORMAT_SGR);
+    } else if terminal.mode_get(crate::ghostty::MODE_MOUSE_UTF8).ok()? {
+        encoder.set_format(ffi::GhosttyMouseFormat_GHOSTTY_MOUSE_FORMAT_UTF8);
     }
     let cols = terminal.cols().ok()? as u32;
     let rows = terminal.rows().ok()? as u32;
