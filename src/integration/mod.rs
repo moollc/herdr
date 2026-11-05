@@ -25,13 +25,13 @@ const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/herdr-agent-state.sh
 const CLAUDE_STATUSLINE_INSTALL_NAME: &str = "herdr-statusline.sh";
 const CLAUDE_STATUSLINE_ASSET: &str = include_str!("assets/claude/herdr-statusline.sh");
 const CLAUDE_STATUSLINE_DELEGATE_NAME: &str = "herdr-statusline-delegate.json";
-const CLAUDE_INTEGRATION_VERSION: u32 = 7;
+const CLAUDE_INTEGRATION_VERSION: u32 = 9;
 const CLAUDE_CONFIG_DIR_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
 const CODEX_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
 const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/herdr-agent-state.sh");
 const RECENT_AGENT_FILES_HOOK_NAME: &str = "herdr-recent-agent-files.py";
 const RECENT_AGENT_FILES_HOOK_ASSET: &str = include_str!("assets/recent-agent-files.py");
-const CODEX_INTEGRATION_VERSION: u32 = 8;
+const CODEX_INTEGRATION_VERSION: u32 = 9;
 const CODEX_HOME_ENV_VAR: &str = "CODEX_HOME";
 const KIMI_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
 const KIMI_HOOK_ASSET: &str = include_str!("assets/kimi/herdr-agent-state.sh");
@@ -1161,6 +1161,13 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
     )?;
     ensure_command_hook(
         hooks,
+        "UserPromptSubmit",
+        format!("bash {quoted_hook_path} session"),
+        10,
+        Some("*"),
+    )?;
+    ensure_command_hook(
+        hooks,
         "Stop",
         format!("bash {quoted_hook_path} ended"),
         10,
@@ -1292,6 +1299,13 @@ fn install_codex_at(dir: &Path) -> io::Result<CodexInstallPaths> {
         hooks,
         "UserPromptSubmit",
         format!("bash {quoted_hook_path} started"),
+        10,
+        None,
+    )?;
+    ensure_command_hook(
+        hooks,
+        "UserPromptSubmit",
+        format!("bash {quoted_hook_path} session"),
         10,
         None,
     )?;
@@ -1610,6 +1624,11 @@ pub(crate) fn uninstall_claude() -> io::Result<ClaudeUninstallResult> {
                 "UserPromptSubmit",
                 &format!("bash {quoted_hook_path} started"),
             )?;
+            updated_settings |= remove_command_hook(
+                hooks,
+                "UserPromptSubmit",
+                &format!("bash {quoted_hook_path} session"),
+            )?;
             updated_settings |=
                 remove_command_hook(hooks, "Stop", &format!("bash {quoted_hook_path} ended"))?;
             updated_settings |= remove_command_hook(
@@ -1732,6 +1751,11 @@ fn uninstall_codex_at(codex_dir: &Path) -> io::Result<CodexUninstallResult> {
                 hooks,
                 "UserPromptSubmit",
                 &format!("bash {quoted_hook_path} started"),
+            )?;
+            updated_hooks |= remove_command_hook(
+                hooks,
+                "UserPromptSubmit",
+                &format!("bash {quoted_hook_path} session"),
             )?;
             updated_hooks |= remove_command_hook(
                 hooks,
@@ -3348,7 +3372,15 @@ mod tests {
             .contains(" session"));
         assert!(settings["hooks"]["UserPromptSubmit"]
             .as_array()
-            .is_some_and(|v| v.len() == 1));
+            .is_some_and(|v| v.len() == 2));
+        assert!(settings["hooks"]["UserPromptSubmit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains(" session")));
         assert!(settings["hooks"].get("PreToolUse").is_none());
         assert!(settings["hooks"].get("PermissionRequest").is_none());
         assert!(settings["hooks"].get("PostToolUse").is_none());
@@ -3404,7 +3436,7 @@ mod tests {
         );
         assert!(settings["hooks"]["UserPromptSubmit"]
             .as_array()
-            .is_some_and(|v| v.len() == 1));
+            .is_some_and(|v| v.len() == 2));
         assert!(settings["hooks"].get("PreToolUse").is_none());
         assert!(settings["hooks"].get("PermissionRequest").is_none());
         assert!(settings["hooks"].get("PostToolUse").is_none());
@@ -3464,7 +3496,7 @@ mod tests {
         );
         assert!(settings["hooks"]["UserPromptSubmit"]
             .as_array()
-            .is_some_and(|v| v.len() == 1));
+            .is_some_and(|v| v.len() == 2));
         assert!(settings["hooks"].get("PreToolUse").is_none());
         assert!(settings["hooks"]["Stop"]
             .as_array()
@@ -3724,7 +3756,7 @@ mod tests {
 
     #[test]
     fn codex_v2_integration_status_is_outdated() {
-        assert_eq!(CODEX_INTEGRATION_VERSION, 8);
+        assert_eq!(CODEX_INTEGRATION_VERSION, 9);
         let _lock = integration_env_lock();
         let base = unique_base();
         let home = base.join("home");
@@ -3827,6 +3859,20 @@ mod tests {
     }
 
     #[test]
+    fn production_claude_orientation_hook_regressions() {
+        let output = std::process::Command::new("python3")
+            .args(["-m", "unittest", "scripts.test_claude_orientation_hook"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn install_codex_writes_hook_and_updates_hooks_and_config() {
         let _lock = integration_env_lock();
         let base = unique_base();
@@ -3852,7 +3898,15 @@ mod tests {
             .contains(" session"));
         assert!(hooks["hooks"]["UserPromptSubmit"]
             .as_array()
-            .is_some_and(|v| v.len() == 1));
+            .is_some_and(|v| v.len() == 2));
+        assert!(hooks["hooks"]["UserPromptSubmit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains(" session")));
         assert_eq!(hooks["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
         assert!(hooks["hooks"]["PostToolUse"][0]["matcher"] == ".*");
         assert!(hooks["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
@@ -3925,7 +3979,7 @@ mod tests {
         assert_eq!(hooks["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         assert!(hooks["hooks"]["UserPromptSubmit"]
             .as_array()
-            .is_some_and(|v| v.len() == 1));
+            .is_some_and(|v| v.len() == 2));
         assert_eq!(hooks["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
         assert!(hooks["hooks"]["PreToolUse"]
             .as_array()
@@ -4774,6 +4828,10 @@ mod tests {
         assert!(CODEX_HOOK_ASSET.contains("os.fdopen(3"));
         assert!(CODEX_HOOK_ASSET.contains("agent_session_id"));
         assert!(CODEX_HOOK_ASSET.contains("pane.report_agent_session"));
+        assert!(
+            CODEX_HOOK_ASSET.contains("hook_event_name")
+                && CODEX_HOOK_ASSET.contains("UserPromptSubmit")
+        );
         assert!(!CODEX_HOOK_ASSET.contains("\"state\": action"));
         assert!(!CODEX_HOOK_ASSET.contains("pane.release_agent"));
         assert!(KIMI_HOOK_ASSET.contains("source = \"herdr:kimi\""));

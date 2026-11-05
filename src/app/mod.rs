@@ -16,6 +16,7 @@ mod api_helpers;
 mod commander;
 mod composer;
 mod config_io;
+mod context_transition;
 mod creation;
 mod ids;
 mod input;

@@ -58,6 +58,7 @@ mod recent_files;
 mod release_notes;
 mod remote;
 mod render_prof;
+mod role_continuity;
 mod selection;
 mod server;
 mod session;

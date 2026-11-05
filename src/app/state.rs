@@ -899,6 +899,7 @@ pub struct PanePopOutRequest {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PaneChromeAction {
     Oversee,
+    Overlord,
     /// Open the pane in its own window in the host terminal.
     PopOut,
     Focus,

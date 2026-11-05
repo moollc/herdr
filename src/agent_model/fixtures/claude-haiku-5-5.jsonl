@@ -1,0 +1,2 @@
+{"type":"user","message":{"role":"user","content":"fixture turn"}}
+{"type":"assistant","effort":"medium","message":{"model":"claude-haiku-5-5","role":"assistant"}}

@@ -116,7 +116,9 @@ fn pane_controls_text(
     } else {
         text.to_string()
     };
-    let text = if title_width >= 38 && !matches!(mode, PaneTitleMode::Peeking) {
+    let text = if title_width >= 100 && !matches!(mode, PaneTitleMode::Peeking) {
+        format!(" OVERSEE OVERLORD{text}")
+    } else if title_width >= 38 && !matches!(mode, PaneTitleMode::Peeking) {
         format!(" OVERSEE{text}")
     } else {
         text
@@ -161,25 +163,39 @@ fn pane_close_control_rect(area: Rect, controls_x: u16, controls_text: &str) -> 
 }
 
 fn pane_pop_control_rect(area: Rect, controls_x: u16, controls_text: &str) -> Option<Rect> {
-    let (controls_text, controls_x) = controls_text
-        .strip_prefix(" OVERSEE")
-        .map_or((controls_text, controls_x), |rest| (rest, controls_x + 8));
+    let (controls_text, controls_x) = strip_role_controls(controls_text, controls_x);
     controls_text
         .starts_with(PANE_POP_CONTROL)
         .then(|| Rect::new(controls_x, area.y, PANE_POP_CONTROL.width() as u16, 1))
+}
+
+fn strip_role_controls(controls_text: &str, controls_x: u16) -> (&str, u16) {
+    if let Some(rest) = controls_text.strip_prefix(" OVERSEE OVERLORD") {
+        (rest, controls_x + 17)
+    } else if let Some(rest) = controls_text.strip_prefix(" OVERSEE") {
+        (rest, controls_x + 8)
+    } else {
+        (controls_text, controls_x)
+    }
 }
 
 fn pane_focus_control_rect(area: Rect, controls_x: u16, controls_text: &str) -> Rect {
     let close = pane_close_control_rect(area, controls_x, controls_text);
     let focus_x = pane_pop_control_rect(area, controls_x, controls_text)
         .map_or(controls_x, |pop| pop.x + pop.width);
-    let focus_x = if controls_text.starts_with(" OVERSEE")
-        && pane_pop_control_rect(area, controls_x, controls_text).is_none()
-    {
-        focus_x + 8
+    let role_width = if controls_text.starts_with(" OVERSEE OVERLORD") {
+        17
+    } else if controls_text.starts_with(" OVERSEE") {
+        8
     } else {
-        focus_x
+        0
     };
+    let focus_x =
+        if role_width > 0 && pane_pop_control_rect(area, controls_x, controls_text).is_none() {
+            focus_x + role_width
+        } else {
+            focus_x
+        };
     let focus_width = close.x.saturating_sub(focus_x);
     Rect::new(focus_x, area.y, focus_width, 1)
 }
@@ -767,6 +783,13 @@ fn pane_chrome_controls(
             action: PaneChromeAction::Oversee,
             rect: Rect::new(controls_x, area.y, 8, 1),
         });
+        if controls_text.starts_with(" OVERSEE OVERLORD") {
+            controls.push(PaneChromeControl {
+                pane_id,
+                action: PaneChromeAction::Overlord,
+                rect: Rect::new(controls_x + 9, area.y, 9, 1),
+            });
+        }
     }
     if focus_rect.width > 0 {
         controls.push(PaneChromeControl {
@@ -1019,13 +1042,37 @@ fn render_code_ui_pane_chrome(
         spans.push(Span::styled(rule_text, edge_style));
     }
     if !controls_text.is_empty() {
-        if let Some(rest) = controls_text.strip_prefix(" OVERSEE") {
+        if controls_text.starts_with(" OVERSEE OVERLORD") {
+            let terminal_id = app.terminal_id_for_any_pane(pane_id);
+            let roles = terminal_id
+                .as_ref()
+                .and_then(|id| app.terminals.get(id))
+                .map(|terminal| {
+                    (
+                        terminal.overseer.is_space_overseer(),
+                        terminal.overseer.is_session_overlord(),
+                    )
+                })
+                .unwrap_or_default();
+            let active_style = Style::default()
+                .fg(app.palette.panel_bg)
+                .bg(active_accent)
+                .add_modifier(Modifier::BOLD);
+            let role_style = |enabled| if enabled { active_style } else { edge_style };
+            spans.push(Span::styled(" OVERSEE", role_style(roles.0)));
+            spans.push(Span::styled(" OVERLORD", role_style(roles.1)));
+            let (rest, _) = strip_role_controls(&controls_text, 0);
+            spans.push(Span::styled(rest.to_string(), edge_style));
+        } else if let Some(rest) = controls_text.strip_prefix(" OVERSEE") {
             let terminal_id = app.terminal_id_for_any_pane(pane_id);
             let kind = terminal_id
                 .as_ref()
                 .and_then(|id| app.terminals.get(id))
                 .and_then(|t| t.overseer.kind());
-            let on = kind.is_some();
+            let on = terminal_id
+                .as_ref()
+                .and_then(|id| app.terminals.get(id))
+                .is_some_and(|terminal| terminal.overseer.is_space_overseer());
             let label = oversee_control_label(
                 kind,
                 app.effective_overseer_scope(
@@ -2423,6 +2470,23 @@ mod tests {
         let (shell, _) = pane_controls_text(40, PaneTitleMode::Normal, false, false);
         assert!(shell.contains('✕'), "{shell:?}");
         assert!(!shell.contains("HIDE"), "{shell:?}");
+    }
+
+    #[test]
+    fn wide_pane_exposes_independent_overseer_and_overlord_controls() {
+        let area = Rect::new(0, 0, 100, 1);
+        let (text, width) = pane_controls_text(100, PaneTitleMode::Normal, true, false);
+        assert!(text.starts_with(" OVERSEE OVERLORD"), "{text:?}");
+        let controls = pane_chrome_controls(area, PaneId::from_raw(7), &text, width);
+        let overseer = controls
+            .iter()
+            .find(|control| control.action == PaneChromeAction::Oversee)
+            .expect("space overseer control");
+        let overlord = controls
+            .iter()
+            .find(|control| control.action == PaneChromeAction::Overlord)
+            .expect("session overlord control");
+        assert!(overseer.rect.x + overseer.rect.width <= overlord.rect.x);
     }
 
     #[test]

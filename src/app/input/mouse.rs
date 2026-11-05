@@ -715,7 +715,10 @@ impl AppState {
                                 self.request_pane_pop_out(control.pane_id);
                             }
                             crate::app::state::PaneChromeAction::Oversee => {
-                                self.toggle_oversee(control.pane_id)
+                                self.toggle_space_overseer(control.pane_id)
+                            }
+                            crate::app::state::PaneChromeAction::Overlord => {
+                                self.toggle_overlord(control.pane_id)
                             }
                             crate::app::state::PaneChromeAction::Focus => self.toggle_zoom(),
                             crate::app::state::PaneChromeAction::Close => {

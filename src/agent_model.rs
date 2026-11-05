@@ -228,10 +228,9 @@ fn valid_pi_session_path(session_path: &str) -> bool {
 /// Pi provider metadata is scanned from the beginning on a cold probe, then
 /// only from the last complete line on each append. A truncated or replaced
 /// file restarts at byte zero rather than inheriting stale provider state.
-fn scan_pi_provider(
-    path: &Path,
-    cached: Option<&AgentModelCacheEntry>,
-) -> Option<(Option<String>, u64, Option<(u64, u64)>)> {
+type PiProviderScan = (Option<String>, u64, Option<(u64, u64)>);
+
+fn scan_pi_provider(path: &Path, cached: Option<&AgentModelCacheEntry>) -> Option<PiProviderScan> {
     let metadata = fs::metadata(path).ok()?;
     let identity = pi_session_file_identity(&metadata);
     let cached_matches = cached.filter(|entry| {
@@ -1582,6 +1581,16 @@ mod tests {
             parse_claude_transcript_tail(r#"{"type":"user","message":{}}"#),
             None
         );
+    }
+
+    #[test]
+    fn saved_claude_transcript_fixtures_observe_model_and_no_turn_yet() {
+        let haiku = include_str!("agent_model/fixtures/claude-haiku-5-5.jsonl");
+        let info = parse_claude_transcript_tail(haiku).expect("assistant model observation");
+        assert_eq!(info.model, "claude-haiku-5-5");
+        assert_eq!(info.effort.as_deref(), Some("medium"));
+        let before_first_turn = include_str!("agent_model/fixtures/claude-no-assistant-turn.jsonl");
+        assert_eq!(parse_claude_transcript_tail(before_first_turn), None);
     }
 
     #[test]

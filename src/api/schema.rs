@@ -102,6 +102,14 @@ pub enum Method {
     OverseerEscalate(OverseerEscalateParams),
     #[serde(rename = "overseer.message")]
     OverseerMessage(OverseerMessageParams),
+    #[serde(rename = "role.set")]
+    RoleSet(RoleSetParams),
+    #[serde(rename = "role.status")]
+    RoleStatus(RoleStatusParams),
+    #[serde(rename = "role.memory_append")]
+    RoleMemoryAppend(RoleMemoryAppendParams),
+    #[serde(rename = "role.handoff_record")]
+    RoleHandoffRecord(RoleHandoffRecordParams),
     #[serde(rename = "pane.set_job_marker")]
     PaneSetJobMarker(PaneSetJobMarkerParams),
     #[serde(rename = "pane.job_marker")]
@@ -515,6 +523,9 @@ pub struct PaneReadParams {
 pub struct OverseerEscalateParams {
     pub caller_pane_id: String,
     pub text: String,
+    /// Stable logical event token used to return the first receipt on retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_key: Option<String>,
     /// Only explicitly informational lines may skip delivery.
     #[serde(default = "default_true")]
     pub wake: bool,
@@ -526,6 +537,164 @@ pub struct OverseerMessageParams {
     pub caller_pane_id: String,
     pub to: String,
     pub text: String,
+    /// Stable logical event token used to return the first receipt on retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRole {
+    SpaceOverseer,
+    SessionOverlord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleSetParams {
+    pub caller_pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_pane_id: Option<String>,
+    pub role: ManagedRole,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleStatusParams {
+    pub caller_pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspected_pane_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleMemoryAppendParams {
+    pub caller_pane_id: String,
+    pub role: ManagedRole,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleHandoffRecordParams {
+    pub caller_pane_id: String,
+    pub role: ManagedRole,
+    pub task_id: String,
+    pub attempt: String,
+    pub candidate: String,
+    pub tests: Vec<String>,
+    pub output_paths: Vec<String>,
+    pub open_findings: Vec<String>,
+    pub cost: String,
+    pub next_owner: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleMemoryPathInfo {
+    pub role: ManagedRole,
+    pub scope_id: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleHolderInfo {
+    pub terminal_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceRoleInfo {
+    pub workspace_id: String,
+    pub overseer: Option<RoleHolderInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleStatusInfo {
+    pub schema_version: u32,
+    pub observed_at_unix: u64,
+    pub caller_terminal_id: String,
+    pub caller_pane_id: String,
+    pub caller_raw_pane_id: String,
+    pub caller_public_pane_id: String,
+    pub caller_identity_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_workspace_id: Option<String>,
+    /// Native agent conversation identity. This is never inferred from UI focus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_native_session: Option<AgentSessionRef>,
+    /// Whether this pane is selected in Herdr's active workspace and tab.
+    pub caller_ui_focused: bool,
+    pub inspected_terminal_id: String,
+    pub inspected_raw_pane_id: String,
+    pub inspected_pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspected_workspace_id: Option<String>,
+    pub inspected_overseer: bool,
+    pub inspected_overlord: bool,
+    pub inspected_role_revision: u64,
+    pub caller_overseer: bool,
+    pub caller_overlord: bool,
+    pub role_revision: u64,
+    pub session_overlord: Option<RoleHolderInfo>,
+    pub space_overseers: Vec<SpaceRoleInfo>,
+    #[serde(default)]
+    pub message_deliveries: Vec<RoleMessageStatusInfo>,
+    pub peers: Vec<RolePeerStatusInfo>,
+    #[serde(default)]
+    pub working_memory: Vec<RoleMemoryPathInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolePeerStatusInfo {
+    pub terminal_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<String>,
+    pub is_caller: bool,
+    pub space_overseer: bool,
+    pub session_overlord: bool,
+    pub role_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session: Option<AgentSessionRef>,
+    pub lifecycle: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_model_pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_effort_pin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_marker: Option<String>,
+    pub task_receipt: Option<String>,
+    pub latest_candidate: Option<String>,
+    pub native_acceptance: Option<String>,
+    pub missing_batch_members: Option<Vec<String>>,
+    pub metadata_revision: u64,
+    pub freshness: String,
+    pub unknown: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleMessageStatusInfo {
+    pub message_id: String,
+    pub target_terminal_id: String,
+    pub state: crate::overseer::MessageDeliveryState,
+    pub hold_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSessionRef {
+    pub source: String,
+    pub agent: String,
+    pub kind: crate::agent_resume::AgentSessionRefKind,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -615,6 +784,15 @@ pub struct PaneReportMetadataParams {
     pub clear_custom_status: bool,
     #[serde(default)]
     pub clear_state_labels: bool,
+    /// Context window use of the native conversation, 0 to 100, read from a harness status line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_used_percent: Option<u8>,
+    /// The native conversation the context reading belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The harness reported no context figure for `session_id`; clears that conversation's cached reading.
+    #[serde(default)]
+    pub context_unknown: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -958,6 +1136,25 @@ pub enum ResponseResult {
     PaneList {
         panes: Vec<PaneInfo>,
     },
+    RoleStatus {
+        status: RoleStatusInfo,
+    },
+    RoleMemoryAppended {
+        role: ManagedRole,
+        scope_id: String,
+        path: String,
+        recorded_at_unix: u64,
+    },
+    RoleHandoffRecorded {
+        valid: bool,
+        reason: String,
+        recorded_at_unix: u64,
+    },
+    RoleMessageReceipt {
+        message_ids: Vec<String>,
+        state: crate::overseer::MessageDeliveryState,
+        target_terminal_ids: Vec<String>,
+    },
     PaneRead {
         read: PaneReadResult,
     },
@@ -1103,7 +1300,14 @@ pub struct PaneInfo {
     /// "space" or "chief" while the pane holds an overseer role; absent otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overseer: Option<String>,
+    #[serde(default)]
+    pub space_overseer: bool,
+    #[serde(default)]
+    pub session_overlord: bool,
     pub pane_id: String,
+    /// Stable within this Herdr session; paired with terminal_id and pane_id.
+    #[serde(default)]
+    pub raw_pane_id: String,
     /// Assigned human name ("Olivia", "Olivia-2"); accepted as a pane target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -1415,6 +1619,9 @@ mod tests {
                 clear_display_agent: false,
                 clear_custom_status: false,
                 clear_state_labels: false,
+                context_used_percent: Some(42),
+                session_id: Some("native-session".into()),
+                context_unknown: false,
                 seq: Some(42),
                 ttl_ms: Some(3_600_000),
             }),
@@ -1733,7 +1940,10 @@ mod tests {
                 },
                 root_pane: PaneInfo {
                     overseer: None,
+                    space_overseer: false,
+                    session_overlord: false,
                     pane_id: "w_1-1".into(),
+                    raw_pane_id: "p_1".into(),
                     name: None,
                     terminal_id: "term_1".into(),
                     workspace_id: "w_1".into(),
@@ -1793,7 +2003,10 @@ mod tests {
                 },
                 root_pane: PaneInfo {
                     overseer: None,
+                    space_overseer: false,
+                    session_overlord: false,
                     pane_id: "w_1-3".into(),
+                    raw_pane_id: "p_3".into(),
                     name: None,
                     terminal_id: "term_example".into(),
                     workspace_id: "w_1".into(),

@@ -3,7 +3,7 @@
 # managed by herdr; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # HERDR_INTEGRATION_ID=codex
-# HERDR_INTEGRATION_VERSION=8
+# HERDR_INTEGRATION_VERSION=9
 
 set -eu
 
@@ -71,8 +71,9 @@ if agent_session_id:
             "agent": "codex",
             "seq": report_seq,
             "agent_session_id": agent_session_id,
-            "turn_reporting": True,
-            "startup_source": hook_input.get("source"),
+            "turn_reporting": hook_input.get("hook_event_name") != "UserPromptSubmit",
+            "startup_source": ("user_prompt_submit" if hook_input.get("hook_event_name") == "UserPromptSubmit"
+                               else hook_input.get("source")),
         },
     }
 else:
@@ -113,7 +114,7 @@ def retry(request):
             time.sleep(0.05 * (attempt + 1))
 
 
-def deliver(context, nonce):
+def deliver(context, nonce, hook_event_name):
     # Socket inode scopes receipts to this server instance. The nonce includes
     # the stable terminal ID/generation; the native session scopes conversation.
     server = os.stat(socket_path)
@@ -140,7 +141,7 @@ def deliver(context, nonce):
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("another hook is emitting orientation; retry SessionStart")
+                    raise TimeoutError("another hook is emitting context; retry the native hook")
                 time.sleep(0.05)
         state = None
         try:
@@ -165,7 +166,7 @@ def deliver(context, nonce):
             # safely be called model receipt or trigger automatic duplication.
             record("emission_uncertain")
             print(json.dumps({"hookSpecificOutput": {
-                "hookEventName": "SessionStart", "additionalContext": context}}), flush=True)
+                "hookEventName": hook_event_name, "additionalContext": context}}), flush=True)
             record("emitted")
         ack = {"id": request_id + ":ack", "method": "pane.ack_orientation", "params": {
             "pane_id": pane_id, "source": source, "agent_session_id": agent_session_id,
@@ -173,14 +174,15 @@ def deliver(context, nonce):
         try:
             retry(ack)
         except Exception as error:
-            diagnostic("stdout emitted, acknowledgement failed (not model receipt); retry SessionStart: " + str(error))
+            diagnostic("stdout emitted, acknowledgement failed (not model receipt); retry the native hook: " + str(error))
 
 
 try:
     result = retry(request)
     context, nonce = result.get("context"), result.get("nonce")
     if isinstance(context, str) and context and isinstance(nonce, str) and nonce:
-        deliver(context, nonce)
+        event_name = "UserPromptSubmit" if hook_input.get("hook_event_name") == "UserPromptSubmit" else "SessionStart"
+        deliver(context, nonce, event_name)
     elif hook_input.get("source") == "startup":
         diagnostic("server returned no startup context: already delivered or incompatible server; check Herdr version and integration status")
 except Exception as error:

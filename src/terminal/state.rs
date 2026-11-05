@@ -118,6 +118,9 @@ pub struct TerminalState {
     /// SessionStart offer/receipt metadata; retained after delivery so a lost
     /// acknowledgement response can be acknowledged idempotently.
     pub orientation_offer: Option<crate::agent_orientation::OrientationOffer>,
+    /// Counts every new offer for this terminal. It survives offer clears, so a new
+    /// lifecycle refresh never reuses an earlier nonce.
+    pub orientation_generation: u64,
     /// Hook-free orientation progress for the current agent process.
     /// The session snapshot carries it for a live handoff. A cold restore drops it.
     pub overseer: crate::overseer::Role,
@@ -174,6 +177,7 @@ impl TerminalState {
             revision: 0,
             orientation: crate::agent_orientation::OrientationState::Suppressed,
             orientation_offer: None,
+            orientation_generation: 0,
             overseer: crate::overseer::Role::default(),
             auto_orientation: crate::agent_orientation::AutoOrientation::Unarmed,
             launch_argv: None,

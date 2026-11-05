@@ -10,7 +10,7 @@ use crate::api::schema::{
 
 mod agent;
 mod integration;
-mod overseer;
+pub(crate) mod overseer;
 mod pane;
 mod server;
 mod shell_init;
@@ -48,6 +48,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "terminal" => run_terminal_command(&args[2..])?,
         "pane" => pane::run_pane_command(&args[2..])?,
         "overseer" => overseer::run_overseer_command(&args[2..])?,
+        "overlord" | "chief" => overseer::run_overlord_command(&args[2..])?,
         "shell-init" => shell_init::run_shell_init_command(&args[2..])?,
         "wait" => run_wait_command(&args[2..])?,
         "integration" => integration::run_integration_command(&args[2..])?,

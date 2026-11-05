@@ -738,6 +738,14 @@ impl App {
             Method::OverseerMessage(params) => {
                 return self.handle_overseer_message(request.id, params)
             }
+            Method::RoleSet(params) => return self.handle_role_set(request.id, params),
+            Method::RoleStatus(params) => return self.handle_role_status(request.id, params),
+            Method::RoleMemoryAppend(params) => {
+                return self.handle_role_memory_append(request.id, params)
+            }
+            Method::RoleHandoffRecord(params) => {
+                return self.handle_role_handoff_record(request.id, params)
+            }
             Method::PaneSetJobMarker(params) => {
                 return self.handle_pane_set_job_marker(request.id, params)
             }

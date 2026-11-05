@@ -999,7 +999,8 @@ impl Workspace {
             purpose: None,
             overseer_scope: None,
             identity_cwd: identity_cwd.clone(),
-            cached_git_branch: git_branch(&identity_cwd),
+            // Keep test output independent of whichever worktree runs the suite.
+            cached_git_branch: None,
             cached_git_ahead_behind: None,
             cached_git_space: None,
             cached_git_worktree_state: GitWorktreeState::Clean,

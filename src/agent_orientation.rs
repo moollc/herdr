@@ -72,6 +72,13 @@ pub struct OrientationOffer {
     pub session_id: String,
     pub nonce: String,
     pub context: String,
+    /// Snapshot digest, role revision and scope binding for deferred team context.
+    #[serde(default)]
+    pub team_view_revision: Option<String>,
+    #[serde(default)]
+    pub role_revision: u64,
+    #[serde(default)]
+    pub scope_key: String,
 }
 
 pub const OPEN: &str = "[Herdr orientation v1]\n";

@@ -58,6 +58,25 @@ if isinstance(session_name, str) and session_name.strip():
 else:
     params["clear_title"] = True
 
+# context use of this conversation from the status line input. a missing or null
+# reading (no messages yet) sends nothing, so the meter stays unknown.
+# A null or missing reading is sent as an explicit unknown for this session, so it
+# clears the figure already cached for this conversation. Without a session, nothing
+# context-related is sent.
+context = payload.get("context_window")
+used = context.get("used_percentage") if isinstance(context, dict) else None
+session_id = payload.get("session_id")
+if isinstance(session_id, str) and session_id.strip():
+    params["session_id"] = session_id.strip()
+    if (
+        isinstance(used, (int, float))
+        and not isinstance(used, bool)
+        and 0 <= used <= 100
+    ):
+        params["context_used_percent"] = int(round(used))
+    else:
+        params["context_unknown"] = True
+
 request = {
     "id": f"{source}:{int(time.time() * 1000)}:{random.randrange(1_000_000):06d}",
     "method": "pane.report_metadata",

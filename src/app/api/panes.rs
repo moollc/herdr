@@ -369,7 +369,7 @@ impl App {
         let terminal_id = self.state.terminal_id_for_any_pane(pane_id);
         let previous = terminal_id
             .as_ref()
-            .and_then(|id| self.state.terminals.get(id))
+            .and_then(|terminal_id| self.state.terminals.get(terminal_id))
             .map(|terminal| {
                 (
                     terminal.persisted_agent_session.clone(),
@@ -378,7 +378,11 @@ impl App {
             });
         let session_id = params.agent_session_id.clone();
         let startup_source = params.startup_source.clone();
-        let codex_startup = params.source == "herdr:codex" && agent_label == "codex";
+        let native_source = params.source.clone();
+        let native_context_hook = matches!(
+            (native_source.as_str(), agent_label.as_str()),
+            ("herdr:codex", "codex") | ("herdr:claude", "claude")
+        );
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
             session_ref: crate::agent_resume::session_ref_from_report(
@@ -387,23 +391,11 @@ impl App {
                 params.agent_session_id,
                 params.agent_session_path,
             ),
-            source: params.source,
+            source: native_source.clone(),
             agent_label: agent_label.clone(),
             seq: params.seq,
         });
 
-        if codex_startup && matches!(startup_source.as_deref(), Some("resume" | "compact")) {
-            if let Some(terminal) = terminal_id
-                .as_ref()
-                .and_then(|id| self.state.terminals.get_mut(id))
-            {
-                if terminal.orientation == crate::agent_orientation::OrientationState::Pending {
-                    terminal.orientation = crate::agent_orientation::OrientationState::Suppressed;
-                    self.state.mark_session_dirty();
-                    self.schedule_session_save();
-                }
-            }
-        }
         if params.turn_reporting {
             if let Some(agent) = crate::detect::parse_agent_label(&agent_label) {
                 self.handle_internal_event(crate::events::AppEvent::TurnReported {
@@ -416,71 +408,137 @@ impl App {
             }
         }
         // SessionStart is a context channel, independent of literal task input.
-        // Native resume/compact and unknown provenance cannot establish freshness.
-        if codex_startup && startup_source.as_deref() == Some("startup") {
-            if let (Some(terminal_id), Some((old_session, old_orientation))) =
-                (terminal_id, previous)
-            {
-                let accepted = self
+        // Native lifecycle hooks can refresh the card only when their exact
+        // conversation identity still matches Herdr's persisted session.
+        let lifecycle_refresh = matches!(
+            startup_source.as_deref(),
+            Some("clear" | "compact" | "resume")
+        );
+        let startup_refresh = startup_source.as_deref() == Some("startup");
+        if native_context_hook
+            && (startup_source.as_deref() == Some("user_prompt_submit")
+                || lifecycle_refresh
+                || startup_refresh)
+        {
+            if let Some(terminal_id) = terminal_id.as_ref() {
+                let accepted_session = self
                     .state
                     .terminals
-                    .get(&terminal_id)
-                    .and_then(|terminal| terminal.persisted_agent_session.as_ref());
-                let fresh = accepted.is_some_and(|session| {
-                    session.source == "herdr:codex"
-                        && session.agent == "codex"
-                        && Some(&session.session_ref.value) == session_id.as_ref()
-                });
-                let same = old_session.as_ref() == accepted;
-                let already_delivered = old_orientation
-                    == crate::agent_orientation::OrientationState::Delivered
-                    && (same || old_session.is_none());
-                if fresh && !already_delivered {
-                    let existing = self
-                        .state
-                        .terminals
-                        .get(&terminal_id)
-                        .and_then(|terminal| terminal.orientation_offer.clone())
-                        .filter(|offer| offer.session_id == session_id.clone().unwrap_or_default());
-                    let offer =
-                        existing.unwrap_or_else(|| crate::agent_orientation::OrientationOffer {
-                            session_id: session_id.clone().unwrap_or_default(),
-                            nonce: format!(
-                                "{}:{}",
-                                terminal_id,
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_nanos())
-                                    .unwrap_or_default()
-                            ),
-                            context: format!(
+                    .get(terminal_id)
+                    .and_then(|terminal| terminal.persisted_agent_session.as_ref())
+                    .filter(|session| {
+                        session.source == native_source
+                            && session.agent == agent_label
+                            && Some(session.session_ref.value.as_str()) == session_id.as_deref()
+                    });
+                if accepted_session.is_some() {
+                    let already_delivered_startup = startup_refresh
+                        && previous
+                            .as_ref()
+                            .is_some_and(|(old_session, old_orientation)| {
+                                *old_orientation
+                                    == crate::agent_orientation::OrientationState::Delivered
+                                    && (old_session.is_none()
+                                        || old_session.as_ref() == accepted_session)
+                            });
+                    if already_delivered_startup {
+                        return encode_success(id, ResponseResult::Ok {});
+                    }
+                    let binding = self.team_view_binding(terminal_id);
+                    if binding.is_some() || lifecycle_refresh || startup_refresh {
+                        let (team_view_revision, role_revision, scope_key) = binding
+                            .map(|(revision, role_revision, scope_key)| {
+                                (Some(revision), role_revision, scope_key)
+                            })
+                            .unwrap_or_else(|| {
+                                let role_revision =
+                                    self.state.terminals[terminal_id].overseer.revision;
+                                (None, role_revision, "unassigned".to_string())
+                            });
+                        let (previous_offer, offer_state) = self
+                            .state
+                            .terminals
+                            .get(terminal_id)
+                            .map(|terminal| {
+                                (terminal.orientation_offer.clone(), terminal.orientation)
+                            })
+                            .unwrap_or((
+                                None,
+                                crate::agent_orientation::OrientationState::Suppressed,
+                            ));
+                        let unchanged = previous_offer.as_ref().is_some_and(|offer| {
+                            offer.session_id == session_id.clone().unwrap_or_default()
+                                && offer.team_view_revision.as_deref()
+                                    == team_view_revision.as_deref()
+                                && offer.role_revision == role_revision
+                                && offer.scope_key == scope_key
+                        });
+                        if unchanged
+                            && offer_state == crate::agent_orientation::OrientationState::Offered
+                        {
+                            if let Some(offer) = previous_offer {
+                                return encode_success(
+                                    id,
+                                    ResponseResult::OrientationContext {
+                                        context: offer.context,
+                                        nonce: offer.nonce,
+                                    },
+                                );
+                            }
+                        }
+                        if !unchanged
+                            || ((lifecycle_refresh || startup_refresh)
+                                && offer_state
+                                    != crate::agent_orientation::OrientationState::Offered)
+                        {
+                            let context = format!(
                                 "{}{}\n[/Herdr orientation]",
                                 crate::agent_orientation::OPEN,
-                                self.orientation_context(&terminal_id)
-                            ),
-                        });
-                    if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                        terminal.orientation = crate::agent_orientation::OrientationState::Offered;
-                        terminal.orientation_offer = Some(offer.clone());
-                    }
-                    self.state.mark_session_dirty();
-                    self.schedule_session_save();
-                    return encode_success(
-                        id,
-                        ResponseResult::OrientationContext {
-                            context: offer.context,
-                            nonce: offer.nonce,
-                        },
-                    );
-                }
-                if already_delivered {
-                    if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                        terminal.orientation = old_orientation;
+                                self.orientation_context(terminal_id)
+                            );
+                            // Each new offer is its own delivery identity. A retry of a pending
+                            // offer returns the stored one above, so only real refreshes get a new nonce.
+                            let generation = self
+                                .state
+                                .terminals
+                                .get_mut(terminal_id)
+                                .map(|terminal| {
+                                    terminal.orientation_generation += 1;
+                                    terminal.orientation_generation
+                                })
+                                .unwrap_or(0);
+                            let nonce = format!(
+                                "{}:{}:{}:{}:{}",
+                                terminal_id,
+                                session_id.as_deref().unwrap_or(""),
+                                role_revision,
+                                team_view_revision.as_deref().unwrap_or("unassigned"),
+                                generation
+                            );
+                            let offer = crate::agent_orientation::OrientationOffer {
+                                session_id: session_id.clone().unwrap_or_default(),
+                                nonce: nonce.clone(),
+                                context: context.clone(),
+                                team_view_revision,
+                                role_revision,
+                                scope_key,
+                            };
+                            if let Some(terminal) = self.state.terminals.get_mut(terminal_id) {
+                                terminal.orientation =
+                                    crate::agent_orientation::OrientationState::Offered;
+                                terminal.orientation_offer = Some(offer);
+                            }
+                            self.state.mark_session_dirty();
+                            self.schedule_session_save();
+                            return encode_success(
+                                id,
+                                ResponseResult::OrientationContext { context, nonce },
+                            );
+                        }
                     }
                 }
             }
         }
-
         encode_success(id, ResponseResult::Ok {})
     }
 
@@ -492,7 +550,7 @@ impl App {
         let Some(pane_id) = self.parse_reporting_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        if params.source != "herdr:codex" {
+        if !matches!(params.source.as_str(), "herdr:codex" | "herdr:claude") {
             return encode_error(
                 id,
                 "invalid_orientation_ack",
@@ -502,13 +560,29 @@ impl App {
         let Some(terminal_id) = self.state.terminal_id_for_any_pane(pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
+        let current_team_binding = self.team_view_binding(&terminal_id);
         let accepted = self
             .state
             .terminals
             .get(&terminal_id)
             .and_then(|terminal| {
                 terminal.orientation_offer.as_ref().filter(|offer| {
-                    offer.session_id == params.agent_session_id && offer.nonce == params.nonce
+                    let role_still_matches = if offer.team_view_revision.is_some() {
+                        current_team_binding.as_ref().is_some_and(
+                            |(revision, role_revision, scope)| {
+                                terminal.overseer.revision == offer.role_revision
+                                    && *role_revision == offer.role_revision
+                                    && scope == &offer.scope_key
+                                    && offer.team_view_revision.as_deref()
+                                        == Some(revision.as_str())
+                            },
+                        )
+                    } else {
+                        true
+                    };
+                    offer.session_id == params.agent_session_id
+                        && offer.nonce == params.nonce
+                        && role_still_matches
                 })
             })
             .is_some();
@@ -545,6 +619,31 @@ impl App {
         let Some(source) = normalize_optional_text(Some(params.source)) else {
             return encode_error(id, "invalid_metadata_request", "missing metadata source");
         };
+        let context_set = params.context_used_percent.is_some() || params.context_unknown;
+        if params.context_used_percent.is_none() && params.context_unknown {
+            // A session-bound unknown reading revokes only that conversation's cached figure.
+            if let Some(terminal_id) = self.state.terminal_id_for_any_pane(pane_id) {
+                self.clear_context_report(&terminal_id, params.session_id.as_deref());
+            }
+        }
+        if let Some(percent) = params.context_used_percent {
+            // Bound to the conversation the reading came from: another or unknown
+            // conversation leaves the meter unknown.
+            if let Some(terminal_id) = self.state.terminal_id_for_any_pane(pane_id) {
+                let label = if source == "herdr:claude-statusline" {
+                    "Claude status line"
+                } else {
+                    source.as_str()
+                };
+                self.report_context_from_session(
+                    &terminal_id,
+                    percent,
+                    params.session_id.as_deref(),
+                    label,
+                    std::time::Instant::now(),
+                );
+            }
+        }
         let raw_title_set = params.title.is_some();
         let raw_display_agent_set = params.display_agent.is_some();
         let raw_custom_status_set = params.custom_status.is_some();
@@ -597,6 +696,9 @@ impl App {
             && !params.clear_custom_status
             && !params.clear_state_labels
         {
+            if context_set {
+                return encode_success(id, ResponseResult::Ok {});
+            }
             return encode_error(
                 id,
                 "invalid_metadata_request",

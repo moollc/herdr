@@ -820,6 +820,9 @@ fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
         clear_display_agent,
         clear_custom_status,
         clear_state_labels,
+        context_used_percent: None,
+        session_id: None,
+        context_unknown: false,
         seq,
         ttl_ms,
     }))

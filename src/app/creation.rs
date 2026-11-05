@@ -327,7 +327,10 @@ impl App {
                 .overseer
                 .kind()
                 .map(|kind| kind.as_str().to_string()),
+            space_overseer: terminal.overseer.is_space_overseer(),
+            session_overlord: terminal.overseer.is_session_overlord(),
             pane_id: self.public_pane_id(ws_idx, pane_id)?,
+            raw_pane_id: format!("p_{}", pane_id.raw()),
             name: crate::pane_names::effective_name(&self.state.terminals, &terminal.id),
             terminal_id: terminal.id.to_string(),
             workspace_id: self.public_workspace_id(ws_idx),

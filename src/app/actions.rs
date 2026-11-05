@@ -1500,6 +1500,7 @@ impl AppState {
         let Some(target_ws) = self.workspace_index_for_pane(target) else {
             return false;
         };
+        let moved_terminal = self.workspaces[source_ws].terminal_id(source).cloned();
         if source_ws == target_ws {
             return match zone {
                 crate::layout::DropZone::Over => self.swap_panes(source, target),
@@ -1536,6 +1537,9 @@ impl AppState {
             }
         }
         self.focus_pane_in_workspace(dest_ws, pane_id);
+        if let Some(terminal_id) = moved_terminal {
+            self.reconcile_moved_space_role(&terminal_id);
+        }
         self.mark_session_dirty();
         true
     }

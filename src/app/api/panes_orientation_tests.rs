@@ -9,13 +9,24 @@ fn session_start(
     source: &str,
     seq: u64,
 ) -> String {
+    session_start_as(app, pane, session, source, seq, "codex")
+}
+
+fn session_start_as(
+    app: &mut App,
+    pane: crate::layout::PaneId,
+    session: &str,
+    source: &str,
+    seq: u64,
+    agent: &str,
+) -> String {
     app.handle_pane_report_agent_session(
         "startup".into(),
         PaneReportAgentSessionParams {
             turn_reporting: false,
             pane_id: format!("p_{}", pane.raw()),
-            source: "herdr:codex".into(),
-            agent: "codex".into(),
+            source: format!("herdr:{agent}"),
+            agent: agent.into(),
             startup_source: Some(source.into()),
             seq: Some(seq),
             agent_session_id: Some(session.into()),
@@ -25,13 +36,23 @@ fn session_start(
 }
 
 fn acknowledge(app: &mut App, pane: crate::layout::PaneId, session: &str, offer: &str) -> String {
+    acknowledge_as(app, pane, session, offer, "codex")
+}
+
+fn acknowledge_as(
+    app: &mut App,
+    pane: crate::layout::PaneId,
+    session: &str,
+    offer: &str,
+    agent: &str,
+) -> String {
     let response: serde_json::Value = serde_json::from_str(offer).unwrap();
     let nonce = response["result"]["nonce"].as_str().unwrap();
     app.handle_pane_ack_orientation(
         "ack".into(),
         PaneAckOrientationParams {
             pane_id: format!("p_{}", pane.raw()),
-            source: "herdr:codex".into(),
+            source: format!("herdr:{agent}"),
             agent_session_id: session.into(),
             nonce: nonce.into(),
         },
@@ -366,8 +387,7 @@ async fn external_codex_deepseek_panel_hook_delivers_generated_identity_before_l
             .contains("context")
     );
     assert!(
-        !session_start(&mut app, pane, "external-codex", "resume", u64::MAX - 1)
-            .contains("context")
+        session_start(&mut app, pane, "external-codex", "resume", u64::MAX - 1).contains("context")
     );
     // Same surviving terminal, new process and verified fresh generation.
     app.state
@@ -408,10 +428,10 @@ async fn orientation_hook_coordinates_structured_delivery_and_new_generation() {
         .get_mut(&terminal_id)
         .unwrap()
         .orientation = crate::agent_orientation::OrientationState::Pending;
-    assert!(!session_start(&mut app, pane, "resumed", "resume", 4).contains("context"));
+    assert!(session_start(&mut app, pane, "resumed", "resume", 4).contains("context"));
     assert_eq!(
         app.state.terminals[&terminal_id].orientation,
-        crate::agent_orientation::OrientationState::Suppressed
+        crate::agent_orientation::OrientationState::Offered
     );
 }
 
@@ -491,6 +511,171 @@ async fn orientation_offer_retries_after_lost_response_and_only_acknowledgement_
         crate::agent_orientation::OrientationState::Delivered
     );
     assert!(acknowledge(&mut app, pane, "external", &retry).contains("result"));
+}
+
+#[tokio::test]
+async fn team_view_updates_are_coalesced_and_bound_to_holder_scope_revision_and_session() {
+    let (mut app, pane) = app_with_two_panes();
+    let terminal_id = app.state.terminal_id_for_any_pane(pane).unwrap();
+    app.state
+        .terminals
+        .get_mut(&terminal_id)
+        .unwrap()
+        .detected_agent = Some(crate::detect::Agent::Codex);
+    app.state.toggle_space_overseer(pane);
+    let startup = session_start(&mut app, pane, "external", "startup", 1);
+    assert!(startup.contains("orientation_context"), "{startup}");
+    acknowledge(&mut app, pane, "external", &startup);
+
+    let unchanged = session_start(&mut app, pane, "external", "user_prompt_submit", 2);
+    assert!(
+        !unchanged.contains("orientation_context"),
+        "unchanged view was offered twice: {unchanged}"
+    );
+
+    let other = app.state.workspaces[0].tabs[0]
+        .panes
+        .values()
+        .find(|state| state.attached_terminal_id != terminal_id)
+        .map(|state| state.attached_terminal_id.clone())
+        .unwrap();
+    app.state.terminals.get_mut(&other).unwrap().state = crate::detect::AgentState::Working;
+    let changed = session_start(&mut app, pane, "external", "user_prompt_submit", 3);
+    assert!(
+        changed.contains("orientation_context"),
+        "changed view was not offered: {changed}"
+    );
+    acknowledge(&mut app, pane, "external", &changed);
+    let duplicate = session_start(&mut app, pane, "external", "user_prompt_submit", 4);
+    assert!(
+        !duplicate.contains("orientation_context"),
+        "coalesced revision was reoffered: {duplicate}"
+    );
+
+    let stale = serde_json::from_str::<serde_json::Value>(&changed).unwrap();
+    let old_nonce = stale["result"]["nonce"].as_str().unwrap().to_string();
+    app.state.toggle_space_overseer(pane);
+    let rejected = app.handle_pane_ack_orientation(
+        "stale".into(),
+        PaneAckOrientationParams {
+            pane_id: format!("p_{}", pane.raw()),
+            source: "herdr:codex".into(),
+            agent_session_id: "external".into(),
+            nonce: old_nonce,
+        },
+    );
+    assert!(
+        rejected.contains("invalid_orientation_ack"),
+        "stale role offer acknowledged: {rejected}"
+    );
+}
+
+#[tokio::test]
+async fn claude_codex_native_clear_and_compact_events_reissue_the_role_card() {
+    for (index, agent) in ["claude", "codex"].into_iter().enumerate() {
+        let (mut app, pane) = app_with_two_panes();
+        let terminal_id = app.state.terminal_id_for_any_pane(pane).unwrap();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .detected_agent = Some(if agent == "claude" {
+            crate::detect::Agent::Claude
+        } else {
+            crate::detect::Agent::Codex
+        });
+        app.state.toggle_space_overseer(pane);
+
+        let startup =
+            session_start_as(&mut app, pane, "native-conversation", "startup", 100, agent);
+        assert!(
+            startup.contains("orientation_context"),
+            "{agent}: {startup}"
+        );
+        acknowledge_as(&mut app, pane, "native-conversation", &startup, agent);
+
+        let compact =
+            session_start_as(&mut app, pane, "native-conversation", "compact", 101, agent);
+        assert!(
+            compact.contains("orientation_context"),
+            "{agent} compact must re-inject the role card: {compact}"
+        );
+        acknowledge_as(&mut app, pane, "native-conversation", &compact, agent);
+
+        let clear = session_start_as(&mut app, pane, "native-conversation", "clear", 102, agent);
+        assert!(
+            clear.contains("orientation_context"),
+            "{agent} clear must re-inject the role card: {clear}"
+        );
+        acknowledge_as(&mut app, pane, "native-conversation", &clear, agent);
+
+        let restarted = session_start_as(
+            &mut app,
+            pane,
+            &format!("new-conversation-{index}"),
+            "startup",
+            103,
+            agent,
+        );
+        assert!(
+            restarted.contains("orientation_context"),
+            "{agent} restart receives its own card: {restarted}"
+        );
+    }
+}
+
+#[test]
+fn claude_native_hook_receives_the_changed_team_view_as_deferred_context() {
+    let (mut app, pane) = app_with_two_panes();
+    let terminal_id = app.state.terminal_id_for_any_pane(pane).unwrap();
+    app.state
+        .terminals
+        .get_mut(&terminal_id)
+        .unwrap()
+        .detected_agent = Some(crate::detect::Agent::Claude);
+    app.state.toggle_space_overseer(pane);
+    let report = |app: &mut App, source: &str, seq| {
+        app.handle_pane_report_agent_session(
+            "claude-hook".into(),
+            PaneReportAgentSessionParams {
+                turn_reporting: false,
+                startup_source: Some(source.into()),
+                pane_id: format!("p_{}", pane.raw()),
+                source: "herdr:claude".into(),
+                agent: "claude".into(),
+                seq: Some(seq),
+                agent_session_id: Some("native".into()),
+                agent_session_path: None,
+            },
+        )
+    };
+    let startup = report(&mut app, "startup", 1);
+    assert!(startup.contains("orientation_context"), "{startup}");
+    let startup_nonce = serde_json::from_str::<serde_json::Value>(&startup).unwrap()["result"]
+        ["nonce"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(app
+        .handle_pane_ack_orientation(
+            "ack-start".into(),
+            PaneAckOrientationParams {
+                pane_id: format!("p_{}", pane.raw()),
+                source: "herdr:claude".into(),
+                agent_session_id: "native".into(),
+                nonce: startup_nonce,
+            }
+        )
+        .contains("result"));
+    let other = app.state.workspaces[0].tabs[0]
+        .panes
+        .values()
+        .find(|state| state.attached_terminal_id != terminal_id)
+        .map(|state| state.attached_terminal_id.clone())
+        .unwrap();
+    app.state.terminals.get_mut(&other).unwrap().state = crate::detect::AgentState::Working;
+    let update = report(&mut app, "user_prompt_submit", 2);
+    assert!(update.contains("orientation_context"), "{update}");
 }
 
 #[tokio::test]
@@ -622,4 +807,73 @@ async fn orientation_navigation_and_empty_input_preserve_pending_and_raw_batches
         .try_recv()
         .unwrap()
         .starts_with(crate::agent_orientation::OPEN.as_bytes()));
+}
+
+#[test]
+fn lifecycle_refreshes_after_an_acknowledged_startup_get_their_own_nonces() {
+    let (mut app, pane) = app_with_two_panes();
+    let terminal_id = app.state.terminal_id_for_any_pane(pane).unwrap();
+    app.state
+        .terminals
+        .get_mut(&terminal_id)
+        .unwrap()
+        .detected_agent = Some(crate::detect::Agent::Claude);
+    app.state.toggle_space_overseer(pane);
+    let nonce_of = |response: &str| {
+        serde_json::from_str::<serde_json::Value>(response).unwrap()["result"]["nonce"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let startup = session_start_as(
+        &mut app,
+        pane,
+        "native-conversation",
+        "startup",
+        100,
+        "claude",
+    );
+    let startup_nonce = nonce_of(&startup);
+    acknowledge_as(&mut app, pane, "native-conversation", &startup, "claude");
+
+    // Same conversation, role revision and team state: a compact is still a new delivery.
+    let compact = session_start_as(
+        &mut app,
+        pane,
+        "native-conversation",
+        "compact",
+        101,
+        "claude",
+    );
+    assert!(compact.contains("orientation_context"), "{compact}");
+    let compact_nonce = nonce_of(&compact);
+    assert_ne!(compact_nonce, startup_nonce);
+    // A retry of the still pending compact offer keeps its nonce.
+    let retry = session_start_as(
+        &mut app,
+        pane,
+        "native-conversation",
+        "compact",
+        102,
+        "claude",
+    );
+    assert_eq!(nonce_of(&retry), compact_nonce);
+    acknowledge_as(&mut app, pane, "native-conversation", &compact, "claude");
+
+    let resume = session_start_as(
+        &mut app,
+        pane,
+        "native-conversation",
+        "resume",
+        103,
+        "claude",
+    );
+    assert!(resume.contains("orientation_context"), "{resume}");
+    let resume_nonce = nonce_of(&resume);
+    assert_ne!(resume_nonce, compact_nonce);
+    assert_ne!(resume_nonce, startup_nonce);
+    // Terminal, session, role revision, team revision, generation: the hook test relies on this shape.
+    assert_eq!(resume_nonce.split(':').count(), 5, "{resume_nonce}");
+    assert!(resume_nonce.ends_with(":3"), "{resume_nonce}");
 }

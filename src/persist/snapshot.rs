@@ -1068,6 +1068,9 @@ mod tests {
                 session_id: "native-session".into(),
                 nonce: "term_1:nonce".into(),
                 context: "all accepted fields".into(),
+                team_view_revision: Some("revision".into()),
+                role_revision: 4,
+                scope_key: "Chief:session".into(),
             });
             let restored: PaneSnapshot =
                 serde_json::from_str(&serde_json::to_string(&pane).unwrap()).unwrap();

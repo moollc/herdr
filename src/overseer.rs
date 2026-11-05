@@ -43,6 +43,8 @@ pub struct OverseerConfig {
     pub claude_settings: Option<String>,
     pub codex_args: Option<Vec<String>>,
     pub cursor_args: Option<Vec<String>>,
+    pub context_transition_enabled: bool,
+    pub context_handoff_limit_percent: u8,
 }
 impl Default for OverseerConfig {
     fn default() -> Self {
@@ -55,6 +57,8 @@ impl Default for OverseerConfig {
             claude_settings: None,
             codex_args: None,
             cursor_args: None,
+            context_transition_enabled: false,
+            context_handoff_limit_percent: 80,
         }
     }
 }
@@ -67,6 +71,20 @@ pub struct Role {
     /// overseer of the whole session, which is the chief.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<Kind>,
+    /// Independent space role. Missing fields migrate the legacy exclusive role.
+    #[serde(default)]
+    pub space_overseer: bool,
+    /// Independent session role. `chief` is the compatibility spelling.
+    #[serde(default)]
+    pub session_overlord: bool,
+    /// Changes only when either role membership changes.
+    #[serde(default)]
+    pub revision: u64,
+    /// Monotonic epochs for each independently addressable authority.
+    #[serde(default)]
+    pub space_generation: u64,
+    #[serde(default)]
+    pub session_generation: u64,
     pub notices: VecDeque<Notice>,
     pub profile_base: Option<Vec<String>>,
     pub restart_argv: Option<Vec<String>>,
@@ -79,9 +97,42 @@ pub struct Notice {
     pub detail: String,
     #[serde(default)]
     pub silent: bool,
+    /// The role this notice was created for; never infer it from a later role.
+    #[serde(default)]
+    pub role: Option<Kind>,
+    /// A queued notice is valid only for the membership revision that created it.
+    #[serde(default)]
+    pub role_revision: u64,
 }
 impl Role {
+    pub fn generation(&self, kind: Kind) -> u64 {
+        match kind {
+            Kind::Space => self.space_generation,
+            Kind::Chief => self.session_generation,
+        }
+    }
+
+    fn queue_notice(&mut self, notice: Notice) {
+        if self
+            .notices
+            .back()
+            .is_some_and(|pending| pending.active && !pending.silent)
+        {
+            if let Some(pending) = self.notices.back_mut() {
+                *pending = notice;
+            }
+        } else {
+            self.notices.push_back(notice);
+        }
+    }
+
     pub fn restored(mut self, live: bool) -> Self {
+        if self.active {
+            match self.kind.unwrap_or(Kind::Chief) {
+                Kind::Space => self.space_overseer = true,
+                Kind::Chief => self.session_overlord = true,
+            }
+        }
         if !live {
             self.input_pending = false;
             self.restart_argv = None;
@@ -89,11 +140,13 @@ impl Role {
                 notice.profile_checked = false;
             }
             if self.active && self.profile_base.is_some() && self.notices.is_empty() {
-                self.notices.push_back(Notice {
+                self.queue_notice(Notice {
                     active: true,
                     profile_checked: false,
                     detail: String::new(),
                     silent: true,
+                    role: self.kind(),
+                    role_revision: self.revision,
                 });
             }
         }
@@ -111,7 +164,81 @@ impl Role {
     }
 
     pub fn kind(&self) -> Option<Kind> {
-        self.active.then(|| self.kind.unwrap_or(Kind::Chief))
+        if self.active {
+            Some(self.kind.unwrap_or(Kind::Chief))
+        } else if self.session_overlord {
+            Some(Kind::Chief)
+        } else if self.space_overseer {
+            Some(Kind::Space)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_space_overseer(&self) -> bool {
+        self.space_overseer || (self.active && self.kind.unwrap_or(Kind::Chief) == Kind::Space)
+    }
+
+    pub fn is_session_overlord(&self) -> bool {
+        self.session_overlord || (self.active && self.kind.unwrap_or(Kind::Chief) == Kind::Chief)
+    }
+
+    /// Set one membership without changing the other. Returns false on a no-op.
+    pub fn set_membership(&mut self, kind: Kind, enabled: bool) -> bool {
+        let was_active = self.active;
+        let current = match kind {
+            Kind::Space => self.is_space_overseer(),
+            Kind::Chief => self.is_session_overlord(),
+        };
+        if current == enabled {
+            return false;
+        }
+        match kind {
+            Kind::Space => {
+                self.space_overseer = enabled;
+                self.space_generation = self.space_generation.wrapping_add(1);
+            }
+            Kind::Chief => {
+                self.session_overlord = enabled;
+                self.session_generation = self.session_generation.wrapping_add(1);
+            }
+        }
+        self.revision = self.revision.wrapping_add(1);
+
+        let replacement = if self.space_overseer {
+            Some(Kind::Space)
+        } else if self.session_overlord {
+            Some(Kind::Chief)
+        } else {
+            None
+        };
+        let before = self.active.then(|| self.kind.unwrap_or(Kind::Chief));
+        if before != replacement {
+            self.sync_legacy_role(replacement);
+        }
+        self.queue_notice(Notice {
+            active: enabled,
+            profile_checked: was_active,
+            detail: String::new(),
+            silent: false,
+            role: Some(kind),
+            role_revision: self.revision,
+        });
+        true
+    }
+
+    fn sync_legacy_role(&mut self, kind: Option<Kind>) {
+        match kind {
+            None => {
+                self.active = false;
+                self.kind = None;
+                // The precise ending notice is added by set_membership/assign.
+            }
+            Some(kind) => {
+                self.active = true;
+                self.kind = Some(kind);
+            }
+        }
     }
 
     /// Take, change or give up the role. A change between space and chief
@@ -122,31 +249,46 @@ impl Role {
         if before == kind {
             return;
         }
+        let had_space = self.is_space_overseer();
+        let had_session = self.is_session_overlord();
         match kind {
             None => {
+                self.space_overseer = false;
+                self.session_overlord = false;
+                self.revision = self.revision.wrapping_add(1);
                 self.active = false;
                 self.kind = None;
-                self.notices.push_back(Notice {
+                self.queue_notice(Notice {
                     active: false,
                     profile_checked: false,
                     detail: String::new(),
                     silent: false,
+                    role: before,
+                    role_revision: self.revision,
                 });
             }
             Some(kind) => {
+                self.space_overseer = kind == Kind::Space;
+                self.session_overlord = kind == Kind::Chief;
+                self.revision = self.revision.wrapping_add(1);
                 let held = self.active;
                 self.active = true;
                 self.kind = Some(kind);
-                let waiting = self.notices.back().is_some_and(|n| n.active && !n.silent);
-                if !(held && waiting) {
-                    self.notices.push_back(Notice {
-                        active: true,
-                        profile_checked: held,
-                        detail: String::new(),
-                        silent: false,
-                    });
-                }
+                self.queue_notice(Notice {
+                    active: true,
+                    profile_checked: held,
+                    detail: String::new(),
+                    silent: false,
+                    role: Some(kind),
+                    role_revision: self.revision,
+                });
             }
+        }
+        if had_space != self.is_space_overseer() {
+            self.space_generation = self.space_generation.wrapping_add(1);
+        }
+        if had_session != self.is_session_overlord() {
+            self.session_generation = self.session_generation.wrapping_add(1);
         }
     }
 }
@@ -167,6 +309,7 @@ pub const MAIL_PREFIX: &str = "msg:";
 pub const MAIL_LIMIT: usize = 8;
 pub const MAIL_LOG: usize = 10;
 pub const MAIL_CHARS: usize = 240;
+pub const LOGICAL_DELIVERY_HISTORY: usize = 128;
 
 pub type SessionIdentity = (
     String,
@@ -237,6 +380,44 @@ pub struct Holder {
     /// The latest lines from other overseers, for the situation file.
     pub mail: VecDeque<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDeliveryState {
+    Queued,
+    Deferred,
+    Submitted,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageDirection {
+    Escalation,
+    Downward,
+}
+
+#[derive(Debug, Clone)]
+pub struct MessageDelivery {
+    pub target_terminal_id: TerminalId,
+    pub state: MessageDeliveryState,
+    pub sender_terminal_id: TerminalId,
+    pub direction: MessageDirection,
+    pub sender_role: Kind,
+    pub sender_role_generation: u64,
+    pub sender_session: Option<SessionIdentity>,
+    pub receiver_session: Option<SessionIdentity>,
+    pub receiver_role: Kind,
+    pub receiver_role_generation: u64,
+    pub sender_workspace_id: Option<String>,
+    pub hold_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogicalDeliveryReceipt {
+    pub binding_sha256: String,
+    pub message_ids: Vec<String>,
+}
 impl Holder {
     pub fn new(kind: Kind, now: Instant) -> Self {
         Self {
@@ -302,6 +483,22 @@ impl DirectStop {
     }
 }
 
+/// What the latest harness report says about one holder's context use. It
+/// lives in memory only and belongs to one native conversation.
+pub struct ContextReport {
+    pub percent: u8,
+    pub source: String,
+    pub session: SessionIdentity,
+    pub reported_at: Instant,
+}
+
+/// Where one holder stands in the context transition, for the role card.
+#[derive(Default)]
+pub struct TransitionTrack {
+    pub requested_at: Option<Instant>,
+    pub status: String,
+}
+
 pub struct Service {
     pub config: OverseerConfig,
     pub tasks_path: Option<PathBuf>,
@@ -317,6 +514,12 @@ pub struct Service {
     pub direct_stops: HashMap<TerminalId, DirectStop>,
     pub profile_probes: HashMap<TerminalId, Vec<String>>,
     pub message_origin_seq: u64,
+    pub message_deliveries: BTreeMap<String, MessageDelivery>,
+    pub logical_deliveries: BTreeMap<String, LogicalDeliveryReceipt>,
+    pub logical_delivery_order: VecDeque<String>,
+    pub context_reports: HashMap<TerminalId, ContextReport>,
+    pub transitions: HashMap<TerminalId, TransitionTrack>,
+    message_namespace: String,
 }
 impl Service {
     pub fn new(config: &crate::config::Config) -> Self {
@@ -339,7 +542,24 @@ impl Service {
             direct_stops: HashMap::new(),
             profile_probes: HashMap::new(),
             message_origin_seq: 0,
+            message_deliveries: BTreeMap::new(),
+            logical_deliveries: BTreeMap::new(),
+            logical_delivery_order: VecDeque::new(),
+            context_reports: HashMap::new(),
+            transitions: HashMap::new(),
+            message_namespace: format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ),
         }
+    }
+
+    pub fn message_id(&self, sequence: u64) -> String {
+        format!("{MAIL_PREFIX}{}-{sequence}", self.message_namespace)
     }
     #[cfg(test)]
     pub fn events_empty(&self) -> bool {
@@ -380,20 +600,63 @@ pub fn dispatched_stages(path: &std::path::Path) -> HashMap<String, PathBuf> {
         .collect()
 }
 
+/// Return the latest queue row's marker even after the dispatcher changes its
+/// state. The native stop alarm uses this as the completion receipt source.
+pub fn queued_stage_marker(path: &std::path::Path, pane: &str) -> Option<PathBuf> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            (fields.len() > 8 && fields[1] == pane && !matches!(fields[4], "" | "-"))
+                .then(|| PathBuf::from(fields[4]))
+        })
+        .next_back()
+}
+
 /// Recheck the actual hand-off, including markers written after the turn hook.
 /// Marker existence alone is insufficient: an empty/partial file is a real stop.
-pub fn task_end(marker: Option<&std::path::Path>, dispatcher_owned: bool) -> Option<&'static str> {
+pub fn task_end_with_queue_marker(
+    marker: Option<&std::path::Path>,
+    queue_marker: Option<&std::path::Path>,
+    dispatcher_owned: bool,
+) -> Option<&'static str> {
+    let marker = queue_marker.or(marker);
+    // Read the queue-owned output before suppressing its direct-stop alarm.
+    let text = marker.and_then(|marker| std::fs::read_to_string(marker).ok());
     if dispatcher_owned {
         return None;
     }
-    let marker = marker?;
-    let handoff = std::fs::read_to_string(marker)
-        .is_ok_and(|text| text.lines().any(|line| line.trim() == "HANDOFF"));
+    let handoff = text.as_deref().is_some_and(substantive_handoff);
     Some(if handoff {
         "finished"
     } else {
         "stopped without a hand-off"
     })
+}
+
+fn substantive_handoff(text: &str) -> bool {
+    let Some((_, block)) = text.split_once("HANDOFF") else {
+        return false;
+    };
+    let mut done = String::new();
+    let mut evidence = false;
+    for line in block.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if key.trim().eq_ignore_ascii_case("done") && value != "-" {
+            done.push_str(value);
+        }
+        if (key.trim().eq_ignore_ascii_case("tests") || key.trim().eq_ignore_ascii_case("patch"))
+            && !matches!(value, "" | "-")
+        {
+            evidence = true;
+        }
+    }
+    done.chars().filter(|ch| !ch.is_whitespace()).count() >= 16 && evidence
 }
 
 /// One plain line of at most `MAIL_CHARS` characters.
@@ -629,6 +892,41 @@ pub(crate) fn team_queue_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_stop_check_reads_latest_queue_marker_and_requires_substantive_handoff() {
+        let root = std::env::temp_dir().join(format!("queued-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let queue = root.join("queue.tsv");
+        let marker = root.join("stage.done");
+        std::fs::write(
+            &queue,
+            format!(
+                "stage\tfixture-pane\tbrief\t-\t{}\tbuild\t-\t10\tdone\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            queued_stage_marker(&queue, "fixture-pane"),
+            Some(marker.clone())
+        );
+        std::fs::write(&marker, "HANDOFF").unwrap();
+        assert_eq!(
+            task_end_with_queue_marker(None, Some(&marker), false),
+            Some("stopped without a hand-off")
+        );
+        std::fs::write(
+            &marker,
+            "HANDOFF\ndone: complete result with verified evidence\ntests: focused test passed\n",
+        )
+        .unwrap();
+        assert_eq!(
+            task_end_with_queue_marker(None, Some(&marker), false),
+            Some("finished")
+        );
+    }
+
     #[test]
     fn notification_ack_is_suppressed_but_correlated_task_and_errors_survive() {
         let session = (
