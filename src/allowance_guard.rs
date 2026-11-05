@@ -34,6 +34,8 @@ pub struct GuardConfig {
     pub cursor: bool,
     /// Provider overrides. Legacy scalar fields remain accepted.
     pub providers: HashMap<Provider, ProviderLimits>,
+    /// Bounded, terminal-specific exceptions; provider policy stays enabled.
+    pub terminal_exceptions: HashMap<String, TerminalException>,
     legacy_thresholds: bool,
 }
 
@@ -48,6 +50,7 @@ impl Default for GuardConfig {
             codex: true,
             cursor: false,
             providers: HashMap::new(),
+            terminal_exceptions: HashMap::new(),
             legacy_thresholds: false,
         }
     }
@@ -67,6 +70,7 @@ impl<'de> Deserialize<'de> for GuardConfig {
             codex: Option<bool>,
             cursor: Option<bool>,
             providers: HashMap<Provider, ProviderLimits>,
+            terminal_exceptions: HashMap<String, TerminalException>,
         }
         let stored = Stored::deserialize(deserializer)?;
         let mut result = Self {
@@ -98,7 +102,28 @@ impl<'de> Deserialize<'de> for GuardConfig {
             result.cursor = v;
         }
         result.providers = stored.providers;
+        result.terminal_exceptions = stored.terminal_exceptions;
         Ok(result)
+    }
+}
+
+/// An explicit temporary allowance override for one terminal and provider.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TerminalException {
+    pub provider: Provider,
+    pub starts_at: u64,
+    pub expires_at: u64,
+    pub minimum_remaining_pct: u8,
+}
+
+impl TerminalException {
+    fn permits(&self, provider: Provider, now: u64, pct: u8) -> bool {
+        self.provider == provider
+            && self.starts_at <= now
+            && now < self.expires_at
+            && self.expires_at.saturating_sub(self.starts_at) <= 3600
+            && self.minimum_remaining_pct >= 1
+            && pct > self.minimum_remaining_pct
     }
 }
 
@@ -481,6 +506,15 @@ impl Guard {
             .find(|w| w.kind == kind)?;
         let pct = window_reading(usage, window, now, working)?;
         if window.resets_at.is_some_and(|at| at <= now) {
+            return None;
+        }
+        if !phase.fast
+            && self
+                .config
+                .terminal_exceptions
+                .get(&pane.to_string())
+                .is_some_and(|exception| exception.permits(provider, now, pct))
+        {
             return None;
         }
         Some((
@@ -1200,5 +1234,47 @@ mod extra_spend_tests {
             .observe_usage(&u, 101, true)
             .iter()
             .any(|e| matches!(e, Event::Stop { .. })));
+    }
+}
+
+#[cfg(test)]
+mod terminal_exception_tests {
+    use super::*;
+
+    #[test]
+    fn exception_requires_matching_provider_time_and_nonzero_reserve() {
+        let mut e = TerminalException {
+            provider: Provider::Claude,
+            starts_at: 100,
+            expires_at: 200,
+            minimum_remaining_pct: 2,
+        };
+        assert!(e.permits(Provider::Claude, 150, 3));
+        assert!(!e.permits(Provider::Codex, 150, 3));
+        assert!(!e.permits(Provider::Claude, 99, 3));
+        assert!(!e.permits(Provider::Claude, 200, 3));
+        assert!(!e.permits(Provider::Claude, 150, 2));
+        e.expires_at = 3701;
+        assert!(!e.permits(Provider::Claude, 150, 3));
+        e.expires_at = 200;
+        e.minimum_remaining_pct = 0;
+        assert!(!e.permits(Provider::Claude, 150, 3));
+    }
+
+    #[test]
+    fn config_retains_terminal_binding_without_disabling_provider() {
+        let c: GuardConfig = toml::from_str(
+            r#"
+[terminal_exceptions.test_terminal]
+provider = "claude"
+starts_at = 100
+expires_at = 200
+minimum_remaining_pct = 2
+"#,
+        )
+        .unwrap();
+        assert!(c.watches(Provider::Claude));
+        assert_eq!(c.terminal_exceptions.len(), 1);
+        assert!(!c.terminal_exceptions.contains_key("other_terminal"));
     }
 }
