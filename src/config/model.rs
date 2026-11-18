@@ -184,6 +184,13 @@ pub struct ConfigReloadReport {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+pub struct RecentFilesConfig {
+    /// Extra filesystem roots, in addition to workspace and agent directories.
+    pub watch: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub overseer: crate::overseer::OverseerConfig,
     pub allowance_guard: crate::allowance_guard::GuardConfig,
@@ -192,6 +199,7 @@ pub struct Config {
     pub board_file: Option<String>,
     /// Optional generic JSON source for the right Tasks column.
     pub tasks_file: Option<String>,
+    pub recent_files: RecentFilesConfig,
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,
     pub session: SessionConfig,

@@ -679,6 +679,48 @@ unreadable, non-regular, or over-1-MiB input displays one dim error line and
 is retried. Atomic replacement avoids partial reads. Rendering clips at the
 window height. Running rows share the agent status animation and timer.
 
+### Recent agent files
+
+The `agent files` list uses native filesystem notifications for every open
+workspace and agent pane, including inactive tabs and agents set down outside
+a space. Writes, creates, and renames move a regular file to the top, without
+duplicates. The newest 100 files are retained in memory for the session. Ages
+measure receipt of the event. Updates normally appear within about one second.
+
+A filesystem watcher cannot observe ordinary file reads (merely opening a file)
+on macOS without elevated tools. It also cannot identify which process wrote a
+file: shell commands, editors, and agents all count. Filesystem-only rows have no
+provider tag. A Codex or Cursor hook event for the same path within five seconds
+supplies its provider tag; journal-only paths outside the watched folders still
+appear, and the existing bounded hook journal survives restarts.
+
+Add output folders outside those directories with this optional section:
+
+```toml
+[recent_files]
+watch = ["~/model-bench-runs"]
+```
+
+The default list is empty. Use absolute paths or `~/` paths. Config reload adds
+or removes these roots. Closing a workspace or agent releases directories no
+longer covered by another root. Changing a pane's working directory updates its
+subscriptions on the background worker; filesystem activity from closed roots
+remains in the recent history until displaced.
+
+Herdr refuses `/`, the home directory itself, its state directory, and
+`~/Library` as roots. It skips `.git`, `target`, `node_modules`, `.DS_Store`,
+`*.lock`, editor swap/backup files, and symlink escapes. Discovery prunes these
+folders before subscribing. Limits are 64 roots, 512 directory watches, 20,000
+discovery entries per root update, 64 process cwd queries per refresh, 1,024
+queued events, and 64 paths per event. Foreground group members cover agent
+children whose cwd differs from their launcher.
+Notifications coalesce over 150 ms. Directory discovery and OS subscriptions run
+on a worker, with no idle directory scans. Unavailable roots, watch failures,
+OS event loss, or a reached limit display an error/partial marker in the existing
+panel; there is no polling fallback. Events before subscription, very short-lived
+files, or lost events cannot be reconstructed. Unsupported filesystems may not
+supply native notifications.
+
 ### Spaces previews and compact agents
 
 Each layout preview draws solid blocks in the same arrangement as the panes,

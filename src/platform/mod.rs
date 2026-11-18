@@ -44,6 +44,29 @@ pub(crate) enum LimitedRead {
     Oversized,
 }
 
+/// Open without following a final symlink or waiting on a FIFO, then verify
+/// the descriptor before reading. Keep platform flags out of callers.
+pub(crate) fn read_regular_file_limited(
+    path: &std::path::Path,
+    max_bytes: usize,
+) -> std::io::Result<LimitedRead> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "expected a regular file",
+        ));
+    }
+    read_limited_reader(file, max_bytes)
+}
+
 pub(crate) fn read_limited_reader(
     mut reader: impl std::io::Read,
     max_bytes: usize,
@@ -157,6 +180,28 @@ impl PrefixInputSource for RealPrefixInputSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_file_reader_rejects_symlinks_fifos_and_large_inputs() {
+        let root =
+            std::env::temp_dir().join(format!("herdr-bounded-read-{}", rand::random::<u64>()));
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("file");
+        std::fs::write(&file, "fixture").unwrap();
+        std::os::unix::fs::symlink(&file, root.join("link")).unwrap();
+        assert!(read_regular_file_limited(&root.join("link"), 10).is_err());
+        assert_eq!(
+            read_regular_file_limited(&file, 2).unwrap(),
+            LimitedRead::Oversized
+        );
+        let fifo =
+            std::ffi::CString::new(root.join("fifo").as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: fixture path is a NUL-terminated CString and mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(read_regular_file_limited(&root.join("fifo"), 10).is_err());
+        std::fs::remove_dir_all(root).unwrap(); // Agent-generated fixtures only.
+    }
 
     #[test]
     fn read_limited_reader_returns_complete_data_under_limit() {

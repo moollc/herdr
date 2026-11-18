@@ -183,6 +183,14 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
     );
     load_live_section(
         table,
+        "recent_files",
+        "recent files config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.recent_files = section,
+    );
+    load_live_section(
+        table,
         "overseer",
         "overseer config",
         &mut diagnostics,
@@ -617,6 +625,29 @@ mouse_capture = false
         assert!(!removed);
         assert_eq!(updated, content);
     }
+    #[test]
+    fn recent_files_live_config_parses_and_reports_invalid_sections() {
+        let loaded =
+            load_live_config_from_str("[recent_files]\nwatch = ['~/outputs', '/tmp/project']")
+                .unwrap();
+        assert_eq!(
+            loaded.config.recent_files.watch,
+            vec!["~/outputs", "/tmp/project"]
+        );
+        assert!(loaded.invalid_sections.is_empty());
+        let invalid = load_live_config_from_str("[recent_files]\nwatch = 42").unwrap();
+        assert!(invalid
+            .invalid_sections
+            .iter()
+            .any(|section| section == "recent_files"));
+        assert!(load_live_config_from_str("")
+            .unwrap()
+            .config
+            .recent_files
+            .watch
+            .is_empty());
+    }
+
     #[test]
     fn board_file_live_config_preserves_invalid_and_supports_removal() {
         let loaded = load_live_config_from_str("board_file = '~/tasks.json'").unwrap();

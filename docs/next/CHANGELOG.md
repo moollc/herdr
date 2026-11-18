@@ -24,6 +24,8 @@
 
 ### Added
 
+- The agent files panel now watches workspace and agent directories for writes, creates, and renames from any provider or process. Files move to the top within about one second, and nearby hook events supply provider tags. Optional `[recent_files] watch` roots cover other output folders. Bounded background discovery and event queues report incomplete coverage in the panel. Ordinary file reads on macOS are not observable.
+
 - `herdr agent close` previews the agents it would end. Use a target or `--detached`, then `--apply` to end them. Socket peer process ancestry establishes the caller; spoofed pane claims and workers without caller environment are denied, and unavailable identity permits preview only. Space overseers can close agents in their own space, the session overlord and external operators cover the session, and active role holders and the caller stay protected. Applied closes are recorded in role memory and situation files.
 
 - OpenRouter allowance on the usage bar. A `1d` meter shows the free model requests left today as a percent, counting down to the next UTC day. A `cr` meter shows the paid credit balance in dollars (for example `9.90$`), with no reset and no countdown. The two readings are independent: each has its own age, and a missing one says why (`no key`, `unknown`, `offline`). Panes running Codex with `[ui.usage] openrouter_codex_home` (default `~/.codex-openrouter`) show as OpenRouter, not GPT. The key is read from an owner-only `openrouter_key_file` (one `OPENROUTER_API_KEY=` line or one bare token) or from the variable named in `openrouter_key_env`; nothing is requested without one. The allowance guard does not act on OpenRouter.

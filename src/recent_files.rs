@@ -1,4 +1,5 @@
-//! Durable, provenance-based list of files explicitly written by agent hooks.
+//! Recent filesystem activity, enriched by the durable provider hook journal.
+mod fs_watch;
 use std::{
     collections::HashMap,
     fs,
@@ -44,6 +45,10 @@ pub(crate) struct RecentFilesWatcher {
     stamp: Option<JournalStamp>,
     next_gap_refresh: Option<Instant>,
     next_poll: Instant,
+    filesystem: fs_watch::FileSystemWatcher,
+    journal_files: Vec<RecentFile>,
+    journal_truncated: bool,
+    journal_error: Option<String>,
 }
 
 impl RecentFilesWatcher {
@@ -54,6 +59,12 @@ impl RecentFilesWatcher {
     fn with_journal_path(journal: PathBuf) -> Self {
         Self {
             root: None,
+            filesystem: fs_watch::FileSystemWatcher::new(
+                journal.parent().unwrap_or(Path::new(".")).into(),
+            ),
+            journal_files: Vec::new(),
+            journal_truncated: false,
+            journal_error: None,
             journal,
             stamp: None,
             next_gap_refresh: None,
@@ -61,11 +72,23 @@ impl RecentFilesWatcher {
         }
     }
 
-    pub fn deadline(&self) -> Option<Instant> {
-        self.root.as_ref().map(|_| self.next_poll)
+    pub fn set_extra_roots(&mut self, paths: &[String]) {
+        self.filesystem.set_extra(paths);
     }
 
-    /// Read only Herdr's bounded activity journal; never traverse workspace paths.
+    pub fn sync_roots(
+        &mut self,
+        paths: impl IntoIterator<Item = PathBuf>,
+        processes: impl IntoIterator<Item = u32>,
+    ) {
+        self.filesystem.sync(paths, processes);
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        (self.root.is_some() || self.filesystem.active()).then_some(self.next_poll)
+    }
+
+    /// Merge worker notifications with the bounded hook journal.
     pub fn poll(
         &mut self,
         now: Instant,
@@ -101,10 +124,13 @@ impl RecentFilesWatcher {
             snapshot.loading = true;
             changed = true;
         }
-        if root.is_none() || (now < self.next_poll && !changed) {
+        if now < self.next_poll && !changed {
             return changed;
         }
-        self.next_poll = now + Duration::from_secs(1);
+        self.next_poll = now + fs_watch::INTERVAL;
+        if root.is_none() {
+            return changed;
+        }
 
         let current_stamp = fs::metadata(&self.journal).ok().and_then(|metadata| {
             Some(JournalStamp {
@@ -112,27 +138,40 @@ impl RecentFilesWatcher {
                 len: metadata.len(),
             })
         });
-        if current_stamp == self.stamp
-            && !changed
-            && self.next_gap_refresh.is_none_or(|deadline| now < deadline)
-        {
-            return false;
-        }
-        self.stamp = current_stamp;
         let old_selected = snapshot
             .selected
             .and_then(|index| snapshot.files.get(index))
             .map(|file| file.path.clone());
-        let (files, truncated, error, next_gap_expiry) =
-            match read_journal_details(&self.journal, wall_now) {
-                Ok(result) => result,
-                Err(error) => (Vec::new(), true, Some(error), None),
-            };
-        self.next_gap_refresh =
-            next_gap_expiry.map(|expiry| now + expiry.duration_since(wall_now).unwrap_or_default());
-        snapshot.files = files;
-        snapshot.truncated = truncated;
-        snapshot.error = error;
+        if current_stamp != self.stamp
+            || changed
+            || self
+                .next_gap_refresh
+                .is_some_and(|deadline| now >= deadline)
+        {
+            self.stamp = current_stamp;
+            let (files, truncated, error, next_gap_expiry) =
+                match read_journal_details(&self.journal, wall_now) {
+                    Ok(result) => result,
+                    Err(error) => (Vec::new(), true, Some(error), None),
+                };
+            self.next_gap_refresh = next_gap_expiry
+                .map(|expiry| now + expiry.duration_since(wall_now).unwrap_or_default());
+            self.journal_files = files;
+            self.journal_truncated = truncated;
+            self.journal_error = error;
+        }
+        snapshot.files = merge_activity(&self.filesystem.activity.files, &self.journal_files);
+        snapshot.truncated = self.journal_truncated
+            || self.filesystem.activity.truncated
+            || self.filesystem.activity.error.is_some()
+            || snapshot.files.len() > MAX_RESULTS;
+        snapshot.files.truncate(MAX_RESULTS);
+        snapshot.error = self
+            .filesystem
+            .activity
+            .error
+            .clone()
+            .or_else(|| self.journal_error.clone());
         snapshot.loading = false;
         snapshot.selected = old_selected
             .and_then(|path| snapshot.files.iter().position(|file| file.path == path))
@@ -150,6 +189,29 @@ impl RecentFilesWatcher {
         changed = *snapshot != previous_snapshot;
         changed
     }
+}
+
+/// Filesystem activity never claims a writer. A nearby explicit hook can supply a tag.
+fn merge_activity(filesystem: &[RecentFile], journal: &[RecentFile]) -> Vec<RecentFile> {
+    let mut files = filesystem.to_vec();
+    for hook in journal {
+        if let Some(file) = files.iter_mut().find(|file| file.path == hook.path) {
+            let distance = file
+                .modified
+                .duration_since(hook.modified)
+                .or_else(|_| hook.modified.duration_since(file.modified))
+                .unwrap_or_default();
+            if distance <= Duration::from_secs(5) {
+                file.agent = hook.agent.clone();
+            }
+            file.modified = file.modified.max(hook.modified);
+        } else {
+            files.push(hook.clone());
+        }
+    }
+    // Stable sort retains notification order when timestamps tie.
+    files.sort_by_key(|file| std::cmp::Reverse(file.modified));
+    files
 }
 
 #[cfg(test)]
@@ -172,16 +234,18 @@ fn read_journal_details(
     journal: &Path,
     wall_now: SystemTime,
 ) -> Result<JournalReadDetails, String> {
-    let bytes = match fs::read(journal) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((Vec::new(), false, None, None));
-        }
-        Err(_) => return Err("Agent file activity journal is unavailable".into()),
-    };
-    if bytes.len() as u64 > MAX_JOURNAL_BYTES {
-        return Err("Agent file activity journal exceeded its size limit".into());
-    }
+    let bytes =
+        match crate::platform::read_regular_file_limited(journal, MAX_JOURNAL_BYTES as usize) {
+            Ok(crate::platform::LimitedRead::Complete(bytes)) => bytes,
+            Ok(crate::platform::LimitedRead::Empty) => Vec::new(),
+            Ok(crate::platform::LimitedRead::Oversized) => {
+                return Err("Agent file activity journal exceeded its size limit".into());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), false, None, None));
+            }
+            Err(_) => return Err("Agent file activity journal is unavailable".into()),
+        };
 
     let journal_absolute = fs::canonicalize(journal).ok();
     let mut by_path: HashMap<PathBuf, RecentFile> = HashMap::new();
@@ -257,6 +321,7 @@ fn read_journal_details(
             partial = true;
             continue;
         }
+        let path = fs::canonicalize(&path).unwrap_or(path);
         let file = RecentFile {
             path: path.clone(),
             modified: UNIX_EPOCH + Duration::from_nanos(time_ns),
@@ -391,7 +456,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&path).expect("fixture dir");
-        path
+        fs::canonicalize(path).expect("canonical fixture dir")
     }
 
     fn event(path: &Path, time_ns: u64, agent: &str) -> serde_json::Value {
@@ -686,6 +751,49 @@ mod tests {
             &mut snapshot,
         ));
         assert_eq!(snapshot, previous);
+    }
+
+    #[test]
+    fn filesystem_merge_uses_nearby_hooks_without_claiming_old_authorship() {
+        let time = UNIX_EPOCH + Duration::from_secs(100);
+        let file = |name: &str, seconds: u64, agent: &str| RecentFile {
+            path: PathBuf::from(name),
+            modified: time + Duration::from_secs(seconds),
+            agent: agent.into(),
+        };
+        let filesystem = vec![file("/a", 10, ""), file("/b", 8, ""), file("/old", 7, "")];
+        let journal = vec![
+            file("/a", 9, "codex"),
+            file("/old", 0, "cursor"),
+            file("/outside", 11, "cursor"),
+        ];
+        let files = merge_activity(&filesystem, &journal);
+        assert_eq!(files.len(), 4);
+        assert_eq!(files[0].path, PathBuf::from("/outside"));
+        assert_eq!(files[1].agent, "codex");
+        assert_eq!(files[1].modified, time + Duration::from_secs(10));
+        assert!(files[2].agent.is_empty());
+        assert!(files[3].agent.is_empty());
+    }
+
+    #[test]
+    fn merge_cap_and_partial_error_keep_rows_and_selection() {
+        let base = fixture_dir("merged-cap");
+        let journal = base.join("state").join(JOURNAL_NAME);
+        let mut watcher = RecentFilesWatcher::with_journal_path(journal);
+        let mut snapshot = RecentFilesSnapshot::default();
+        watcher.filesystem.activity.files = (0..MAX_RESULTS + 5)
+            .map(|i| RecentFile {
+                path: base.join(i.to_string()),
+                modified: UNIX_EPOCH + Duration::from_secs(i as u64),
+                agent: String::new(),
+            })
+            .collect();
+        watcher.filesystem.activity.error = Some("File watcher partial".into());
+        assert!(watcher.poll(Instant::now(), Some(base), &mut snapshot));
+        assert_eq!(snapshot.files.len(), MAX_RESULTS);
+        assert!(snapshot.truncated);
+        assert_eq!(snapshot.error.as_deref(), Some("File watcher partial"));
     }
 
     #[test]

@@ -542,14 +542,47 @@ impl App {
     }
 
     pub(crate) fn poll_board_if_due(&mut self, now: Instant) -> bool {
-        let recent_files_root = if self.state.tasks.configured {
-            self.state
-                .active
-                .and_then(|index| self.state.workspaces.get(index))
-                .map(|workspace| workspace.identity_cwd.clone())
-        } else {
-            None
-        };
+        let recent_files_root = self
+            .state
+            .tasks
+            .configured
+            .then(|| {
+                self.state
+                    .active
+                    .and_then(|index| self.state.workspaces.get(index))
+                    .map(|workspace| workspace.identity_cwd.clone())
+            })
+            .flatten();
+        // Include every workspace and all agent terminals, including inactive
+        // tabs and set-down panes. Current cwd queries run on the watcher worker.
+        let roots = self
+            .state
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.identity_cwd.clone())
+            .chain(
+                self.state
+                    .terminals
+                    .values()
+                    .filter(|terminal| terminal.effective_known_agent().is_some())
+                    .map(|terminal| terminal.cwd.clone()),
+            );
+        let processes = self
+            .state
+            .workspaces
+            .iter()
+            .filter_map(|workspace| workspace.tabs.first())
+            .filter_map(|tab| tab.terminal_id(tab.root_pane))
+            .chain(
+                self.state
+                    .terminals
+                    .iter()
+                    .filter(|(_, terminal)| terminal.effective_known_agent().is_some())
+                    .map(|(id, _)| id),
+            )
+            .filter_map(|id| self.terminal_runtimes.get(id))
+            .map(|runtime| runtime.child_pid());
+        self.recent_files_watcher.sync_roots(roots, processes);
         self.board_watcher.poll(now, &mut self.state.board)
             | self.tasks_watcher.poll(now, &mut self.state.tasks)
             | self

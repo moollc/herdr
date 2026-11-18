@@ -705,7 +705,11 @@ impl App {
             tasks_watcher: crate::tasks::TasksWatcher::new(crate::tasks::configured_path(
                 config.tasks_file.as_deref(),
             )),
-            recent_files_watcher: crate::recent_files::RecentFilesWatcher::new(),
+            recent_files_watcher: {
+                let mut watcher = crate::recent_files::RecentFilesWatcher::new();
+                watcher.set_extra_roots(&config.recent_files.watch);
+                watcher
+            },
             board_watcher: crate::board::BoardWatcher::new(crate::board::configured_path(
                 config.board_file.as_deref(),
             )),
@@ -1339,6 +1343,10 @@ impl App {
         }
         if !invalid_section("allowance_guard") {
             self.state.allowance_guard.config = config.allowance_guard.clone();
+        }
+        if !invalid_section("recent_files") {
+            self.recent_files_watcher
+                .set_extra_roots(&config.recent_files.watch);
         }
         if !invalid_section("tasks_file") {
             self.overseer_service.tasks_path =
