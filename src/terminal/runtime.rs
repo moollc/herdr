@@ -96,7 +96,16 @@ impl TerminalRuntime {
         if child_pid == 0 {
             return;
         }
-        let pids = match crate::platform::foreground_job(child_pid)
+        crate::pane::terminate_agent_processes(self.agent_process_ids());
+    }
+
+    /// Current foreground job or session members, using the shutdown ownership evidence.
+    pub(crate) fn agent_process_ids(&self) -> Vec<u32> {
+        let child_pid = self.child_pid();
+        if child_pid == 0 {
+            return Vec::new();
+        }
+        match crate::platform::foreground_job(child_pid)
             .filter(|job| job.process_group_id != child_pid)
         {
             Some(job) => job.processes.iter().map(|process| process.pid).collect(),
@@ -107,8 +116,7 @@ impl TerminalRuntime {
                 }
                 pids
             }
-        };
-        crate::pane::terminate_agent_processes(pids);
+        }
     }
 
     pub fn shutdown(self) {

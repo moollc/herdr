@@ -1,5 +1,6 @@
 pub mod client;
 mod event_hub;
+pub(crate) mod peer;
 pub mod schema;
 mod server;
 mod status;
@@ -66,4 +67,12 @@ pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;
 
 pub fn socket_path() -> PathBuf {
     crate::session::active_api_socket_path()
+}
+
+#[cfg(test)]
+pub(crate) fn serve_test_connection(
+    stream: std::os::unix::net::UnixStream,
+    api_tx: &ApiRequestSender,
+) -> std::io::Result<()> {
+    server::serve_test_connection(stream, api_tx)
 }

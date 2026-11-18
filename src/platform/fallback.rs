@@ -76,3 +76,11 @@ pub fn clipboard_image_read_support_hint() -> Option<&'static str> {
 pub fn show_desktop_notification(_title: &str, _body: Option<&str>) -> std::io::Result<bool> {
     Ok(false)
 }
+
+pub(crate) fn unix_peer_pid(_stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    None
+}
+
+pub(crate) fn parent_process_id(_pid: u32) -> Option<u32> {
+    None
+}

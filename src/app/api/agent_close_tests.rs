@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime};
 struct Fixture {
     app: App,
     root: PathBuf,
+    caller: Option<PaneId>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -29,10 +30,18 @@ impl Fixture {
         app.state.workspaces = vec![Workspace::test_new("a"), Workspace::test_new("b")];
         app.state.active = Some(0);
         app.state.ensure_test_terminals();
-        let root = std::env::temp_dir().join(format!("agent-close-{}", TerminalId::alloc()));
+        let root = std::env::temp_dir().join(format!(
+            "agent-close-{}-{}",
+            std::process::id(),
+            TerminalId::alloc()
+        ));
         app.overseer_service.situation_path = root.join("overseer/situation.md");
         app.overseer_service.tasks_path = None;
-        Self { app, root }
+        Self {
+            app,
+            root,
+            caller: None,
+        }
     }
     fn agent(&mut self, ws: usize, idle: u64) -> PaneId {
         let pane = self.app.state.workspaces[ws].test_split(ratatui::layout::Direction::Horizontal);
@@ -62,10 +71,16 @@ impl Fixture {
         role.space_overseer = !chief;
     }
     fn close(&mut self, params: AgentCloseParams) -> Value {
-        json(&self.app.handle_api_request(Request {
-            id: "close".into(),
-            method: Method::AgentClose(params),
-        }))
+        // These fixture calls test role/safety policy with an explicit trusted identity.
+        // Connection authentication is exercised separately through real sockets below.
+        let caller = self
+            .caller
+            .map_or(Caller::External, |pane| Caller::Pane(self.terminal(pane)));
+        json(
+            &self
+                .app
+                .handle_agent_close_as("close".into(), params, caller),
+        )
     }
 }
 impl Drop for Fixture {
@@ -213,6 +228,7 @@ fn caller_and_active_roles_remain_protected_even_with_force() {
         let mut f = Fixture::new();
         let caller = f.agent(0, 900);
         f.role(caller, chief);
+        f.caller = Some(caller);
         assert_eq!(
             code(&f.close(AgentCloseParams {
                 caller_pane_id: Some(raw(caller)),
@@ -234,6 +250,7 @@ fn caller_and_active_roles_remain_protected_even_with_force() {
         let response = f.close(AgentCloseParams {
             force: true,
             apply: true,
+            allow_detached: true,
             ..bulk()
         });
         assert_eq!(
@@ -249,6 +266,7 @@ fn space_overseer_scope_and_explicit_detached_override() {
     let mut f = Fixture::new();
     let caller = f.agent(0, 900);
     f.role(caller, false);
+    f.caller = Some(caller);
     let own = f.agent(0, 900);
     let other = f.agent(1, 900);
     let detached = f.agent(1, 900);
@@ -299,6 +317,7 @@ fn overlord_and_external_operator_cover_other_spaces_and_detached() {
         let mut f = Fixture::new();
         let caller = f.agent(0, 900);
         f.role(caller, true);
+        f.caller = (!external).then_some(caller);
         let other = f.agent(1, 900);
         let detached = f.agent(1, 900);
         f.detach(detached);
@@ -325,6 +344,7 @@ fn overlord_and_external_operator_cover_other_spaces_and_detached() {
 fn workers_and_invalid_callers_fail_closed_for_every_scope() {
     let mut f = Fixture::new();
     let caller = f.agent(0, 900);
+    f.caller = Some(caller);
     let own = f.agent(0, 900);
     let other = f.agent(1, 900);
     let detached = f.agent(1, 900);
@@ -552,4 +572,219 @@ fn a_single_detached_assertion_still_returns_busy_and_protection_errors() {
         })),
         "active_overseer_or_overlord"
     );
+}
+
+#[test]
+fn unavailable_connection_evidence_allows_only_preview_and_external_claims_are_denied() {
+    let mut f = Fixture::new();
+    let target_pane = f.agent(0, 900);
+    let preview = json(&f.app.handle_agent_close(
+        "preview".into(),
+        AgentCloseParams {
+            target: Some(raw(target_pane)),
+            ..Default::default()
+        },
+    ));
+    assert_eq!(preview["result"]["dry_run"], true);
+    assert_eq!(preview["result"]["would_close_count"], 1);
+    for claim in [None, Some(raw(target_pane))] {
+        let response = json(&f.app.handle_agent_close(
+            "apply".into(),
+            AgentCloseParams {
+                caller_pane_id: claim,
+                force: true,
+                ..target(target_pane)
+            },
+        ));
+        assert_eq!(code(&response), "caller_identity_unavailable", "{response}");
+    }
+    assert_eq!(
+        code(&f.close(AgentCloseParams {
+            caller_pane_id: Some(raw(target_pane)),
+            ..target(target_pane)
+        })),
+        "permission_denied"
+    );
+    assert!(f.app.state.terminal_id_for_any_pane(target_pane).is_some());
+}
+
+#[tokio::test]
+async fn real_socket_worker_cannot_spoof_overlord_or_drop_environment_even_when_detached() {
+    use std::os::unix::net::UnixListener;
+    let mut f = Fixture::new();
+    let worker = f.agent(0, 900);
+    let boss = f.agent(0, 900);
+    f.role(boss, true);
+    let victim = f.agent(1, 900);
+    std::fs::create_dir_all(&f.root).unwrap();
+    let socket = f.root.join("test.sock");
+    let ready = f.root.join("ready");
+    let finished = f.root.join("finished");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let thread = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        for _ in 0..4 {
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "test socket accept timeout"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("test socket accept: {error}"),
+                }
+            };
+            crate::api::serve_test_connection(stream, &tx).unwrap();
+        }
+    });
+    // Run a real socket client under a throwaway PTY child, with no model harness.
+    // Its spoofed server-only evidence is ignored by serde as well.
+    let script = r#"
+import json, os, socket, sys, time
+path, ready, finished, boss, victim, worker = sys.argv[1:]
+os.environ.pop('HERDR_PANE_ID', None)
+while not os.path.exists(ready): time.sleep(.01)
+for claim, target in [(boss, victim), (None, victim), (None, worker), (boss, worker)]:
+    params = dict(target=target, apply=True, force=True,
+                  peer_process=dict(ancestry=[1], complete=True))
+    if claim is not None: params['caller_pane_id'] = claim
+    with socket.socket(socket.AF_UNIX) as client:
+        client.connect(path)
+        client.sendall((json.dumps(dict(id='attack', method='agent.close', params=params))+'\n').encode())
+        response = json.loads(client.makefile().readline())
+        assert response['error']['code'] == 'permission_denied', response
+open(finished, 'w').write('four attacks denied')
+time.sleep(10)
+"#;
+    let runtime = crate::terminal::TerminalRuntime::spawn_argv_command(
+        worker,
+        24,
+        80,
+        std::env::temp_dir(),
+        &[
+            "/usr/bin/env".into(),
+            "python3".into(),
+            "-c".into(),
+            script.into(),
+            socket.display().to_string(),
+            ready.display().to_string(),
+            finished.display().to_string(),
+            raw(boss),
+            raw(victim),
+            raw(worker),
+        ],
+        1024 * 1024,
+        f.app.state.host_terminal_theme,
+        f.app.event_tx.clone(),
+        f.app.render_notify.clone(),
+        f.app.render_dirty.clone(),
+    )
+    .unwrap();
+    let terminal = f.terminal(worker);
+    f.app.terminal_runtimes.insert(terminal, runtime);
+    f.detach(worker);
+    std::fs::write(&ready, "go").unwrap();
+    for _ in 0..4 {
+        let message = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let Method::AgentClose(params) = &message.request.method else {
+            panic!("unexpected request")
+        };
+        assert_ne!(
+            params.peer_process,
+            crate::api::peer::PeerProcess::default()
+        );
+        f.app.handle_api_request_message(message);
+    }
+    thread.join().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !finished.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        std::fs::read_to_string(finished).unwrap(),
+        "four attacks denied"
+    );
+    assert!(f.app.state.terminal_id_for_any_pane(victim).is_some());
+    assert!(f.app.state.is_detached_agent_pane(worker));
+}
+
+#[tokio::test]
+async fn process_resolved_roles_apply_scope_without_client_claims() {
+    for chief in [false, true] {
+        let mut f = Fixture::new();
+        let caller = f.agent(0, 900);
+        f.role(caller, chief);
+        let own = f.agent(0, 900);
+        let other = f.agent(1, 900);
+        let runtime = crate::terminal::TerminalRuntime::spawn_argv_command(
+            caller,
+            24,
+            80,
+            std::env::temp_dir(),
+            &["/bin/cat".into()],
+            1024 * 1024,
+            f.app.state.host_terminal_theme,
+            f.app.event_tx.clone(),
+            f.app.render_notify.clone(),
+            f.app.render_dirty.clone(),
+        )
+        .unwrap();
+        let peer = crate::api::peer::PeerProcess::capture(Some(runtime.child_pid()));
+        let terminal = f.terminal(caller);
+        f.app.terminal_runtimes.insert(terminal, runtime);
+        let response = json(&f.app.handle_agent_close(
+            "cross".into(),
+            AgentCloseParams {
+                peer_process: peer.clone(),
+                ..target(other)
+            },
+        ));
+        if chief {
+            assert_eq!(response["result"]["closed_count"], 1, "{response}");
+        } else {
+            assert_eq!(code(&response), "permission_denied", "{response}");
+        }
+        assert_eq!(
+            json(&f.app.handle_agent_close(
+                "own".into(),
+                AgentCloseParams {
+                    peer_process: peer.clone(),
+                    ..target(own)
+                }
+            ))["result"]["closed_count"],
+            1
+        );
+        assert_eq!(
+            code(&json(&f.app.handle_agent_close(
+                "self".into(),
+                AgentCloseParams {
+                    peer_process: peer,
+                    force: true,
+                    ..target(caller)
+                }
+            ))),
+            "cannot_close_caller"
+        );
+        // The test process is outside all of its synthetic pane runtimes.
+        let external = crate::api::peer::PeerProcess::capture(Some(std::process::id()));
+        let target_pane = f.agent(1, 900);
+        assert_eq!(
+            json(&f.app.handle_agent_close(
+                "external".into(),
+                AgentCloseParams {
+                    peer_process: external,
+                    ..target(target_pane)
+                }
+            ))["result"]["closed_count"],
+            1
+        );
+    }
 }

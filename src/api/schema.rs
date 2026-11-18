@@ -1267,6 +1267,9 @@ pub struct TabInfo {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCloseParams {
+    /// Connection evidence populated by the server, never accepted from JSON.
+    #[serde(skip)]
+    pub(crate) peer_process: crate::api::peer::PeerProcess,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     #[serde(default)]

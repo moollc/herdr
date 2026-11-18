@@ -137,6 +137,7 @@ fn handle_connection(
         debug!(err = %err, "api connection write timeout unavailable");
     }
 
+    let peer_pid = crate::platform::unix_peer_pid(&stream);
     let Some(line) = read_initial_request_line(&mut stream)? else {
         return Ok(());
     };
@@ -146,7 +147,7 @@ fn handle_connection(
         return Ok(());
     }
 
-    let request = match serde_json::from_str::<Request>(line) {
+    let mut request = match serde_json::from_str::<Request>(line) {
         Ok(request) => request,
         Err(err) => {
             write_json_line_allow_disconnect(
@@ -163,6 +164,9 @@ fn handle_connection(
         }
     };
 
+    if let Method::AgentClose(params) = &mut request.method {
+        params.peer_process = crate::api::peer::PeerProcess::capture(peer_pid);
+    }
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
@@ -590,6 +594,20 @@ fn error_response_json(id: String, code: &str, message: String) -> String {
         r#"{"id":"","error":{"code":"internal_error","message":"failed to encode error response"}}"#
             .to_string()
     })
+}
+
+#[cfg(test)]
+pub(super) fn serve_test_connection(
+    stream: UnixStream,
+    api_tx: &ApiRequestSender,
+) -> std::io::Result<()> {
+    handle_connection(
+        stream,
+        api_tx,
+        &EventHub::default(),
+        &Arc::new(AtomicBool::new(true)),
+        None,
+    )
 }
 
 #[cfg(test)]

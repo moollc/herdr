@@ -965,6 +965,28 @@ pub(crate) fn default_browser_bundle_id() -> Option<String> {
     }
 }
 
+/// Kernel identity of the process that connected this Unix socket.
+pub(crate) fn unix_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of_val(&pid) as libc::socklen_t;
+    // SAFETY: pid and len are writable buffers of the sizes supplied to getsockopt.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            &mut pid as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (result == 0 && len as usize == std::mem::size_of_val(&pid) && pid > 0).then_some(pid as u32)
+}
+
+pub(crate) fn parent_process_id(pid: u32) -> Option<u32> {
+    process_bsdinfo(pid).map(|info| info.pbi_ppid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

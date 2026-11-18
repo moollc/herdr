@@ -1,24 +1,46 @@
 //! Agent deletion is distinct from closing a pane, which sets its agent down.
+use crate::api::peer::Caller;
 use crate::api::schema::{AgentCloseCandidate, AgentCloseParams, AgentCloseResult, ResponseResult};
 use crate::app::App;
 use crate::detect::AgentState;
+use crate::terminal::TerminalId;
 
 use super::responses::{encode_error, encode_error_body, encode_success};
 
 impl App {
     pub(super) fn handle_agent_close(&mut self, id: String, params: AgentCloseParams) -> String {
+        let anchors = self.terminal_runtimes.iter().map(|(terminal, runtime)| {
+            let mut pids = runtime.agent_process_ids();
+            pids.push(runtime.child_pid()); // PTY child is also the session leader.
+            (terminal.clone(), pids)
+        });
+        let identity = params.peer_process.resolve(anchors);
+        self.handle_agent_close_as(id, params, identity)
+    }
+
+    fn handle_agent_close_as(
+        &mut self,
+        id: String,
+        params: AgentCloseParams,
+        identity: Caller<TerminalId>,
+    ) -> String {
         if params.target.is_none() && !params.detached {
             return encode_error(id, "invalid_params", "provide a target or --detached");
         }
-        // An unresolvable identity must never fall through to operator scope.
-        let caller = match params.caller_pane_id.as_deref() {
-            Some(raw) => {
-                let Some(terminal_id) = self
-                    .parse_reporting_pane_id(raw)
-                    .and_then(|pane| self.state.terminal_id_for_any_pane(pane))
-                else {
-                    return encode_error(id, "permission_denied", "calling pane not found");
-                };
+        let caller = match identity {
+            Caller::Pane(terminal_id) => {
+                if params.caller_pane_id.as_deref().is_some_and(|claim| {
+                    self.parse_reporting_pane_id(claim)
+                        .and_then(|pane| self.state.terminal_id_for_any_pane(pane))
+                        .as_ref()
+                        != Some(&terminal_id)
+                }) {
+                    return encode_error(
+                        id,
+                        "permission_denied",
+                        "caller pane claim conflicts with socket peer identity",
+                    );
+                }
                 let Some(terminal) = self.state.terminals.get(&terminal_id) else {
                     return encode_error(id, "permission_denied", "calling terminal not found");
                 };
@@ -29,8 +51,29 @@ impl App {
                 }
                 Some((terminal_id, terminal.overseer.is_session_overlord()))
             }
-            None => None,
+            Caller::External => {
+                if params.caller_pane_id.is_some() {
+                    return encode_error(
+                        id,
+                        "permission_denied",
+                        "external socket peer cannot claim a pane identity",
+                    );
+                }
+                None
+            }
+            Caller::Unavailable => {
+                if params.apply {
+                    return encode_error(id, "caller_identity_unavailable", "cannot verify socket peer credentials or process ancestry; preview only, --apply refused");
+                }
+                None
+            }
         };
+        // Audit the verified identity even when the client omitted its environment.
+        let caller_label = caller.as_ref().and_then(|(terminal, _)| {
+            self.resolve_terminal_target(&terminal.to_string())
+                .ok()
+                .map(|target| format!("p_{}", target.pane_id.raw()))
+        });
         let space_only = caller.as_ref().is_some_and(|(_, chief)| !chief);
         let caller_space = caller
             .as_ref()
@@ -159,8 +202,7 @@ impl App {
             }
             self.shutdown_detached_terminal_runtimes();
             if closed_count > 0 {
-                let audit = self
-                    .log_agent_close_to_situation(params.caller_pane_id.as_deref(), &candidates);
+                let audit = self.log_agent_close_to_situation(caller_label.as_deref(), &candidates);
                 self.save_session_now();
                 if let Err(error) = audit {
                     tracing::error!(%error, closed_count, "agents closed but audit write failed");

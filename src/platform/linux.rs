@@ -454,6 +454,30 @@ fn process_session_id(pid: u32) -> Option<i32> {
     fields.get(3)?.parse().ok()
 }
 
+pub(crate) fn unix_peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of_val(&cred) as libc::socklen_t;
+    // SAFETY: cred and len are writable buffers of the sizes supplied to getsockopt.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    (result == 0 && len as usize == std::mem::size_of_val(&cred) && cred.pid > 0)
+        .then_some(cred.pid as u32)
+}
+
+pub(crate) fn parent_process_id(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat.get(stat.rfind(')')? + 2..)?;
+    fields.split_whitespace().nth(1)?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

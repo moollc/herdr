@@ -263,7 +263,7 @@ fn parse_agent_close(
 fn agent_close(args: &[String]) -> std::io::Result<i32> {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
         eprintln!("{AGENT_CLOSE_USAGE}");
-        eprintln!("Preview by default; --apply terminates agents. --force permits working/blocked agents, but never the caller or an active role holder. Space overseers cover their own space; --allow-detached adds detached scope. Worker panes are denied. Caller defaults to HERDR_PANE_ID; --caller-pane overrides it.");
+        eprintln!("Preview by default; --apply terminates agents. --force permits working/blocked agents, but never the caller or an active role holder. Space overseers cover their own space; --allow-detached adds detached scope. Worker panes are denied. Socket peer process ancestry determines the caller, even without HERDR_PANE_ID. --caller-pane (default HERDR_PANE_ID) is a checked claim, not an override. External peers have operator scope. Unavailable credentials or ancestry permit preview only; --apply is refused.");
         return Ok(0);
     }
     let params = match parse_agent_close(args, std::env::var("HERDR_PANE_ID").ok()) {
