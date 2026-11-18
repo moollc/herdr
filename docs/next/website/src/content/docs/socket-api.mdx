@@ -327,3 +327,17 @@ Prompt paste and Enter occupy a single ordered input queue entry. A full or clos
 Codex SessionStart reports may additionally include `startup_source` (`startup`, `resume`, or `compact`). A verified `herdr:codex` report with a native session ID and `startup` source can return `{"type":"orientation_context","context":"..."}` instead of `{"type":"ok"}`. The installed hook forwards that context through SessionStart `hookSpecificOutput.additionalContext` before the first task, including shell and external-panel launches. Repeated reports for a delivered generation and native resume/compact events return no context. Structured argv delivery and hook delivery share the terminal's once-only state. Other integrations that omit the optional field retain their existing response.
 
 Raw `pane.send_input` and `pane.send_keys` batches also occupy one queue entry. Nonblank literal text suppresses any pending semantic fallback after admission; navigation keys and empty sends preserve it. Literal task bytes are never rewritten by the startup hook.
+
+## End agents
+
+`agent.close` accepts `target` (optional string), `detached` (boolean), `idle_over_seconds` (optional nonnegative integer), `force`, `apply`, `allow_detached` (booleans, default `false`), and `caller_pane_id` (optional string). Provide a target or set `detached: true`. With both, the target must be detached. Omitting `apply` produces a preview.
+
+```json
+{"id":"preview","method":"agent.close","params":{"detached":true,"idle_over_seconds":300}}
+```
+
+The result has `type: "agent_close"`, `dry_run`, `closed_count`, `would_close_count`, `skipped_count`, and `candidates`. Each candidate includes `terminal_id`, `raw_pane_id`, optional docked `pane_id` and `workspace_id`, `location`, `agent`, `agent_status`, optional `idle_seconds`, `title`, `cwd`, `action` (`would_close`, `closed`, or `skipped`), and optional `reason`. Skip reasons include `cannot_close_caller`, `active_overseer_or_overlord`, `agent_working`, `agent_blocked`, `idle_under_threshold`, and `not_detached`.
+
+Caller context follows the CLI role rules. Unknown callers and workers receive `permission_denied`. A single applied busy target returns `agent_busy`; self and active role targets return their protection code. These local role checks trust caller-supplied context. `force` cannot override scope or role protection. If deletion succeeds but audit persistence fails, `agent_close_audit_failed` reports how many agents were closed; inspect session state before retrying.
+
+Detached agents also appear in `agent.list`, with `workspace_id` and `tab_id` set to `"detached"` and a raw `p_<id>` pane handle. `pane.close` continues to set docked agents down without ending them.

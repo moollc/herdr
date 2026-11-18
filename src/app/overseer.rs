@@ -1510,6 +1510,153 @@ impl App {
         base.with_file_name(format!("space-{name}.md"))
     }
 
+    /// Persist close notes in the existing role-memory streams. Situation
+    /// rendering reads them back, so a later periodic refresh keeps the audit.
+    pub(super) fn log_agent_close_to_situation(
+        &self,
+        caller: Option<&str>,
+        candidates: &[crate::api::schema::AgentCloseCandidate],
+    ) -> std::io::Result<()> {
+        use crate::role_continuity::{append_record, memory_path, ContinuityRecord};
+        let caller_terminal = caller
+            .and_then(|raw| self.parse_reporting_pane_id(raw))
+            .and_then(|pane| self.state.terminal_id_for_any_pane(pane));
+        let native_session = caller_terminal
+            .as_ref()
+            .and_then(|id| self.state.terminals.get(id))
+            .and_then(|t| t.current_session_identity_for_persistence());
+        let root = self
+            .overseer_service
+            .situation_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("role-memory");
+        let mut affected = std::collections::BTreeSet::new();
+        for candidate in candidates.iter().filter(|c| c.action == "closed") {
+            let text = format!(
+                "agent.close caller={} closed {} ({}, {}, idle_seconds={:?}, location={})",
+                caller.unwrap_or("external"),
+                candidate.terminal_id,
+                candidate.agent,
+                candidate.agent_status,
+                candidate.idle_seconds,
+                candidate.location
+            );
+            // The session record covers detached closes and gives the overlord
+            // one complete audit; docked closes also belong to their own space.
+            let mut scopes = vec![(
+                "session".to_string(),
+                "session:overlord".to_string(),
+                "sessionoverlord",
+            )];
+            if let Some(workspace) = &candidate.workspace_id {
+                scopes.push((
+                    workspace.clone(),
+                    format!("space:{workspace}"),
+                    "spaceoverseer",
+                ));
+            }
+            for (scope_id, key, role) in scopes {
+                append_record(
+                    &memory_path(&root, &key),
+                    &ContinuityRecord::Memory {
+                        recorded_at_unix: crate::role_continuity::unix_now(),
+                        role: role.into(),
+                        scope_id: scope_id.clone(),
+                        terminal_id: caller_terminal
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "external".into()),
+                        native_session: native_session.clone(),
+                        text: text.clone(),
+                    },
+                )?;
+                affected.insert(scope_id);
+            }
+        }
+        // Refresh active holders with their existing mail, and create a chief
+        // report even when no chief is assigned (external operator case).
+        let chief = self
+            .state
+            .terminals
+            .values()
+            .find(|t| t.overseer.is_session_overlord())
+            .map(|t| t.id.clone())
+            .unwrap_or_else(TerminalId::alloc);
+        self.write_situation(&chief, Kind::Chief)?;
+        for scope_id in affected.iter().filter(|s| s.as_str() != "session") {
+            let workspace = self.state.workspaces.iter().find(|w| &w.id == scope_id);
+            if let Some(terminal) = workspace.and_then(|w| {
+                w.tabs
+                    .iter()
+                    .flat_map(|t| t.panes.values())
+                    .map(|p| &p.attached_terminal_id)
+                    .find(|id| {
+                        self.state
+                            .terminals
+                            .get(*id)
+                            .is_some_and(|t| t.overseer.is_space_overseer())
+                    })
+                    .or_else(|| {
+                        w.tabs
+                            .iter()
+                            .flat_map(|t| t.panes.values())
+                            .next()
+                            .map(|p| &p.attached_terminal_id)
+                    })
+            }) {
+                self.write_situation(terminal, Kind::Space)?;
+            } else {
+                let name: String = scope_id
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                let path = self
+                    .overseer_service
+                    .situation_path
+                    .with_file_name(format!("space-{name}.md"));
+                let mut text =
+                    "# Herdr situation for one space\n\nThis space has closed.\n".to_string();
+                self.append_agent_close_audit(&mut text, &format!("space:{scope_id}"));
+                std::fs::write(path, text)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn append_agent_close_audit(&self, text: &mut String, key: &str) {
+        let root = self
+            .overseer_service
+            .situation_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("role-memory");
+        let read = crate::role_continuity::read_records_lenient(
+            &crate::role_continuity::memory_path(&root, key),
+        );
+        for problem in &read.problems {
+            tracing::warn!(%problem, "cannot read part of agent close audit");
+        }
+        let notes: Vec<_> = read
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                crate::role_continuity::ContinuityRecord::Memory { text, .. }
+                    if text.starts_with("agent.close ") =>
+                {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect();
+        if !notes.is_empty() {
+            text.push_str("\n## Agent close audit (latest 20)\n");
+            for note in notes.iter().skip(notes.len().saturating_sub(20)) {
+                text.push_str(&format!("- {}\n", one_line(note)));
+            }
+        }
+    }
+
     fn write_situation(&self, holder: &TerminalId, kind: Kind) -> std::io::Result<()> {
         let places = self.state.terminal_places();
         let own_space = places.get(holder).copied();
@@ -1534,8 +1681,8 @@ impl App {
             }
         }
         if kind == Kind::Chief {
+            text.push_str("\n## Detached\n");
             for detached in &self.state.detached_agents {
-                text.push_str("\n## Detached\n");
                 self.append_situation_pane(
                     &mut text,
                     detached.pane_id,
@@ -1566,6 +1713,16 @@ impl App {
                 text.push_str(line);
                 text.push('\n');
             }
+        }
+        let scope_key = if kind == Kind::Chief {
+            Some("session:overlord".to_string())
+        } else {
+            own_space
+                .and_then(|i| self.state.workspaces.get(i))
+                .map(|ws| format!("space:{}", ws.id))
+        };
+        if let Some(key) = scope_key {
+            self.append_agent_close_audit(&mut text, &key);
         }
         let path = self.overseer_situation_path(holder, kind);
         if let Some(parent) = path.parent() {

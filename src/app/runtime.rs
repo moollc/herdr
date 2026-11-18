@@ -115,6 +115,7 @@ impl App {
         let terminal_ids = std::mem::take(&mut self.state.terminal_runtime_shutdowns);
         for terminal_id in terminal_ids {
             if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
+                runtime.terminate_agent_processes();
                 runtime.shutdown();
             }
         }
@@ -139,6 +140,7 @@ impl App {
             &msg.request.method,
             crate::api::schema::Method::ServerStop(_)
                 | crate::api::schema::Method::ServerLiveHandoff(_)
+                | crate::api::schema::Method::AgentClose(_)
         );
         let response = self.handle_api_request(msg.request);
         if !skip_default_workspace {

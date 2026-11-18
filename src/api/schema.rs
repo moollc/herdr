@@ -58,6 +58,8 @@ pub enum Method {
     TabClose(TabTarget),
     #[serde(rename = "agent.list")]
     AgentList(EmptyParams),
+    #[serde(rename = "agent.close")]
+    AgentClose(AgentCloseParams),
     #[serde(rename = "agent.get")]
     AgentGet(AgentTarget),
     #[serde(rename = "agent.read")]
@@ -1119,6 +1121,7 @@ pub enum ResponseResult {
     AgentList {
         agents: Vec<AgentInfo>,
     },
+    AgentClose(AgentCloseResult),
     PaneInfo {
         pane: PaneInfo,
     },
@@ -1260,6 +1263,53 @@ pub struct TabInfo {
     pub focused: bool,
     pub pane_count: usize,
     pub agent_status: AgentStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCloseParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub detached: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_over_seconds: Option<u64>,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub apply: bool,
+    #[serde(default)]
+    pub allow_detached: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_pane_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCloseCandidate {
+    pub terminal_id: String,
+    pub raw_pane_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    pub location: String,
+    pub agent: String,
+    pub agent_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_seconds: Option<u64>,
+    pub title: String,
+    pub cwd: String,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCloseResult {
+    pub dry_run: bool,
+    pub closed_count: usize,
+    pub would_close_count: usize,
+    pub skipped_count: usize,
+    pub candidates: Vec<AgentCloseCandidate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -63,8 +63,11 @@ impl App {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
         };
-        let Some((pane, workspace_id)) = self.lookup_runtime(resolved.ws_idx, resolved.pane_id)
-        else {
+        let agent = match self.agent_info_for_target(&params.target) {
+            Ok(agent) => agent,
+            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+        };
+        let Some(pane) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &params.target);
         };
         let requested_lines = params.lines.unwrap_or(80).min(1000) as usize;
@@ -85,13 +88,9 @@ impl App {
             id,
             ResponseResult::PaneRead {
                 read: PaneReadResult {
-                    pane_id: self
-                        .public_pane_id(resolved.ws_idx, resolved.pane_id)
-                        .unwrap_or_else(|| params.target.clone()),
-                    workspace_id,
-                    tab_id: self
-                        .public_tab_id(resolved.ws_idx, resolved.tab_idx)
-                        .unwrap(),
+                    pane_id: agent.pane_id,
+                    workspace_id: agent.workspace_id,
+                    tab_id: agent.tab_id,
                     source: params.source,
                     format: params.format,
                     text,

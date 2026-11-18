@@ -57,6 +57,16 @@ impl App {
             }
         }
 
+        if let Some(pane_id) = self.parse_reporting_pane_id(target) {
+            if let Some(resolved) = self
+                .terminal_targets()
+                .into_iter()
+                .find(|item| item.pane_id == pane_id)
+            {
+                return Ok(resolved);
+            }
+        }
+
         let assigned = crate::pane_names::assigned_names(&self.state.terminals);
         let name_matches: Vec<_> = self
             .terminal_targets()
@@ -70,6 +80,7 @@ impl App {
                         terminal.agent_name.as_deref() == Some(target)
                             || terminal.effective_agent_label() == Some(target)
                             || terminal.manual_label.as_deref() == Some(target)
+                            || terminal.effective_presentation().title.as_deref() == Some(target)
                             || assigned
                                 .get(&terminal.id)
                                 .is_some_and(|name| name.eq_ignore_ascii_case(target))
@@ -168,6 +179,22 @@ impl App {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     ) -> Option<TerminalTargetCandidate> {
+        if let Some(info) = self
+            .state
+            .detached_agents
+            .iter()
+            .find(|item| item.pane_id == pane_id)
+            .and_then(|item| self.detached_agent_info(item))
+        {
+            return Some(TerminalTargetCandidate {
+                terminal_id: info.terminal_id,
+                pane_id: info.pane_id,
+                workspace_id: info.workspace_id,
+                tab_id: info.tab_id,
+                cwd: info.cwd,
+                agent_status: info.agent_status,
+            });
+        }
         let ws = self.state.workspaces.get(ws_idx)?;
         let tab_idx = ws.find_tab_index_for_pane(pane_id)?;
         let pane = ws.pane_state(pane_id)?;

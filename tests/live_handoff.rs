@@ -1021,8 +1021,8 @@ fn live_handoff_accepts_old_pane_id_from_child_env() {
             }
             let session = format!("{kind}-generation-{generation}");
             if kind == "claude" && generation > 0 {
-                // agent.list intentionally describes layout panes. Check the
-                // actual persisted detached terminal after the native callback.
+                // Detached agents stay visible across handoffs. Check both the
+                // public row and the persisted terminal after the native callback.
                 let snapshot = config_home
                     .join(app_dir_name())
                     .join("sessions/handoff-reporting/session.json");
@@ -1040,10 +1040,25 @@ fn live_handoff_accepts_old_pane_id_from_child_env() {
                     "detached native session lost or duplicated: {saved}"
                 );
                 assert_eq!(matches[0]["pane"]["terminal_id"], *terminal);
+                let detached_rows: Vec<_> = rows
+                    .iter()
+                    .filter(|row| row["agent_session"]["value"] == session)
+                    .collect();
+                assert_eq!(
+                    detached_rows.len(),
+                    1,
+                    "detached session lost or duplicated: {agents}"
+                );
+                assert_eq!(detached_rows[0]["terminal_id"], *terminal);
+                assert_eq!(detached_rows[0]["workspace_id"], "detached");
+                assert_eq!(detached_rows[0]["tab_id"], "detached");
+                assert!(detached_rows[0]["pane_id"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("p_"));
                 assert!(
-                    !rows
-                        .iter()
-                        .any(|row| row["agent_session"]["value"] == session),
+                    !rows.iter().any(|row| row["workspace_id"] != "detached"
+                        && row["agent_session"]["value"] == session),
                     "detached report leaked into a layout pane: {agents}"
                 );
                 continue;

@@ -1811,6 +1811,12 @@ impl AppState {
             .any(|detached| detached.pane.attached_terminal_id == *terminal_id)
     }
 
+    pub(crate) fn is_detached_agent_pane(&self, pane_id: PaneId) -> bool {
+        self.detached_agents
+            .iter()
+            .any(|item| item.pane_id == pane_id)
+    }
+
     /// End a set-down agent. This is the one thing that ends an agent with no
     /// pane: it leaves the table and its process is shut down.
     pub fn close_detached_agent(&mut self, pane_id: PaneId) {
@@ -2265,27 +2271,10 @@ impl AppState {
             return false;
         };
 
-        if let Some(child_pid) = self
-            .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
-            .map(|runtime| runtime.child_pid())
-            .filter(|pid| *pid != 0)
+        if let Some(runtime) =
+            self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
         {
-            let foreground_job = crate::platform::foreground_job(child_pid)
-                .filter(|job| job.process_group_id != child_pid);
-            match foreground_job {
-                Some(job) => {
-                    crate::pane::terminate_agent_processes(
-                        job.processes.iter().map(|process| process.pid).collect(),
-                    );
-                }
-                None => {
-                    let mut pids = crate::platform::session_processes(child_pid);
-                    if pids.is_empty() {
-                        pids.push(child_pid);
-                    }
-                    crate::pane::terminate_agent_processes(pids);
-                }
-            }
+            runtime.terminate_agent_processes();
         }
 
         if self.close_pane_would_close_workspace(ws_idx, pane_id) {

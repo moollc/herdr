@@ -16,6 +16,8 @@ pub struct TerminalRuntime(
     crate::pane::PaneRuntime,
     std::sync::Mutex<Option<std::time::Instant>>,
     std::sync::atomic::AtomicBool,
+    // A close and the shutdown queue can both request termination. Capture once.
+    std::sync::atomic::AtomicBool,
 );
 
 impl TerminalRuntime {
@@ -23,6 +25,7 @@ impl TerminalRuntime {
         Self(
             inner,
             std::sync::Mutex::new(None),
+            std::sync::atomic::AtomicBool::new(false),
             std::sync::atomic::AtomicBool::new(false),
         )
     }
@@ -80,6 +83,32 @@ impl TerminalRuntime {
                 now.saturating_duration_since(last) >= std::time::Duration::from_secs(2)
             })
         })
+    }
+
+    /// Capture the closing terminal's foreground job (or its session) before
+    /// the PTY is dropped, then use the same asynchronous signal ladder as a
+    /// docked agent close. Never re-probe after shutdown and risk a new job.
+    pub(crate) fn terminate_agent_processes(&self) {
+        if self.3.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let child_pid = self.child_pid();
+        if child_pid == 0 {
+            return;
+        }
+        let pids = match crate::platform::foreground_job(child_pid)
+            .filter(|job| job.process_group_id != child_pid)
+        {
+            Some(job) => job.processes.iter().map(|process| process.pid).collect(),
+            None => {
+                let mut pids = crate::platform::session_processes(child_pid);
+                if pids.is_empty() {
+                    pids.push(child_pid);
+                }
+                pids
+            }
+        };
+        crate::pane::terminate_agent_processes(pids);
     }
 
     pub fn shutdown(self) {

@@ -113,7 +113,57 @@ impl App {
                         .filter_map(move |pane_id| self.agent_info(ws_idx, pane_id))
                 })
             })
+            .chain(
+                self.state
+                    .detached_agents
+                    .iter()
+                    .filter_map(|item| self.detached_agent_info(item)),
+            )
             .collect()
+    }
+
+    pub(super) fn detached_agent_info(
+        &self,
+        detached: &super::state::DetachedAgent,
+    ) -> Option<crate::api::schema::AgentInfo> {
+        let terminal = self
+            .state
+            .terminals
+            .get(&detached.pane.attached_terminal_id)?;
+        if !terminal.is_agent_terminal() {
+            return None;
+        }
+        let presentation = terminal.effective_presentation();
+        let runtime = self.terminal_runtimes.get(&terminal.id);
+        let now = std::time::SystemTime::now();
+        Some(crate::api::schema::AgentInfo {
+            terminal_id: terminal.id.to_string(),
+            name: terminal.agent_name.clone(),
+            agent: terminal.effective_agent_label().map(str::to_string),
+            title: presentation.title,
+            display_agent: presentation.display_agent,
+            agent_status: super::api_helpers::pane_agent_status(terminal.state, detached.pane.seen),
+            custom_status: presentation.custom_status,
+            state_labels: presentation.state_labels,
+            agent_session: super::creation::terminal_agent_session_info(terminal),
+            workspace_id: "detached".into(),
+            tab_id: "detached".into(),
+            pane_id: format!("p_{}", detached.pane_id.raw()),
+            focused: false,
+            cwd: Some(
+                runtime
+                    .and_then(|r| r.cwd())
+                    .unwrap_or_else(|| terminal.cwd.clone())
+                    .display()
+                    .to_string(),
+            ),
+            foreground_cwd: runtime
+                .and_then(|r| r.foreground_cwd())
+                .map(|p| p.display().to_string()),
+            revision: terminal.revision,
+            run_seconds: terminal.agent_run_duration(now).map(|d| d.as_secs()),
+            idle_seconds: terminal.agent_idle_duration(now).map(|d| d.as_secs()),
+        })
     }
 
     pub(super) fn agent_info_for_target(
@@ -121,7 +171,12 @@ impl App {
         target: &str,
     ) -> Result<crate::api::schema::AgentInfo, TerminalTargetError> {
         let resolved = self.resolve_terminal_target(target)?;
-        self.agent_info(resolved.ws_idx, resolved.pane_id)
+        self.state
+            .detached_agents
+            .iter()
+            .find(|item| item.pane_id == resolved.pane_id)
+            .and_then(|item| self.detached_agent_info(item))
+            .or_else(|| self.agent_info(resolved.ws_idx, resolved.pane_id))
             .ok_or_else(|| TerminalTargetError::NotFound {
                 target: target.to_string(),
             })

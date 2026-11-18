@@ -11,6 +11,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
     };
 
     match subcommand {
+        "close" => agent_close(&args[1..]),
         "list" => agent_list(&args[1..]),
         "get" => agent_get(&args[1..]),
         "status" => agent_status(&args[1..]),
@@ -205,6 +206,109 @@ fn agent_worktree_land(args: &[String]) -> std::io::Result<i32> {
         id: "cli:agent:worktree:land".into(),
         method: Method::AgentWorktreeLand(AgentWorktreeLandParams { target, cwd }),
     })?)
+}
+
+const AGENT_CLOSE_USAGE: &str = "herdr agent close <target|--detached> [--idle-over SECONDS] [--force] [--dry-run|--apply] [--allow-detached] [--caller-pane ID] [--json]";
+
+fn parse_agent_close(
+    args: &[String],
+    caller: Option<String>,
+) -> Result<crate::api::schema::AgentCloseParams, String> {
+    let mut params = crate::api::schema::AgentCloseParams {
+        caller_pane_id: caller,
+        ..Default::default()
+    };
+    let mut dry_run = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--detached" => params.detached = true,
+            "--force" => params.force = true,
+            "--apply" => params.apply = true,
+            "--dry-run" => dry_run = true,
+            "--allow-detached" => params.allow_detached = true,
+            "--json" => {}
+            "--idle-over" | "--caller-pane" => {
+                let flag = &args[index];
+                index += 1;
+                let value = args
+                    .get(index)
+                    .filter(|v| !v.starts_with('-'))
+                    .ok_or_else(|| format!("missing value for {flag}"))?;
+                if flag == "--idle-over" {
+                    params.idle_over_seconds =
+                        Some(value.parse().map_err(|_| {
+                            "--idle-over requires a nonnegative integer".to_string()
+                        })?);
+                } else {
+                    params.caller_pane_id = Some(value.clone());
+                }
+            }
+            value if !value.starts_with('-') && params.target.is_none() => {
+                params.target = Some(value.into())
+            }
+            other => return Err(format!("unknown option or extra target: {other}")),
+        }
+        index += 1;
+    }
+    if params.target.is_none() && !params.detached {
+        return Err("provide a target or --detached".into());
+    }
+    if params.apply && dry_run {
+        return Err("--apply and --dry-run are mutually exclusive".into());
+    }
+    Ok(params)
+}
+
+fn agent_close(args: &[String]) -> std::io::Result<i32> {
+    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        eprintln!("{AGENT_CLOSE_USAGE}");
+        eprintln!("Preview by default; --apply terminates agents. --force permits working/blocked agents, but never the caller or an active role holder. Space overseers cover their own space; --allow-detached adds detached scope. Worker panes are denied. Caller defaults to HERDR_PANE_ID; --caller-pane overrides it.");
+        return Ok(0);
+    }
+    let params = match parse_agent_close(args, std::env::var("HERDR_PANE_ID").ok()) {
+        Ok(params) => params,
+        Err(message) => {
+            eprintln!("{message}\nusage: {AGENT_CLOSE_USAGE}");
+            return Ok(2);
+        }
+    };
+    let response = super::send_request(&Request {
+        id: "cli:agent:close".into(),
+        method: Method::AgentClose(params),
+    })?;
+    if args.iter().any(|arg| arg == "--json") || response.get("error").is_some() {
+        return super::print_response(&response);
+    }
+    let result = &response["result"];
+    println!(
+        "{}: {} closed, {} would close, {} skipped",
+        if result["dry_run"] == true {
+            "dry run"
+        } else {
+            "applied"
+        },
+        result["closed_count"],
+        result["would_close_count"],
+        result["skipped_count"]
+    );
+    println!(
+        "{:<14} {:<24} {:<14} {:<10} REASON",
+        "ACTION", "PANE", "LOCATION", "STATUS"
+    );
+    if let Some(candidates) = result["candidates"].as_array() {
+        for c in candidates {
+            println!(
+                "{:<14} {:<24} {:<14} {:<10} {}",
+                c["action"].as_str().unwrap_or("?"),
+                c["raw_pane_id"].as_str().unwrap_or("?"),
+                c["location"].as_str().unwrap_or("?"),
+                c["agent_status"].as_str().unwrap_or("?"),
+                c["reason"].as_str().unwrap_or("")
+            );
+        }
+    }
+    Ok(0)
 }
 
 fn agent_list(args: &[String]) -> std::io::Result<i32> {
@@ -603,6 +707,8 @@ fn parse_agent_wait_status(value: &str) -> std::io::Result<AgentStatus> {
 
 fn print_agent_help() {
     eprintln!("herdr agent commands:");
+    eprintln!("  {AGENT_CLOSE_USAGE}");
+    eprintln!("  close previews by default; --apply ends agents, pane close only sets them down");
     eprintln!("  herdr agent list");
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent status [target]");
@@ -624,6 +730,35 @@ fn print_agent_help() {
 #[cfg(test)]
 mod tests {
     use super::agent_status_line;
+
+    #[test]
+    fn close_cli_defaults_and_flags() {
+        let args = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        let default = super::parse_agent_close(&args("--detached"), Some("p_1".into())).unwrap();
+        assert!(!default.apply);
+        assert_eq!(default.caller_pane_id.as_deref(), Some("p_1"));
+        let params = super::parse_agent_close(&args("term_a --detached --idle-over 300 --force --apply --allow-detached --caller-pane p_2 --json"), Some("p_1".into())).unwrap();
+        assert_eq!(params.target.as_deref(), Some("term_a"));
+        assert_eq!(params.idle_over_seconds, Some(300));
+        assert_eq!(params.caller_pane_id.as_deref(), Some("p_2"));
+        assert!(params.apply && params.force && params.allow_detached && params.detached);
+        for invalid in [
+            "",
+            "--apply --dry-run --detached",
+            "--detached --idle-over",
+            "--detached --idle-over -1",
+            "--detached --idle-over nope",
+            "a b",
+            "--detached --caller-pane",
+            "--unknown",
+        ] {
+            assert!(
+                super::parse_agent_close(&args(invalid), None).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
     use serde_json::json;
 
     #[test]

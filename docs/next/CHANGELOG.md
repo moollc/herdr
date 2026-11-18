@@ -10,6 +10,8 @@
 
 ### Fixed
 
+- Agents set down outside a space now appear in `agent list` and resolve in `agent get`, `read`, `send`, and `prompt`. Ending a set-down agent signals its processes before dropping the terminal runtime. `pane close` still sets a docked agent down and keeps it running.
+
 - Native agent reports keep reaching their original terminals through repeated live handoffs, including agents set down outside a workspace. Pane aliases now follow stable terminal identities across generations, and restored panes cannot reuse inherited raw ids that would send a report to another agent.
 
 - Agents started by typing their command into a pane, such as Claude Code or a Codex wrapper, now receive the Herdr orientation as soon as they are ready for input, with no hook needed. Each agent gets it once. An agent that exits and starts again in the same pane, including after a cold restart, gets it again; live handoffs do not. Typing into the agent before it is ready cancels it, and agents already oriented by a hook or a Herdr launch are skipped.
@@ -21,6 +23,8 @@
 - In Black Box, a Ctrl+clicked URL also stopped opening a third time from Black Box itself. herdr sets Black Box's `vte.ext.blackbox.app-opens-links` terminal property while it runs and clears it on exit, and Black Box leaves Ctrl+clicked links to herdr while it is set.
 
 ### Added
+
+- `herdr agent close` previews the agents it would end. Use a target or `--detached`, then `--apply` to end them. Space overseers can close agents in their own space, the session overlord and external operators cover the session, and active role holders and the caller stay protected. Applied closes are recorded in role memory and situation files.
 
 - OpenRouter allowance on the usage bar. A `1d` meter shows the free model requests left today as a percent, counting down to the next UTC day. A `cr` meter shows the paid credit balance in dollars (for example `9.90$`), with no reset and no countdown. The two readings are independent: each has its own age, and a missing one says why (`no key`, `unknown`, `offline`). Panes running Codex with `[ui.usage] openrouter_codex_home` (default `~/.codex-openrouter`) show as OpenRouter, not GPT. The key is read from an owner-only `openrouter_key_file` (one `OPENROUTER_API_KEY=` line or one bare token) or from the variable named in `openrouter_key_env`; nothing is requested without one. The allowance guard does not act on OpenRouter.
 - The allowance guard. When a provider's five hour allowance falls to 15% or below, or drops 25 points within 10 minutes, every working agent on that provider, in any space, gets one note to finish its step, save, write a hand off and stop. At 3% or below those agents are interrupted with their own interrupt key, and nothing is killed. The overseer pane gets one line naming the provider, the percent and the pane writing the most output. A `!` on the usage bar shows while the guard is active, and it re-arms once the allowance is back above 50%. Set it in `[allowance_guard]`: `wind_down_pct`, `fast_drop_points`, `fast_window_minutes`, `stop_pct`, and `claude`, `codex`, `cursor` to turn a provider on or off (Cursor is off by default).
