@@ -379,6 +379,46 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[tokio::test]
+    async fn recent_files_hidden_panel_forwards_first_client_key() {
+        for hidden in 0..3 {
+            for bytes in [b"l".as_slice(), b"\r", b"\x1b[A"] {
+                let (mut app, mut rx) = recent_files_client_app();
+                match hidden {
+                    0 => app.state.tasks_collapsed = true,
+                    1 => app.state.view.tasks_rect.width = 1,
+                    _ => app.state.view.tasks_rect.height = 1,
+                }
+                assert!(crate::ui::recent_file_viewport(&app.state).is_none());
+                app.route_client_input(bytes.to_vec());
+                assert_eq!(
+                    rx.try_recv().unwrap().as_ref(),
+                    bytes,
+                    "hidden case {hidden}"
+                );
+                assert!(!app.state.recent_files.keyboard_focus);
+                assert_eq!(app.state.recent_files.selected, None);
+                assert!(app.state.recent_files.open_error.is_none());
+                assert!(rx.try_recv().is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recent_files_release_through_key_handler_does_not_open_or_move() {
+        let (mut app, mut rx) = recent_files_client_app();
+        for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Esc] {
+            app.handle_key(
+                TerminalKey::new(code, KeyModifiers::NONE).with_kind(KeyEventKind::Release),
+            )
+            .await;
+            assert_eq!(app.state.recent_files.selected, Some(0));
+            assert!(app.state.recent_files.open_error.is_none());
+            assert!(app.state.recent_files.keyboard_focus);
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
     fn app_with_screen_bytes(bytes: &[u8]) -> (App, crate::layout::PaneInfo) {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");

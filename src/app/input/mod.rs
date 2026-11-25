@@ -166,7 +166,7 @@ impl App {
         if crate::ui::recent_file_viewport(&self.state).is_none() {
             self.state.recent_files.keyboard_focus = false;
             self.state.recent_files.selected = None;
-            return true;
+            return false;
         }
         match event.code {
             KeyCode::Esc => {

@@ -10,7 +10,7 @@
 
 ### Fixed
 
-- The agent files watcher keeps one recursive subscription per root on macOS, so directory churn no longer restarts the native stream for each directory. Ignored build events are filtered before queuing, unchanged snapshots no longer wake the UI, and skipped symlinks and vanished write events show partial coverage. macOS stream-wide event loss during builds remains visible, even for ignored output. The live watcher retains a measured idle server RSS cost of about 1.1–1.6 MiB (roughly 4–5%).
+- The agent files watcher keeps one recursive subscription per root on macOS, so directory churn no longer restarts the native stream for each directory. Ignored build events are filtered before queuing, unchanged snapshots no longer wake the UI, and ordinary atomic saves no longer report partial coverage. Recursive native coverage remains complete beyond discovery limits and for in-root file symlinks. Failed native root updates warn and retry; journal and watcher diagnostics occupy separate rows. Hidden file panels release keyboard focus without swallowing the first shell key. macOS stream-wide event loss during builds remains visible, even for ignored output. The live watcher retains a measured idle server RSS cost of about 1.1–1.6 MiB (roughly 4–5%).
 
 - Agents set down outside a space now appear in `agent list` and resolve in `agent get`, `read`, `send`, and `prompt`. Ending a set-down agent signals its processes before dropping the terminal runtime. `pane close` still sets a docked agent down and keeps it running.
 

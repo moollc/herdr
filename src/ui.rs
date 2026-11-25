@@ -245,6 +245,8 @@ fn compute_view_internal(
             resize_panes,
             cell_size,
         );
+        app.recent_files.keyboard_focus = false;
+        app.recent_files.selected = None;
         return;
     }
 
@@ -375,6 +377,10 @@ fn compute_view_internal(
     };
     app.view.pane_chrome_controls = self::panes::compute_pane_chrome_controls(app);
     app.view.pane_title_hit_areas = self::panes::compute_pane_title_hit_areas(app);
+    if tasks::recent_file_viewport(app).is_none() {
+        app.recent_files.keyboard_focus = false;
+        app.recent_files.selected = None;
+    }
 }
 
 fn desktop_sidebar_width(app: &AppState, total_width: u16) -> u16 {

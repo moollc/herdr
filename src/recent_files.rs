@@ -175,7 +175,7 @@ impl RecentFilesWatcher {
         snapshot.files.truncate(MAX_RESULTS);
         snapshot.error = match (&self.journal_error, &self.filesystem.activity.error) {
             // Lost hook data must stay visible before a potentially long watcher warning.
-            (Some(journal), Some(watcher)) => Some(format!("{journal}, {watcher}")),
+            (Some(journal), Some(watcher)) => Some(format!("{journal}\n{watcher}")),
             (Some(error), None) | (None, Some(error)) => Some(error.clone()),
             (None, None) => None,
         };
@@ -818,10 +818,13 @@ mod tests {
 
     #[test]
     fn error_selection_both_diagnostics_keep_journal_first() {
-        let snapshot = error_snapshot(Some("{corrupt}\n"), Some("File watcher partial"));
+        let snapshot = error_snapshot(
+            Some("{corrupt}\n"),
+            Some("File watcher partial, coverage may be incomplete"),
+        );
         assert_eq!(
             snapshot.error.as_deref(),
-            Some("Some agent file events were incomplete or unsupported, File watcher partial")
+            Some("Some agent file events were incomplete or unsupported\nFile watcher partial, coverage may be incomplete")
         );
         assert!(snapshot.truncated);
     }
@@ -861,7 +864,7 @@ mod tests {
         watcher.poll(Instant::now(), Some(base), &mut snapshot);
         assert_eq!(
             snapshot.error.as_deref(),
-            Some("Agent file activity journal is unavailable, File watcher partial")
+            Some("Agent file activity journal is unavailable\nFile watcher partial")
         );
         assert!(snapshot.truncated);
     }

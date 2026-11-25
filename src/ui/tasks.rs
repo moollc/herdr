@@ -188,12 +188,15 @@ pub(crate) fn recent_file_viewport(app: &AppState) -> Option<(u16, usize)> {
     if y > area.y + 1 && y < area.bottom() {
         y += 1;
     }
-    if app.recent_files.error.is_some() && y < area.bottom() {
-        y += 1;
+    if let Some(error) = &app.recent_files.error {
+        y += error
+            .lines()
+            .count()
+            .min(area.bottom().saturating_sub(y) as usize) as u16;
     }
     let first_file_row = y.saturating_add(1);
     (first_file_row < area.bottom())
-        .then_some((first_file_row, (area.bottom() - first_file_row) as usize))
+        .then(|| (first_file_row, (area.bottom() - first_file_row) as usize))
 }
 
 pub(crate) fn recent_file_at(app: &AppState, column: u16, row: u16) -> Option<usize> {
@@ -385,11 +388,13 @@ pub(super) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
                     );
                 } else {
                     if let Some(error) = &app.recent_files.error {
-                        frame.render_widget(
-                            Paragraph::new(fit(error, content.width as usize)).style(dim),
-                            Rect::new(content.x, y, content.width, 1),
-                        );
-                        y += 1;
+                        for line in error.lines().take(area.bottom().saturating_sub(y) as usize) {
+                            frame.render_widget(
+                                Paragraph::new(fit(line, content.width as usize)).style(dim),
+                                Rect::new(content.x, y, content.width, 1),
+                            );
+                            y += 1;
+                        }
                     }
                     if app.recent_files.files.is_empty() {
                         if app.recent_files.error.is_none() {
@@ -986,5 +991,59 @@ mod tests {
         let error_only = text(&error_only);
         assert!(!error_only.contains("no captured agent files"));
         assert!(!error_only.contains("second.html"));
+    }
+
+    #[test]
+    fn combined_diagnostics_are_visible_at_sixty_columns_with_correct_hit_rows() {
+        let mut app = state();
+        app.sidebar_width = 60;
+        app.sidebar_max_width = 64;
+        app.tasks.tasks.as_mut().unwrap().rows.clear();
+        app.recent_files.error = Some("Some agent file events were incomplete or unsupported\nFile watcher partial, coverage may be incomplete".into());
+        app.recent_files
+            .files
+            .push(crate::recent_files::RecentFile {
+                path: "/project/visible.txt".into(),
+                modified: std::time::SystemTime::now(),
+                agent: String::new(),
+            });
+        let buf = draw(&mut app, 180, 24);
+        let area = app.view.tasks_rect;
+        assert_eq!(area.width, 60);
+        let lines: Vec<_> = (area.y..area.bottom())
+            .map(|y| {
+                (area.x..area.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let journal = lines
+            .iter()
+            .position(|line| line.contains("Some agent file events were incomplete or unsupported"))
+            .unwrap();
+        assert!(lines[journal + 1].contains("File watcher partial, coverage may be incomplete"));
+        let file = lines
+            .iter()
+            .position(|line| line.contains("visible.txt"))
+            .unwrap();
+        assert_eq!(recent_file_viewport(&app).unwrap().0, area.y + file as u16);
+        assert_eq!(
+            recent_file_at(&app, area.x + 2, area.y + file as u16),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn disappearing_viewport_clears_keyboard_focus_during_layout() {
+        for (width, height, collapsed) in [(180, 24, true), (40, 24, false), (180, 2, false)] {
+            let mut app = state();
+            app.recent_files.keyboard_focus = true;
+            app.recent_files.selected = Some(0);
+            app.tasks_collapsed = collapsed;
+            draw(&mut app, width, height);
+            assert!(recent_file_viewport(&app).is_none());
+            assert!(!app.recent_files.keyboard_focus);
+            assert_eq!(app.recent_files.selected, None);
+        }
     }
 }

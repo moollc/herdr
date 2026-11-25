@@ -22,7 +22,7 @@ const MAX_ENTRIES: usize = 20_000;
 const MAX_EVENTS: usize = 1024;
 const MAX_EVENT_PATHS: usize = 64;
 const MAX_PATH_BYTES: usize = 4096;
-const PARTIAL: &str = "File watcher partial, a watch or event limit was reached";
+const PARTIAL: &str = "File watcher partial, coverage may be incomplete";
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 struct Roots {
@@ -75,6 +75,16 @@ impl FileSystemWatcher {
 
     pub fn active(&self) -> bool {
         self.commands.is_some()
+    }
+
+    fn publish_error(&mut self, error: &str) {
+        if self.activity.error.as_deref() != Some(error) {
+            self.activity.error = Some(error.into());
+            self.changed = true;
+            if let Some(wake) = &self.wake {
+                wake();
+            }
+        }
     }
 
     pub fn set_extra(&mut self, paths: &[String]) {
@@ -142,7 +152,7 @@ impl FileSystemWatcher {
                     self.updates = Some(update_rx);
                 }
                 Err(_) => {
-                    self.activity.error = Some("File watcher could not start".into());
+                    self.publish_error("File watcher could not start");
                     self.sent = Some(roots.clone()); // Fail visibly, without a spawn retry loop.
                 }
             }
@@ -153,7 +163,7 @@ impl FileSystemWatcher {
                     Ok(()) => self.sent = Some(roots),
                     Err(TrySendError::Full(_)) => {}
                     Err(TrySendError::Disconnected(_)) => {
-                        self.activity.error = Some("File watcher stopped".into());
+                        self.publish_error("File watcher stopped");
                         self.sent = Some(roots);
                         self.commands = None;
                     }
@@ -169,7 +179,7 @@ impl FileSystemWatcher {
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.activity.error = Some("File watcher stopped".into());
+                    self.publish_error("File watcher stopped");
                 }
             }
         }
@@ -181,6 +191,7 @@ struct Tree {
     directories: HashSet<PathBuf>,
     root_streams: bool,
     subscriptions: HashSet<PathBuf>,
+    stream_retry: bool,
     state_dir: PathBuf,
     library: Option<PathBuf>,
     home: Option<PathBuf>,
@@ -196,6 +207,7 @@ impl Tree {
             directories: HashSet::new(),
             root_streams: false,
             subscriptions: HashSet::new(),
+            stream_retry: false,
             state_dir: fs::canonicalize(&state_dir).unwrap_or(state_dir),
             library: home.as_ref().map(|home| home.join("Library")),
             home: home.and_then(|home| fs::canonicalize(home).ok()),
@@ -214,26 +226,35 @@ impl Tree {
 
     /// FSEvents already has a recursive stream. Changing its paths restarts
     /// that stream, so only root changes may touch native registrations.
-    fn sync_streams(&mut self, watcher: &mut impl Watcher) -> bool {
+    fn sync_streams(&mut self, watcher: &mut impl Watcher) {
         let desired: HashSet<_> = self.roots.iter().cloned().collect();
-        if desired == self.subscriptions {
-            return true;
+        if desired == self.subscriptions && !self.stream_retry {
+            return;
         }
         let mut paths = watcher.paths_mut();
         let mut ok = true;
-        for path in self.subscriptions.difference(&desired) {
-            ok &= paths.remove(path).is_ok();
+        let mut added = Vec::new();
+        for path in self.subscriptions.clone().difference(&desired) {
+            if paths.remove(path).is_ok() {
+                self.subscriptions.remove(path);
+            } else {
+                ok = false;
+            }
         }
         for path in desired.difference(&self.subscriptions) {
-            ok &= paths.add(path, RecursiveMode::Recursive).is_ok();
+            if paths.add(path, RecursiveMode::Recursive).is_ok() {
+                added.push(path.clone());
+            } else {
+                ok = false;
+                continue;
+            }
         }
+        self.subscriptions.extend(added);
         ok &= paths.commit().is_ok();
+        self.stream_retry = !ok;
         if !ok {
             self.activity.error = Some("File watcher could not update native roots".into());
-            return false; // Drop the backend, releasing even partially applied registrations.
         }
-        self.subscriptions = desired;
-        true
     }
 
     fn reset<W: Watcher>(&mut self, request: &Roots, watcher: &mut W, force: bool) -> bool {
@@ -292,14 +313,15 @@ impl Tree {
         if error.is_some() {
             self.activity.error = error;
         }
-        if !force && self.roots == minimal {
+        let roots_changed = self.roots != minimal;
+        self.roots = minimal;
+        if self.root_streams {
+            self.sync_streams(watcher);
+        }
+        if !force && !roots_changed {
             return true;
         }
-        self.roots = minimal;
         self.entries = 0;
-        if self.root_streams && !self.sync_streams(watcher) {
-            return false;
-        }
         // Differential removal retains subscriptions shared by multiple workspaces.
         let removed: Vec<_> = self
             .directories
@@ -336,7 +358,9 @@ impl Tree {
                 continue;
             }
             if self.directories.len() >= MAX_DIRECTORIES {
-                self.partial();
+                if !self.root_streams {
+                    self.partial();
+                }
                 break;
             }
             if !self.root_streams && watcher.watch(&path, RecursiveMode::NonRecursive).is_err() {
@@ -350,7 +374,9 @@ impl Tree {
             };
             for entry in entries {
                 if self.entries >= MAX_ENTRIES {
-                    self.partial();
+                    if !self.root_streams {
+                        self.partial();
+                    }
                     return;
                 }
                 self.entries += 1;
@@ -373,11 +399,16 @@ impl Tree {
                 if kind.is_dir() {
                     if queue.len() + self.directories.len() < MAX_DIRECTORIES {
                         queue.push_back(path);
-                    } else {
+                    } else if !self.root_streams {
                         self.partial();
                     }
                 } else if kind.is_symlink() {
-                    self.partial(); // Never follow loops or silently omit coverage.
+                    if !fs::canonicalize(&path)
+                        .ok()
+                        .is_some_and(|target| self.covered_file_alias(&target))
+                    {
+                        self.partial(); // Never follow directory links or escapes.
+                    }
                 } else if new
                     && kind.is_file()
                     && fs::canonicalize(&path).ok().as_ref() == Some(&path)
@@ -386,6 +417,13 @@ impl Tree {
                 }
             }
         }
+    }
+
+    fn covered_file_alias(&self, target: &Path) -> bool {
+        self.root_streams
+            && is_regular_file(target)
+            && !self.ignored(target)
+            && self.roots.iter().any(|root| target.starts_with(root))
     }
 
     fn record(&mut self, path: PathBuf, time: SystemTime) {
@@ -447,12 +485,20 @@ impl Tree {
             if self.ignored(&path) {
                 continue;
             }
-            let Ok(canonical) = fs::canonicalize(&path) else {
-                self.partial(); // A create/modify vanished before it could be observed.
-                continue;
+            let canonical = match fs::canonicalize(&path) {
+                Ok(canonical) => canonical,
+                // Atomic saves and rename-from paths routinely vanish before
+                // the coalesced batch drains. The target has its own event.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    self.partial();
+                    continue;
+                }
             };
             if canonical != path {
-                self.partial(); // Symlink coverage is deliberately excluded.
+                if !self.covered_file_alias(&canonical) {
+                    self.partial();
+                }
                 continue;
             }
             if self.ignored(&canonical)
@@ -578,13 +624,22 @@ fn run(
     state_dir: PathBuf,
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
+    run_with_watcher::<RecommendedWatcher>(commands, updates, state_dir, wake);
+}
+
+fn run_with_watcher<W: Watcher>(
+    commands: Receiver<Roots>,
+    updates: SyncSender<Activity>,
+    state_dir: PathBuf,
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
+) {
     let (events_tx, events_rx) = mpsc::sync_channel(MAX_EVENTS);
     let overflow = Arc::new(AtomicBool::new(false));
     let dropped = Arc::clone(&overflow);
     let mut tree = Tree::new(state_dir);
     let ignored_state = tree.state_dir.clone();
     let ignored_library = tree.library.clone();
-    let watcher = RecommendedWatcher::new(
+    let watcher = W::new(
         move |result: notify::Result<Event>| {
             forward(
                 &events_tx,
@@ -646,15 +701,11 @@ fn run(
                 Err(TrySendError::Disconnected(_)) => break,
                 Err(TrySendError::Full(_)) => {} // Retry after the consumer drains the old snapshot.
                 Ok(()) => {
-                    // Keep the first snapshot as a readiness barrier, but the
-                    // consumer already holds empty activity. Waking for that
-                    // snapshot would allocate a redundant full server frame.
-                    let changed = published.is_some() || tree.activity != Activity::default();
+                    // Drain even the empty readiness barrier promptly, so it
+                    // cannot block the first real update in the capacity-one queue.
                     published = Some(tree.activity.clone());
-                    if changed {
-                        if let Some(wake) = &wake {
-                            wake();
-                        }
+                    if let Some(wake) = &wake {
+                        wake();
                     }
                 }
             }
@@ -890,7 +941,8 @@ mod tests {
             fs::create_dir(fixture.0.join(index.to_string())).unwrap();
         }
         let mut tree = tree(&fixture);
-        tree.reset(&fixture.roots(), &mut backend(), true);
+        tree.roots = fixture.roots().paths;
+        tree.discover(fixture.0.clone(), &mut backend(), false);
         assert!(tree.directories.len() <= MAX_DIRECTORIES);
         assert!(tree.activity.error.is_some());
     }
@@ -1001,6 +1053,8 @@ mod tests {
     struct CountingWatcher {
         adds: Vec<(PathBuf, RecursiveMode)>,
         removes: Vec<PathBuf>,
+        fail_add: bool,
+        fail_remove: bool,
     }
 
     impl Watcher for CountingWatcher {
@@ -1010,11 +1064,17 @@ mod tests {
 
         fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
             self.adds.push((path.into(), mode));
+            if self.fail_add {
+                return Err(notify::Error::generic("injected add failure"));
+            }
             Ok(())
         }
 
         fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
             self.removes.push(path.into());
+            if self.fail_remove {
+                return Err(notify::Error::generic("injected remove failure"));
+            }
             Ok(())
         }
 
@@ -1040,8 +1100,8 @@ mod tests {
             &mut watcher,
         );
         assert!(
-            tree.activity.error.is_some(),
-            "discovery cap must remain visible"
+            tree.activity.error.is_none(),
+            "recursive native coverage survives the discovery cap"
         );
         assert_eq!(
             watcher.adds,
@@ -1114,12 +1174,18 @@ mod tests {
         let mut tree = tree(&fixture);
         let mut watcher = CountingWatcher::default();
         tree.reset(&fixture.roots(), &mut watcher, true);
-        tree.event(
-            write_event(&fixture.0.join("vanished")),
-            SystemTime::now(),
-            &mut watcher,
-        );
-        assert!(tree.activity.error.is_some());
+        for kind in [
+            EventKind::Create(CreateKind::File),
+            write_event(&fixture.0).kind,
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+        ] {
+            tree.event(
+                Event::new(kind).add_path(fixture.0.join("vanished")),
+                SystemTime::now(),
+                &mut watcher,
+            );
+            assert!(tree.activity.error.is_none(), "vanished paths are normal");
+        }
         let good = fixture.0.join("good.txt");
         fs::write(&good, "ok").unwrap();
         tree.event(write_event(&good), SystemTime::now(), &mut watcher);
@@ -1161,7 +1227,16 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert!(initial == Activity::default());
-        let before = 0;
+        let wake_deadline = Instant::now() + INTERVAL;
+        while count.load(Ordering::Relaxed) == 0 && Instant::now() < wake_deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "empty readiness must wake"
+        );
+        let before = 1;
         let deadline = Instant::now() + INTERVAL * 4;
         while Instant::now() < deadline {
             watcher.sync(roots.clone(), []);
@@ -1190,5 +1265,163 @@ mod tests {
             activity.error.is_some() && count.load(Ordering::Relaxed) > 0
         });
         assert!(watcher.take_changed());
+    }
+
+    #[test]
+    fn recursive_stream_entry_budget_does_not_claim_native_loss() {
+        let fixture = Fixture::new();
+        fs::write(fixture.0.join("one"), "fixture").unwrap();
+        let mut tree = tree(&fixture);
+        let mut watcher = CountingWatcher::default();
+        tree.reset(&fixture.roots(), &mut watcher, true);
+        tree.entries = MAX_ENTRIES;
+        let new = fixture.0.join("new");
+        fs::create_dir(&new).unwrap();
+        fs::write(new.join("child"), "fixture").unwrap();
+        tree.event(write_event(&new), SystemTime::now(), &mut watcher);
+        assert!(tree.activity.error.is_none());
+        tree.event(
+            write_event(&new.join("child")),
+            SystemTime::now(),
+            &mut watcher,
+        );
+        assert_eq!(tree.activity.files[0].path, new.join("child"));
+        assert_eq!(tree.entries, MAX_ENTRIES);
+    }
+
+    #[test]
+    fn recursive_stream_file_alias_is_covered_but_directory_alias_is_partial() {
+        let fixture = Fixture::new();
+        let file = fixture.0.join("AGENTS.md");
+        let alias = fixture.0.join("CLAUDE.md");
+        fs::write(&file, "instructions").unwrap();
+        std::os::unix::fs::symlink(&file, &alias).unwrap();
+        let mut tree = tree(&fixture);
+        let mut watcher = CountingWatcher::default();
+        tree.reset(&fixture.roots(), &mut watcher, true);
+        assert!(
+            tree.activity.error.is_none(),
+            "in-root file alias is covered"
+        );
+        tree.event(write_event(&alias), SystemTime::now(), &mut watcher);
+        assert!(tree.activity.error.is_none());
+        tree.event(write_event(&file), SystemTime::now(), &mut watcher);
+        assert_eq!(tree.activity.files[0].path, file);
+        let directory_alias = fixture.0.join("loop");
+        std::os::unix::fs::symlink(&fixture.0, &directory_alias).unwrap();
+        tree.event(
+            write_event(&directory_alias),
+            SystemTime::now(),
+            &mut watcher,
+        );
+        assert!(tree.activity.error.is_some());
+        // The per-directory backend retains its conservative symlink contract.
+        let mut per_directory = super::Tree::new(fixture.0.join("state"));
+        per_directory.roots = fixture.roots().paths;
+        per_directory.discover(fixture.0.clone(), &mut watcher, false);
+        assert!(per_directory.activity.error.is_some());
+    }
+
+    #[test]
+    fn native_root_add_and_remove_failures_retry_without_stopping() {
+        let fixture = Fixture::new();
+        let mut tree = tree(&fixture);
+        let mut watcher = CountingWatcher {
+            fail_add: true,
+            ..Default::default()
+        };
+        assert!(tree.reset(&fixture.roots(), &mut watcher, true));
+        assert!(tree
+            .activity
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("native roots"));
+        assert!(tree.subscriptions.is_empty());
+        watcher.fail_add = false;
+        assert!(tree.reset(&fixture.roots(), &mut watcher, false));
+        assert_eq!(watcher.adds.len(), 2);
+        assert!(tree.subscriptions.contains(&fixture.0));
+        let good = fixture.0.join("after-retry.txt");
+        fs::write(&good, "ok").unwrap();
+        tree.event(write_event(&good), SystemTime::now(), &mut watcher);
+        assert_eq!(tree.activity.files[0].path, good);
+        watcher.fail_remove = true;
+        assert!(tree.reset(&Roots::default(), &mut watcher, true));
+        assert!(tree.subscriptions.contains(&fixture.0));
+        watcher.fail_remove = false;
+        assert!(tree.reset(&Roots::default(), &mut watcher, false));
+        assert!(tree.subscriptions.is_empty());
+        assert_eq!(watcher.removes.len(), 2);
+    }
+
+    #[test]
+    fn stopped_channels_publish_changed_and_wake_once() {
+        for command_failure in [false, true] {
+            let mut watcher = FileSystemWatcher::new(PathBuf::from("/unused"));
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let wake_count = Arc::clone(&count);
+            watcher.set_wake(move || {
+                wake_count.fetch_add(1, Ordering::Relaxed);
+            });
+            watcher.sent = Some(Roots::default());
+            if command_failure {
+                let (tx, rx) = mpsc::sync_channel(1);
+                drop(rx);
+                watcher.commands = Some(tx);
+            } else {
+                let (tx, rx) = mpsc::sync_channel(1);
+                drop(tx);
+                watcher.updates = Some(rx);
+            }
+            watcher.sync([PathBuf::from("/unused")], []);
+            assert_eq!(
+                watcher.activity.error.as_deref(),
+                Some("File watcher stopped")
+            );
+            assert!(watcher.take_changed());
+            assert_eq!(count.load(Ordering::Relaxed), 1);
+            watcher.sync([PathBuf::from("/unused")], []);
+            assert!(!watcher.take_changed());
+            assert_eq!(count.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    struct ConstructorFailure;
+    impl Watcher for ConstructorFailure {
+        fn new<F: notify::EventHandler>(_: F, _: notify::Config) -> notify::Result<Self> {
+            Err(notify::Error::generic("injected constructor failure"))
+        }
+        fn watch(&mut self, _: &Path, _: RecursiveMode) -> notify::Result<()> {
+            unreachable!()
+        }
+        fn unwatch(&mut self, _: &Path) -> notify::Result<()> {
+            unreachable!()
+        }
+        fn kind() -> notify::WatcherKind {
+            notify::WatcherKind::Fsevent
+        }
+    }
+
+    #[test]
+    fn native_constructor_failure_publishes_error_and_wakes() {
+        let fixture = Fixture::new();
+        let (_command_tx, command_rx) = mpsc::sync_channel(1);
+        let (update_tx, update_rx) = mpsc::sync_channel(1);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wake_count = Arc::clone(&count);
+        run_with_watcher::<ConstructorFailure>(
+            command_rx,
+            update_tx,
+            fixture.0.clone(),
+            Some(Arc::new(move || {
+                wake_count.fetch_add(1, Ordering::Relaxed);
+            })),
+        );
+        assert_eq!(
+            update_rx.try_recv().unwrap().error.as_deref(),
+            Some("File watcher could not start")
+        );
+        assert_eq!(count.load(Ordering::Relaxed), 1);
     }
 }

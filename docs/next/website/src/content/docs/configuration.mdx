@@ -719,11 +719,17 @@ watch cap on other backends), 20,000 discovery entries per root update,
 queued events, and 64 paths per event. Foreground group members cover agent
 children whose cwd differs from their launcher.
 Notifications coalesce over 150 ms and wake the existing render loop only when
-activity changes. Idle journal and process-root refreshes run once per second.
+activity changes (including the initial readiness snapshot). Idle journal and process-root refreshes run once per second.
 Directory discovery and OS subscriptions run on a worker, with no idle directory
 scans. Unavailable roots, watch failures, OS event loss, or a reached limit display
-an error/partial marker in the existing panel; skipped symlinks and create/modify
-events that vanish before inspection also report partial coverage.
+an error/partial marker in the existing panel. On macOS, the bounded discovery
+limits do not reduce recursive native coverage. In-root file symlinks are already
+covered at their targets; directory symlinks are not followed and may report partial
+coverage. Temporary paths that vanish before inspection are normal during atomic
+saves and do not mark coverage partial. Failed native root updates warn and retry
+on the next root refresh. Loss warnings remain visible because history cannot be
+reconstructed. Journal and watcher diagnostics appear on separate rows, journal
+first. Panel keyboard focus clears when the file rows disappear.
 
 On macOS, FSEvents can report stream-wide event loss during a build, including
 when the build output is in an ignored folder. Herdr keeps the partial marker
