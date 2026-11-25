@@ -72,6 +72,10 @@ impl RecentFilesWatcher {
         }
     }
 
+    pub fn set_wake(&mut self, wake: impl Fn() + Send + Sync + 'static) {
+        self.filesystem.set_wake(wake);
+    }
+
     pub fn set_extra_roots(&mut self, paths: &[String]) {
         self.filesystem.set_extra(paths);
     }
@@ -124,10 +128,13 @@ impl RecentFilesWatcher {
             snapshot.loading = true;
             changed = true;
         }
-        if now < self.next_poll && !changed {
+        let filesystem_changed = self.filesystem.take_changed();
+        if now < self.next_poll && !changed && !filesystem_changed {
             return changed;
         }
-        self.next_poll = now + fs_watch::INTERVAL;
+        // Journal ages and edits keep their original idle cadence. Native activity
+        // wakes the existing render loop and bypasses this deadline when changed.
+        self.next_poll = now + Duration::from_secs(1);
         if root.is_none() {
             return changed;
         }
@@ -166,12 +173,12 @@ impl RecentFilesWatcher {
             || self.filesystem.activity.error.is_some()
             || snapshot.files.len() > MAX_RESULTS;
         snapshot.files.truncate(MAX_RESULTS);
-        snapshot.error = self
-            .filesystem
-            .activity
-            .error
-            .clone()
-            .or_else(|| self.journal_error.clone());
+        snapshot.error = match (&self.journal_error, &self.filesystem.activity.error) {
+            // Lost hook data must stay visible before a potentially long watcher warning.
+            (Some(journal), Some(watcher)) => Some(format!("{journal}, {watcher}")),
+            (Some(error), None) | (None, Some(error)) => Some(error.clone()),
+            (None, None) => None,
+        };
         snapshot.loading = false;
         snapshot.selected = old_selected
             .and_then(|path| snapshot.files.iter().position(|file| file.path == path))
@@ -796,6 +803,69 @@ mod tests {
         assert_eq!(snapshot.error.as_deref(), Some("File watcher partial"));
     }
 
+    fn error_snapshot(journal: Option<&str>, watcher_error: Option<&str>) -> RecentFilesSnapshot {
+        let base = fixture_dir("error-selection");
+        let journal_path = base.join(JOURNAL_NAME);
+        if let Some(contents) = journal {
+            fs::write(&journal_path, contents).expect("journal");
+        }
+        let mut watcher = RecentFilesWatcher::with_journal_path(journal_path);
+        watcher.filesystem.activity.error = watcher_error.map(str::to_owned);
+        let mut snapshot = RecentFilesSnapshot::default();
+        watcher.poll(Instant::now(), Some(base), &mut snapshot);
+        snapshot
+    }
+
+    #[test]
+    fn error_selection_both_diagnostics_keep_journal_first() {
+        let snapshot = error_snapshot(Some("{corrupt}\n"), Some("File watcher partial"));
+        assert_eq!(
+            snapshot.error.as_deref(),
+            Some("Some agent file events were incomplete or unsupported, File watcher partial")
+        );
+        assert!(snapshot.truncated);
+    }
+
+    #[test]
+    fn error_selection_journal_only_is_unchanged() {
+        let snapshot = error_snapshot(Some("{corrupt}\n"), None);
+        assert_eq!(
+            snapshot.error.as_deref(),
+            Some("Some agent file events were incomplete or unsupported")
+        );
+        assert!(snapshot.truncated);
+    }
+
+    #[test]
+    fn error_selection_watcher_only_is_unchanged() {
+        let snapshot = error_snapshot(None, Some("File watcher partial"));
+        assert_eq!(snapshot.error.as_deref(), Some("File watcher partial"));
+        assert!(snapshot.truncated);
+    }
+
+    #[test]
+    fn error_selection_neither_diagnostic_stays_empty() {
+        let snapshot = error_snapshot(None, None);
+        assert_eq!(snapshot.error, None);
+        assert!(!snapshot.truncated);
+    }
+
+    #[test]
+    fn error_selection_unavailable_journal_precedes_watcher_warning() {
+        let base = fixture_dir("unavailable-error-selection");
+        let journal = base.join(JOURNAL_NAME);
+        fs::create_dir(&journal).expect("nonregular journal");
+        let mut watcher = RecentFilesWatcher::with_journal_path(journal);
+        watcher.filesystem.activity.error = Some("File watcher partial".into());
+        let mut snapshot = RecentFilesSnapshot::default();
+        watcher.poll(Instant::now(), Some(base), &mut snapshot);
+        assert_eq!(
+            snapshot.error.as_deref(),
+            Some("Agent file activity journal is unavailable, File watcher partial")
+        );
+        assert!(snapshot.truncated);
+    }
+
     #[test]
     fn hidden_viewport_cannot_receive_keyboard_focus() {
         let mut snapshot = RecentFilesSnapshot {
@@ -847,5 +917,15 @@ mod tests {
         assert!(is_regular_file(&older));
         assert!(!is_regular_file(&base.join("deleted before open.txt")));
         assert!(display_name(Path::new("long résumé report.webp"), 14).ends_with(".webp"));
+    }
+
+    #[test]
+    fn safety_regression_idle_journal_keeps_one_second_deadline() {
+        let base = fixture_dir("idle-cadence");
+        let mut watcher = RecentFilesWatcher::with_journal_path(base.join(JOURNAL_NAME));
+        let mut snapshot = RecentFilesSnapshot::default();
+        let now = Instant::now();
+        watcher.poll_at(now, SystemTime::now(), Some(base), &mut snapshot);
+        assert_eq!(watcher.deadline(), Some(now + Duration::from_secs(1)));
     }
 }

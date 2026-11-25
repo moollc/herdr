@@ -343,13 +343,29 @@ pub(super) fn render(app: &AppState, frame: &mut Frame, area: Rect) {
             y += 1;
         }
         if y < area.bottom() {
-            let heading = if app.recent_files.truncated {
-                " agent files · partial"
-            } else if app.recent_files.keyboard_focus {
-                " agent files · ↑↓ Enter · Esc"
+            let headings: &[&str] = if app.recent_files.keyboard_focus {
+                if app.recent_files.truncated {
+                    &[
+                        " agent files · partial · ↑↓ Enter · Esc",
+                        " partial · ↑↓ Enter · Esc",
+                        "partial · Enter/Esc",
+                        "partial ↵ Esc",
+                        "! ↵ Esc",
+                    ]
+                } else {
+                    &[" agent files · ↑↓ Enter · Esc", " ↑↓ Enter · Esc", "↵ Esc"]
+                }
+            } else if app.recent_files.truncated {
+                &[" agent files · partial"]
             } else {
-                " agent files · prefix+f"
+                &[" agent files · prefix+f"]
             };
+            // Shorten the label before dropping keyboard controls or coverage.
+            let heading = headings
+                .iter()
+                .find(|heading| heading.width() <= content.width as usize)
+                .copied()
+                .unwrap_or(headings[headings.len() - 1]);
             frame.render_widget(
                 Paragraph::new(fit(heading, content.width as usize)).style(dim),
                 Rect::new(content.x, y, content.width, 1),
@@ -858,6 +874,49 @@ mod tests {
     }
 
     #[test]
+    fn focused_partial_recent_files_keep_key_hints_at_narrow_widths() {
+        for width in (0..=64).rev() {
+            let mut app = state();
+            app.tasks.tasks.as_mut().unwrap().rows.clear();
+            app.sidebar_width = width + 1;
+            app.sidebar_min_width = width + 1;
+            app.sidebar_max_width = width + 1;
+            app.recent_files.truncated = true;
+            app.recent_files.keyboard_focus = true;
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width + 3, 5)).unwrap();
+            terminal
+                .draw(|frame| {
+                    frame.buffer_mut()[(0, 1)].set_symbol("L");
+                    frame.buffer_mut()[(width + 2, 1)].set_symbol("R");
+                    render(&app, frame, Rect::new(1, 0, width + 1, 5));
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let heading = (2..width + 2)
+                .map(|x| buf[(x, 1)].symbol())
+                .collect::<String>();
+            assert_eq!(buf[(0, 1)].symbol(), "L");
+            assert_eq!(buf[(width + 2, 1)].symbol(), "R");
+            assert!(heading.width() <= width as usize, "{width}: {heading}");
+            if width >= 13 {
+                assert!(heading.contains("partial"), "{width}: {heading}");
+                assert!(heading.contains("Esc"), "{width}: {heading}");
+                assert!(
+                    heading.contains("Enter") || heading.contains('↵'),
+                    "{width}: {heading}"
+                );
+            }
+            if width >= 25 {
+                assert!(heading.contains("↑↓ Enter · Esc"), "{width}: {heading}");
+            }
+            if width >= 40 {
+                assert!(heading.contains("agent files"), "{width}: {heading}");
+            }
+        }
+    }
+
+    #[test]
     fn partial_recent_files_error_keeps_valid_rows_rendered_and_selectable() {
         let mut app = state();
         app.recent_files = crate::recent_files::RecentFilesSnapshot {
@@ -880,7 +939,7 @@ mod tests {
         let buf = draw(&mut app, 160, 24);
         let area = app.view.tasks_rect;
         let rendered = text(&buf);
-        assert!(rendered.contains("agent files · partial"));
+        assert!(rendered.contains("partial"));
         let rendered_lines = (area.y..area.bottom())
             .map(|row| {
                 (area.x..area.right())

@@ -708,6 +708,12 @@ impl App {
             recent_files_watcher: {
                 let mut watcher = crate::recent_files::RecentFilesWatcher::new();
                 watcher.set_extra_roots(&config.recent_files.watch);
+                let notify = Arc::clone(&render_notify);
+                let dirty = Arc::clone(&render_dirty);
+                watcher.set_wake(move || {
+                    dirty.store(true, Ordering::Release);
+                    notify.notify_one();
+                });
                 watcher
             },
             board_watcher: crate::board::BoardWatcher::new(crate::board::configured_path(

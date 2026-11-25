@@ -26,6 +26,9 @@ impl App {
         if super::composer::handle_player_link_key(&mut self.state, key) {
             return;
         }
+        if self.state.recent_files.keyboard_focus && self.handle_recent_files_key(key) {
+            return;
+        }
         let Some(input) = self.prepare_terminal_key_forward(key) else {
             return;
         };
@@ -275,6 +278,106 @@ mod tests {
     };
     use super::*;
     use crate::{config::Config, events::AppEvent, workspace::Workspace};
+
+    fn recent_files_client_app() -> (App, tokio::sync::mpsc::Receiver<Bytes>) {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane = ws.tabs[0].root_pane;
+        let (runtime, rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        ws.insert_test_runtime(pane, runtime);
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.view.layout = crate::app::state::ViewLayout::Desktop;
+        app.state.view.tasks_rect = Rect::new(0, 0, 64, 16);
+        app.state.tasks_collapsed = false;
+        app.state.recent_files = crate::recent_files::RecentFilesSnapshot {
+            files: (0..3)
+                .map(|index| crate::recent_files::RecentFile {
+                    // A missing path exercises open_recent_file's validation
+                    // without launching a real desktop application.
+                    path: std::env::temp_dir()
+                        .join("herdr-client-missing-recent-file")
+                        .join(index.to_string()),
+                    modified: std::time::SystemTime::now(),
+                    agent: "codex".into(),
+                })
+                .collect(),
+            keyboard_focus: true,
+            selected: Some(0),
+            ..Default::default()
+        };
+        assert!(crate::ui::recent_file_viewport(&app.state).is_some());
+        (app, rx)
+    }
+
+    #[tokio::test]
+    async fn recent_files_client_arrows_move_selection_without_shell_input() {
+        let (mut app, mut rx) = recent_files_client_app();
+        app.route_client_input(b"\x1b[B".to_vec());
+        assert_eq!(app.state.recent_files.selected, Some(1));
+        app.route_client_input(b"\x1b[A".to_vec());
+        assert_eq!(app.state.recent_files.selected, Some(0));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn recent_files_client_enter_calls_open_path_without_shell_input() {
+        let (mut app, mut rx) = recent_files_client_app();
+        app.route_client_input(b"\r".to_vec());
+        assert_eq!(
+            app.state.recent_files.open_error.as_deref(),
+            Some("File is no longer available")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn recent_files_client_escape_clears_focus_without_shell_input() {
+        let (mut app, mut rx) = recent_files_client_app();
+        app.route_client_input(b"\x1b".to_vec());
+        assert!(!app.state.recent_files.keyboard_focus);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn recent_files_client_printable_key_clears_focus_and_reaches_shell() {
+        let (mut app, mut rx) = recent_files_client_app();
+        app.route_client_input(b"x".to_vec());
+        assert!(!app.state.recent_files.keyboard_focus);
+        assert_eq!(rx.try_recv().unwrap().as_ref(), b"x");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn recent_files_client_unfocused_arrows_reach_shell_unchanged() {
+        let (mut app, mut rx) = recent_files_client_app();
+        app.state.recent_files.keyboard_focus = false;
+        app.route_client_input(b"\x1b[B\x1b[A".to_vec());
+        assert_eq!(rx.try_recv().unwrap().as_ref(), b"\x1b[B");
+        assert_eq!(rx.try_recv().unwrap().as_ref(), b"\x1b[A");
+        assert_eq!(app.state.recent_files.selected, Some(0));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn recent_files_client_repeat_moves_once_and_release_does_not_fire() {
+        let (mut app, mut rx) = recent_files_client_app();
+        // Kitty Down press, repeat, release: one step per press/repeat,
+        // no third step or shell bytes from the release.
+        app.route_client_input(b"\x1b[57420;1:1u".to_vec());
+        assert_eq!(app.state.recent_files.selected, Some(1));
+        app.route_client_input(b"\x1b[57420;1:2u".to_vec());
+        assert_eq!(app.state.recent_files.selected, Some(2));
+        app.route_client_input(b"\x1b[57420;1:3u".to_vec());
+        assert_eq!(app.state.recent_files.selected, Some(2));
+        // A release must not invoke the opener or dismiss focus either.
+        app.route_client_input(b"\x1b[13;1:3u\x1b[27;1:3u".to_vec());
+        assert!(app.state.recent_files.open_error.is_none());
+        assert!(app.state.recent_files.keyboard_focus);
+        assert!(rx.try_recv().is_err());
+    }
 
     fn app_with_screen_bytes(bytes: &[u8]) -> (App, crate::layout::PaneInfo) {
         let mut app = app_for_mouse_test();

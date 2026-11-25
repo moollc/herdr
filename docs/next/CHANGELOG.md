@@ -10,6 +10,8 @@
 
 ### Fixed
 
+- The agent files watcher keeps one recursive subscription per root on macOS, so directory churn no longer restarts the native stream for each directory. Ignored build events are filtered before queuing, unchanged snapshots no longer wake the UI, and skipped symlinks and vanished write events show partial coverage. macOS stream-wide event loss during builds remains visible, even for ignored output. The live watcher retains a measured idle server RSS cost of about 1.1–1.6 MiB (roughly 4–5%).
+
 - Agents set down outside a space now appear in `agent list` and resolve in `agent get`, `read`, `send`, and `prompt`. Ending a set-down agent signals its processes before dropping the terminal runtime. `pane close` still sets a docked agent down and keeps it running.
 
 - Native agent reports keep reaching their original terminals through repeated live handoffs, including agents set down outside a workspace. Pane aliases now follow stable terminal identities across generations, and restored panes cannot reuse inherited raw ids that would send a report to another agent.

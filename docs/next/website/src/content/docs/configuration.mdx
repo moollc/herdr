@@ -710,16 +710,33 @@ remains in the recent history until displaced.
 Herdr refuses `/`, the home directory itself, its state directory, and
 `~/Library` as roots. It skips `.git`, `target`, `node_modules`, `.DS_Store`,
 `*.lock`, editor swap/backup files, and symlink escapes. Discovery prunes these
-folders before subscribing. Limits are 64 roots, 512 directory watches, 20,000
-discovery entries per root update, 64 process cwd queries per refresh, 1,024
+folders. On macOS, one recursive native subscription per root avoids restarting
+the notification stream during directory churn; root changes are batched. Ignored
+paths are discarded before the event queue. Other backends use pruned directory
+subscriptions. Limits are 64 roots, 512 discovered directories (also the native
+watch cap on other backends), 20,000 discovery entries per root update,
+64 process cwd queries per refresh, 1,024
 queued events, and 64 paths per event. Foreground group members cover agent
 children whose cwd differs from their launcher.
-Notifications coalesce over 150 ms. Directory discovery and OS subscriptions run
-on a worker, with no idle directory scans. Unavailable roots, watch failures,
-OS event loss, or a reached limit display an error/partial marker in the existing
-panel; there is no polling fallback. Events before subscription, very short-lived
-files, or lost events cannot be reconstructed. Unsupported filesystems may not
-supply native notifications.
+Notifications coalesce over 150 ms and wake the existing render loop only when
+activity changes. Idle journal and process-root refreshes run once per second.
+Directory discovery and OS subscriptions run on a worker, with no idle directory
+scans. Unavailable roots, watch failures, OS event loss, or a reached limit display
+an error/partial marker in the existing panel; skipped symlinks and create/modify
+events that vanish before inspection also report partial coverage.
+
+On macOS, FSEvents can report stream-wide event loss during a build, including
+when the build output is in an ignored folder. Herdr keeps the partial marker
+visible because filtering ignored paths cannot recover events the OS dropped.
+Ignored output stays out of the list, and subsequent observed writes still appear.
+There is no polling fallback. Events before subscription, very short-lived files,
+or lost events cannot be reconstructed. Unsupported filesystems may not supply
+native notifications.
+
+The live watcher thread and native stream state add an accepted idle memory cost.
+Matched macOS measurements found about 1.1–1.6 MiB additional server RSS, roughly
+4–5% of the measured idle server footprint. This is a measured residual cost, not
+a claim of zero overhead; the exact cost depends on the platform and workload.
 
 ### Spaces previews and compact agents
 
