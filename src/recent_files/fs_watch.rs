@@ -17,6 +17,8 @@ use super::{is_regular_file, RecentFile, MAX_RESULTS};
 
 pub(super) const INTERVAL: Duration = Duration::from_millis(150);
 const MAX_ROOTS: usize = 64;
+const MAX_STREAM_ATTEMPTS: u32 = 4;
+const STREAM_RETRY_DELAY: Duration = Duration::from_secs(20);
 const MAX_DIRECTORIES: usize = 512;
 const MAX_ENTRIES: usize = 20_000;
 const MAX_EVENTS: usize = 1024;
@@ -163,7 +165,10 @@ impl FileSystemWatcher {
                     Ok(()) => self.sent = Some(roots),
                     Err(TrySendError::Full(_)) => {}
                     Err(TrySendError::Disconnected(_)) => {
-                        self.publish_error("File watcher stopped");
+                        // Preserve a worker's specific terminal diagnostic after disconnect.
+                        if self.activity.error.is_none() {
+                            self.publish_error("File watcher stopped");
+                        }
                         self.sent = Some(roots);
                         self.commands = None;
                     }
@@ -179,7 +184,10 @@ impl FileSystemWatcher {
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.publish_error("File watcher stopped");
+                    // Preserve a worker's specific terminal diagnostic after disconnect.
+                    if self.activity.error.is_none() {
+                        self.publish_error("File watcher stopped");
+                    }
                 }
             }
         }
@@ -192,6 +200,8 @@ struct Tree {
     root_streams: bool,
     subscriptions: HashSet<PathBuf>,
     stream_retry: bool,
+    stream_failures: u32,
+    stream_retry_at: Option<Instant>,
     state_dir: PathBuf,
     library: Option<PathBuf>,
     home: Option<PathBuf>,
@@ -208,6 +218,8 @@ impl Tree {
             root_streams: false,
             subscriptions: HashSet::new(),
             stream_retry: false,
+            stream_failures: 0,
+            stream_retry_at: None,
             state_dir: fs::canonicalize(&state_dir).unwrap_or(state_dir),
             library: home.as_ref().map(|home| home.join("Library")),
             home: home.and_then(|home| fs::canonicalize(home).ok()),
@@ -227,33 +239,74 @@ impl Tree {
     /// FSEvents already has a recursive stream. Changing its paths restarts
     /// that stream, so only root changes may touch native registrations.
     fn sync_streams(&mut self, watcher: &mut impl Watcher) {
+        self.sync_streams_at(watcher, Instant::now());
+    }
+
+    fn sync_streams_at(&mut self, watcher: &mut impl Watcher, now: Instant) {
         let desired: HashSet<_> = self.roots.iter().cloned().collect();
         if desired == self.subscriptions && !self.stream_retry {
             return;
         }
+        // A failed FSEvents mutation can still change backend state. Limit
+        // restarts to attempts at 0, 20, 60 and 140 seconds, then stop retrying.
+        if self.stream_failures >= MAX_STREAM_ATTEMPTS
+            || self.stream_retry_at.is_some_and(|next| now < next)
+        {
+            return;
+        }
+        let removed: Vec<_> = self.subscriptions.difference(&desired).cloned().collect();
         let mut paths = watcher.paths_mut();
         let mut ok = true;
-        let mut added = Vec::new();
-        for path in self.subscriptions.clone().difference(&desired) {
-            if paths.remove(path).is_ok() {
-                self.subscriptions.remove(path);
+        for path in &removed {
+            match paths.remove(path) {
+                Ok(()) => {
+                    self.subscriptions.remove(path);
+                }
+                // notify has already removed the stream-array entry, even
+                // when recanonicalizing an old alias misses its filter key.
+                Err(error) if matches!(error.kind, notify::ErrorKind::WatchNotFound) => {
+                    self.subscriptions.remove(path);
+                }
+                Err(_) => ok = false,
+            }
+        }
+        if !removed.is_empty() {
+            // Removing an old path that became a symlink can erase a wanted
+            // root's canonical filter. Remove/re-add wanted registrations in
+            // this same batch to repair both the path array and event filter.
+            for path in &desired {
+                if self.subscriptions.remove(path) {
+                    if let Err(error) = paths.remove(path) {
+                        ok &= matches!(error.kind, notify::ErrorKind::WatchNotFound);
+                    }
+                }
+            }
+        }
+        let added: Vec<_> = desired.difference(&self.subscriptions).cloned().collect();
+        for path in added {
+            if paths.add(&path, RecursiveMode::Recursive).is_ok() {
+                self.subscriptions.insert(path);
             } else {
                 ok = false;
             }
         }
-        for path in desired.difference(&self.subscriptions) {
-            if paths.add(path, RecursiveMode::Recursive).is_ok() {
-                added.push(path.clone());
-            } else {
-                ok = false;
-                continue;
-            }
-        }
-        self.subscriptions.extend(added);
         ok &= paths.commit().is_ok();
         self.stream_retry = !ok;
-        if !ok {
-            self.activity.error = Some("File watcher could not update native roots".into());
+        if ok {
+            self.stream_failures = 0;
+            self.stream_retry_at = None;
+        } else {
+            self.stream_failures += 1;
+            self.stream_retry_at =
+                Some(now + STREAM_RETRY_DELAY * (1 << (self.stream_failures - 1)));
+            self.activity.error = Some(
+                if self.stream_failures >= MAX_STREAM_ATTEMPTS {
+                    "File watcher native root retries exhausted, coverage may be incomplete"
+                } else {
+                    "File watcher could not update native roots"
+                }
+                .into(),
+            );
         }
     }
 
@@ -347,8 +400,19 @@ impl Tree {
     /// a hard per-directory watch budget; recursive streams register only roots.
     fn discover(&mut self, start: PathBuf, watcher: &mut impl Watcher, new: bool) {
         let mut queue = VecDeque::from([start]);
+        // A moved-in directory may have no child notifications. Its scan must
+        // not inherit exhausted startup budgets, or silently omit its contents.
+        let event_scan = self.root_streams && new;
+        let mut scanned = HashSet::new();
+        let mut event_entries = 0;
         while let Some(path) = queue.pop_front() {
-            if self.ignored(&path) || self.directories.contains(&path) {
+            if self.ignored(&path)
+                || if event_scan {
+                    scanned.contains(&path)
+                } else {
+                    self.directories.contains(&path)
+                }
+            {
                 continue;
             }
             if fs::canonicalize(&path).ok().as_ref() != Some(&path)
@@ -357,8 +421,13 @@ impl Tree {
                 self.partial();
                 continue;
             }
-            if self.directories.len() >= MAX_DIRECTORIES {
-                if !self.root_streams {
+            let directory_count = if event_scan {
+                scanned.len()
+            } else {
+                self.directories.len()
+            };
+            if directory_count >= MAX_DIRECTORIES {
+                if event_scan || !self.root_streams {
                     self.partial();
                 }
                 break;
@@ -367,19 +436,32 @@ impl Tree {
                 self.activity.error = Some("File watcher could not watch a directory".into());
                 continue;
             }
-            self.directories.insert(path.clone());
+            if event_scan {
+                scanned.insert(path.clone());
+            }
+            if self.directories.len() < MAX_DIRECTORIES {
+                self.directories.insert(path.clone());
+            }
             let Ok(entries) = fs::read_dir(path) else {
                 self.activity.error = Some("File watcher could not read a directory".into());
                 continue;
             };
             for entry in entries {
-                if self.entries >= MAX_ENTRIES {
-                    if !self.root_streams {
+                if if event_scan {
+                    event_entries >= MAX_ENTRIES
+                } else {
+                    self.entries >= MAX_ENTRIES
+                } {
+                    if event_scan || !self.root_streams {
                         self.partial();
                     }
                     return;
                 }
-                self.entries += 1;
+                if event_scan {
+                    event_entries += 1;
+                } else {
+                    self.entries += 1;
+                }
                 let Ok(entry) = entry else {
                     self.partial();
                     continue;
@@ -397,9 +479,14 @@ impl Tree {
                     continue;
                 };
                 if kind.is_dir() {
-                    if queue.len() + self.directories.len() < MAX_DIRECTORIES {
+                    let directory_count = if event_scan {
+                        scanned.len()
+                    } else {
+                        self.directories.len()
+                    };
+                    if queue.len() + directory_count < MAX_DIRECTORIES {
                         queue.push_back(path);
-                    } else if !self.root_streams {
+                    } else if event_scan || !self.root_streams {
                         self.partial();
                     }
                 } else if kind.is_symlink() {
@@ -489,7 +576,12 @@ impl Tree {
                 Ok(canonical) => canonical,
                 // Atomic saves and rename-from paths routinely vanish before
                 // the coalesced batch drains. The target has its own event.
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_symlink()) {
+                        self.partial(); // An extant dangling link is not a vanished temp file.
+                    }
+                    continue;
+                }
                 Err(_) => {
                     self.partial();
                     continue;
@@ -1055,6 +1147,8 @@ mod tests {
         removes: Vec<PathBuf>,
         fail_add: bool,
         fail_remove: bool,
+        remove_not_found: bool,
+        filters: HashSet<PathBuf>,
     }
 
     impl Watcher for CountingWatcher {
@@ -1067,11 +1161,20 @@ mod tests {
             if self.fail_add {
                 return Err(notify::Error::generic("injected add failure"));
             }
+            self.filters
+                .insert(fs::canonicalize(path).unwrap_or_else(|_| path.into()));
             Ok(())
         }
 
         fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
             self.removes.push(path.into());
+            // Emulate FSEvents' recanonicalized event-filter removal, including
+            // the side effect before a reported failure.
+            self.filters
+                .remove(&fs::canonicalize(path).unwrap_or_else(|_| path.into()));
+            if self.remove_not_found {
+                return Err(notify::Error::watch_not_found());
+            }
             if self.fail_remove {
                 return Err(notify::Error::generic("injected remove failure"));
             }
@@ -1100,8 +1203,8 @@ mod tests {
             &mut watcher,
         );
         assert!(
-            tree.activity.error.is_none(),
-            "recursive native coverage survives the discovery cap"
+            tree.activity.error.as_deref() == Some(PARTIAL),
+            "moved-in contents beyond the per-event cap must report partial"
         );
         assert_eq!(
             watcher.adds,
@@ -1280,12 +1383,11 @@ mod tests {
         fs::write(new.join("child"), "fixture").unwrap();
         tree.event(write_event(&new), SystemTime::now(), &mut watcher);
         assert!(tree.activity.error.is_none());
-        tree.event(
-            write_event(&new.join("child")),
-            SystemTime::now(),
-            &mut watcher,
+        assert_eq!(
+            tree.activity.files[0].path,
+            new.join("child"),
+            "directory event alone must discover contents"
         );
-        assert_eq!(tree.activity.files[0].path, new.join("child"));
         assert_eq!(tree.entries, MAX_ENTRIES);
     }
 
@@ -1339,6 +1441,7 @@ mod tests {
             .contains("native roots"));
         assert!(tree.subscriptions.is_empty());
         watcher.fail_add = false;
+        tree.stream_retry_at = Some(Instant::now());
         assert!(tree.reset(&fixture.roots(), &mut watcher, false));
         assert_eq!(watcher.adds.len(), 2);
         assert!(tree.subscriptions.contains(&fixture.0));
@@ -1350,6 +1453,7 @@ mod tests {
         assert!(tree.reset(&Roots::default(), &mut watcher, true));
         assert!(tree.subscriptions.contains(&fixture.0));
         watcher.fail_remove = false;
+        tree.stream_retry_at = Some(Instant::now());
         assert!(tree.reset(&Roots::default(), &mut watcher, false));
         assert!(tree.subscriptions.is_empty());
         assert_eq!(watcher.removes.len(), 2);
@@ -1418,10 +1522,158 @@ mod tests {
                 wake_count.fetch_add(1, Ordering::Relaxed);
             })),
         );
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        let mut consumer = FileSystemWatcher::new(fixture.0.join("state"));
+        consumer.sent = Some(Roots::default());
+        consumer.updates = Some(update_rx);
+        consumer.sync([], []);
         assert_eq!(
-            update_rx.try_recv().unwrap().error.as_deref(),
+            consumer.activity.error.as_deref(),
             Some("File watcher could not start")
         );
-        assert_eq!(count.load(Ordering::Relaxed), 1);
+        assert!(consumer.take_changed());
+        let (tx, rx) = mpsc::sync_channel(1);
+        drop(rx);
+        consumer.commands = Some(tx);
+        for _ in 0..3 {
+            consumer.sync([fixture.0.clone()], []);
+            assert_eq!(
+                consumer.activity.error.as_deref(),
+                Some("File watcher could not start")
+            );
+            assert!(!consumer.take_changed());
+        }
+    }
+    #[test]
+    fn moved_in_tree_uses_fresh_budgets_after_startup_is_exhausted() {
+        let fixture = Fixture::new();
+        let outside = Fixture::new();
+        let mut tree = tree(&fixture);
+        let mut watcher = CountingWatcher::default();
+        tree.reset(&fixture.roots(), &mut watcher, true);
+        tree.entries = MAX_ENTRIES;
+        tree.directories
+            .extend((1..MAX_DIRECTORIES).map(|i| fixture.0.join(format!("old-{i}"))));
+        fs::create_dir(outside.0.join("nested")).unwrap();
+        fs::write(outside.0.join("nested/child.txt"), "moved").unwrap();
+        let moved = fixture.0.join("moved");
+        fs::rename(outside.0.join("nested"), &moved).unwrap();
+        tree.event(
+            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To))).add_path(moved.clone()),
+            SystemTime::now(),
+            &mut watcher,
+        );
+        assert_eq!(
+            tree.activity.files.first().map(|f| &f.path),
+            Some(&moved.join("child.txt"))
+        );
+        assert!(tree.activity.error.is_none());
+        assert_eq!(tree.entries, MAX_ENTRIES);
+        assert_eq!(tree.directories.len(), MAX_DIRECTORIES);
+        assert_eq!(watcher.adds.len(), 1);
+    }
+
+    #[test]
+    fn moved_in_tree_entry_limit_is_partial_with_later_events_still_live() {
+        let fixture = Fixture::new();
+        let mut tree = tree(&fixture);
+        let mut watcher = CountingWatcher::default();
+        tree.reset(&fixture.roots(), &mut watcher, true);
+        let moved = fixture.0.join("moved");
+        fs::create_dir(&moved).unwrap();
+        for i in 0..=MAX_ENTRIES {
+            fs::write(moved.join(i.to_string()), "x").unwrap();
+        }
+        tree.event(write_event(&moved), SystemTime::now(), &mut watcher);
+        assert_eq!(tree.activity.error.as_deref(), Some(PARTIAL));
+        let later = fixture.0.join("later.txt");
+        fs::write(&later, "live").unwrap();
+        tree.event(write_event(&later), SystemTime::now(), &mut watcher);
+        assert_eq!(tree.activity.files[0].path, later);
+    }
+
+    #[test]
+    fn native_root_failure_backoff_is_bounded_with_visible_exhaustion() {
+        let fixture = Fixture::new();
+        let mut tree = tree(&fixture);
+        let mut watcher = CountingWatcher::default();
+        tree.reset(&fixture.roots(), &mut watcher, true);
+        tree.roots.clear();
+        watcher.fail_remove = true;
+        let start = Instant::now();
+        let mut attempts = Vec::new();
+        for second in 0..1000 {
+            let before = watcher.removes.len();
+            tree.sync_streams_at(&mut watcher, start + Duration::from_secs(second));
+            if watcher.removes.len() != before {
+                attempts.push(second);
+            }
+        }
+        assert_eq!(attempts, vec![0, 20, 60, 140]);
+        assert!(tree
+            .activity
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("retries exhausted"));
+        assert!(tree.stream_retry);
+    }
+
+    #[test]
+    fn native_root_failed_alias_removal_repairs_wanted_event_filter() {
+        for not_found in [false, true] {
+            let fixture = Fixture::new();
+            let old = fixture.0.join("old");
+            let wanted = fixture.0.join("wanted");
+            fs::create_dir(&old).unwrap();
+            fs::create_dir(&wanted).unwrap();
+            let mut tree = tree(&fixture);
+            let mut watcher = CountingWatcher::default();
+            let request = Roots {
+                paths: vec![old.clone(), wanted.clone()],
+                ..Roots::default()
+            };
+            tree.reset(&request, &mut watcher, true);
+            fs::remove_dir(&old).unwrap(); // Generated empty fixture only.
+            std::os::unix::fs::symlink(&wanted, &old).unwrap();
+            watcher.fail_remove = !not_found;
+            watcher.remove_not_found = not_found;
+            let request = Roots {
+                paths: vec![wanted.clone()],
+                ..Roots::default()
+            };
+            tree.reset(&request, &mut watcher, false);
+            assert!(
+                watcher.filters.contains(&wanted),
+                "failed removal must not disable a wanted root"
+            );
+            assert!(tree.subscriptions.contains(&wanted));
+            assert_eq!(tree.subscriptions.contains(&old), !not_found);
+            if !not_found {
+                tree.sync_streams_at(&mut watcher, Instant::now() + Duration::from_secs(21));
+                assert!(
+                    watcher.filters.contains(&wanted),
+                    "retry must also repair the filter"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_created_dangling_symlink_marks_partial_but_vanished_path_does_not() {
+        let fixture = Fixture::new();
+        let mut tree = tree(&fixture);
+        let mut watcher = CountingWatcher::default();
+        tree.reset(&fixture.roots(), &mut watcher, true);
+        let path = fixture.0.join("dangling.txt");
+        tree.event(write_event(&path), SystemTime::now(), &mut watcher);
+        assert!(tree.activity.error.is_none());
+        std::os::unix::fs::symlink(fixture.0.join("missing"), &path).unwrap();
+        tree.event(
+            Event::new(EventKind::Create(CreateKind::File)).add_path(path),
+            SystemTime::now(),
+            &mut watcher,
+        );
+        assert_eq!(tree.activity.error.as_deref(), Some(PARTIAL));
     }
 }

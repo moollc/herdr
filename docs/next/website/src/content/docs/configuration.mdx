@@ -722,14 +722,19 @@ Notifications coalesce over 150 ms and wake the existing render loop only when
 activity changes (including the initial readiness snapshot). Idle journal and process-root refreshes run once per second.
 Directory discovery and OS subscriptions run on a worker, with no idle directory
 scans. Unavailable roots, watch failures, OS event loss, or a reached limit display
-an error/partial marker in the existing panel. On macOS, the bounded discovery
-limits do not reduce recursive native coverage. In-root file symlinks are already
+an error/partial marker in the existing panel. On macOS, startup discovery limits do not reduce native subscriptions. A directory
+moved into a root may emit only one event, so each new-directory scan gets its own
+512-directory and 20,000-entry budget. Reaching either per-event limit marks partial
+coverage because some moved-in contents may be omitted. In-root file symlinks are already
 covered at their targets; directory symlinks are not followed and may report partial
 coverage. Temporary paths that vanish before inspection are normal during atomic
-saves and do not mark coverage partial. Failed native root updates warn and retry
-on the next root refresh. Loss warnings remain visible because history cannot be
+saves and do not mark coverage partial. Dangling symlinks mark partial both at
+startup and when created during the session. Failed native root updates warn and retry
+with backoff (20, 40, then 80 seconds). After four failed attempts, retries stop
+for this watcher and an exhausted-retries warning remains visible. Loss warnings remain visible because history cannot be
 reconstructed. Journal and watcher diagnostics appear on separate rows, journal
-first. Panel keyboard focus clears when the file rows disappear.
+first. When file rows are hidden for the typing client, its next key releases panel focus
+and reaches the shell. Layouts for other attached clients do not clear that focus.
 
 On macOS, FSEvents can report stream-wide event loss during a build, including
 when the build output is in an ignored folder. Herdr keeps the partial marker

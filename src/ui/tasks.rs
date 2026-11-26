@@ -1042,8 +1042,10 @@ mod tests {
             app.tasks_collapsed = collapsed;
             draw(&mut app, width, height);
             assert!(recent_file_viewport(&app).is_none());
-            assert!(!app.recent_files.keyboard_focus);
-            assert_eq!(app.recent_files.selected, None);
+            // Layout alone cannot decide whether this is the typing client.
+            // The key-time hidden-panel check releases focus and forwards keys.
+            assert!(app.recent_files.keyboard_focus);
+            assert_eq!(app.recent_files.selected, Some(0));
         }
     }
 }

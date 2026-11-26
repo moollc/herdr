@@ -380,6 +380,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recent_files_two_client_layouts_preserve_typing_clients_focus() {
+        for narrow_width in [40, 90] {
+            let (mut app, mut rx) = recent_files_client_app();
+            app.state.tasks.configured = true;
+            app.state.sidebar_width = 60;
+            app.state.sidebar_max_width = 64;
+            app.state.mobile_width_threshold = 60;
+            let runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+            // Same order as the server: background narrow client, foreground
+            // desktop client, both computing geometry on the same AppState.
+            crate::ui::compute_view_without_resizing_panes(
+                &mut app.state,
+                &runtimes,
+                Rect::new(0, 0, narrow_width, 24),
+            );
+            assert!(crate::ui::recent_file_viewport(&app.state).is_none());
+            crate::ui::compute_view_without_resizing_panes(
+                &mut app.state,
+                &runtimes,
+                Rect::new(0, 0, 240, 48),
+            );
+            assert!(crate::ui::recent_file_viewport(&app.state).is_some());
+            assert!(app.state.recent_files.keyboard_focus);
+            assert_eq!(app.state.recent_files.selected, Some(0));
+            app.route_client_input(b"\x1b[B".to_vec());
+            assert_eq!(app.state.recent_files.selected, Some(1));
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn recent_files_hidden_panel_forwards_first_client_key() {
         for hidden in 0..3 {
             for bytes in [b"l".as_slice(), b"\r", b"\x1b[A"] {
